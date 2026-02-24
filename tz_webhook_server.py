@@ -25,8 +25,8 @@ from dotenv import load_dotenv
 load_dotenv()
 
 BASE_URL     = "https://webapi.tradezero.com"
-API_KEY      = os.getenv("TZ_API_KEY")
-API_SECRET   = os.getenv("TZ_API_SECRET")
+API_KEY      = (os.getenv("TZ_API_KEY") or "").strip()
+API_SECRET   = (os.getenv("TZ_API_SECRET") or "").strip()
 ACCOUNT_ID   = "TZP190C7"
 LIMIT_BUFFER = 0.005   # 0.5% price buffer so limit fills immediately
 
