@@ -278,8 +278,7 @@ def root():
 
 if __name__ == "__main__":
     if not API_KEY or not API_SECRET:
-        print("ERROR: Set TZ_API_KEY and TZ_API_SECRET in .env")
-        exit(1)
+        print("WARNING: TZ_API_KEY or TZ_API_SECRET not set — webhook will fail but server will start")
 
     port = int(os.environ.get("PORT", 5000))   # Railway sets PORT dynamically
 
