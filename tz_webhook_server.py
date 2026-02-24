@@ -250,9 +250,22 @@ def health():
     try:
         r = requests.get(f"{BASE_URL}/v1/api/accounts", headers=tz_headers(), timeout=10)
         tz_ok = r.status_code == 200
-    except Exception:
+        tz_detail = f"http_{r.status_code}"
+    except requests.exceptions.Timeout:
         tz_ok = False
-    status = {"server": "ok", "tz_api": "ok" if tz_ok else "unreachable", "account": ACCOUNT_ID}
+        tz_detail = "timeout"
+    except requests.exceptions.ConnectionError as e:
+        tz_ok = False
+        tz_detail = f"connection_error: {str(e)[:100]}"
+    except Exception as e:
+        tz_ok = False
+        tz_detail = f"error: {str(e)[:100]}"
+    status = {
+        "server": "ok",
+        "tz_api": "ok" if tz_ok else "unreachable",
+        "tz_detail": tz_detail,
+        "account": ACCOUNT_ID
+    }
     log.info(f"HEALTH: {status}")
     return jsonify(status), 200
 
