@@ -248,7 +248,7 @@ def webhook():
 @app.route("/health", methods=["GET"])
 def health():
     try:
-        r = requests.get(f"{BASE_URL}/v1/api/accounts", headers=tz_headers(), timeout=10)
+        r = requests.get(f"{BASE_URL}/v1/api/accounts/{ACCOUNT_ID}/positions", headers=tz_headers(), timeout=10)
         tz_ok = r.status_code == 200
         tz_detail = f"http_{r.status_code}"
     except requests.exceptions.Timeout:
