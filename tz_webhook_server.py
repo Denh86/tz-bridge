@@ -247,10 +247,11 @@ def webhook():
 
 @app.route("/health", methods=["GET"])
 def health():
+    url = f"{BASE_URL}/v1/api/accounts/{ACCOUNT_ID}/positions"
     try:
-        r = requests.get(f"{BASE_URL}/v1/api/accounts/{ACCOUNT_ID}/positions", headers=tz_headers(), timeout=10)
+        r = requests.get(url, headers=tz_headers(), timeout=10)
         tz_ok = r.status_code == 200
-        tz_detail = f"http_{r.status_code}"
+        tz_detail = f"http_{r.status_code}: {r.text[:200]}"
     except requests.exceptions.Timeout:
         tz_ok = False
         tz_detail = "timeout"
@@ -264,7 +265,9 @@ def health():
         "server": "ok",
         "tz_api": "ok" if tz_ok else "unreachable",
         "tz_detail": tz_detail,
-        "account": ACCOUNT_ID
+        "tz_url": url,
+        "account": ACCOUNT_ID,
+        "key_preview": API_KEY[:8] + "..." if API_KEY else "NOT SET",
     }
     log.info(f"HEALTH: {status}")
     return jsonify(status), 200
