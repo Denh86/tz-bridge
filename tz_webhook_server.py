@@ -234,7 +234,7 @@ def poll_locate_status(symbol, quote_req_id):
         if r.status_code == 200:
             history = r.json().get("locateHistory", [])
             for item in history:
-                if item.get("quoteReqId") == quote_req_id:
+                if item.get("quoteReqID") == quote_req_id:
                     status = item.get("locateStatus")
                     log.info(f"  [{symbol}] Locate poll: status={status} | "
                              f"shares={item.get('locateShares')} | "
