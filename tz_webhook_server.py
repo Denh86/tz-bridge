@@ -33,7 +33,7 @@ load_dotenv()
 # CONFIG — adjust these without touching any other code
 # ══════════════════════════════════════════════════════════════════════════════
 BASE_URL             = "https://webapi.tradezero.com"
-ACCOUNT_ID           = "DHA41998"
+ACCOUNT_ID           = "TZP190C7"
 MAX_LOCATE_COST_PCT  = 0.02    # 2%  — reject if locatePrice / entryPrice > this
 MIN_LOCATE_QUANTITY  = 100     # TZ minimum locate size
 LOCATE_POLL_INTERVAL = 2       # seconds between locate status polls
@@ -234,7 +234,7 @@ def poll_locate_status(symbol, quote_req_id):
         if r.status_code == 200:
             history = r.json().get("locateHistory", [])
             for item in history:
-                if item.get("quoteReqID") == quote_req_id:
+                if item.get("quoteReqId") == quote_req_id:
                     status = item.get("locateStatus")
                     log.info(f"  [{symbol}] Locate poll: status={status} | "
                              f"shares={item.get('locateShares')} | "
@@ -430,7 +430,8 @@ def cancel_and_cleanup(symbol, reason):
         shares = float(position.get("shares", 0))
         if shares < 0:
             cover_qty   = abs(int(shares))
-            last_price  = float(position.get("priceClose", position.get("priceAvg", 0)))
+            # priceClose is 0.0 during market hours — use priceAvg as fallback
+            last_price  = float(position.get("priceClose") or position.get("priceAvg") or 0)
             if last_price <= 0:
                 log.error(f"[{symbol}] Cannot determine cover price — MANUAL ACTION REQUIRED")
                 block(symbol, f"cleanup: has position but no valid price — MANUAL ACTION REQUIRED")
@@ -604,7 +605,8 @@ def webhook():
             return jsonify({"status": "ok", "note": "not a short position"}), 200
 
         cover_qty   = abs(int(shares))
-        last_price  = float(position.get("priceClose", position.get("priceAvg", price)))
+        # priceClose is 0.0 during market hours — use priceAvg as fallback, then signal price
+        last_price  = float(position.get("priceClose") or position.get("priceAvg") or price)
         cover_limit = round(last_price * (1 + LIMIT_BUFFER), 2)
 
         log.info(f"[{symbol}] Covering {cover_qty} shares | "
