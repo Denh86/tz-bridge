@@ -33,7 +33,7 @@ load_dotenv()
 # CONFIG — adjust these without touching any other code
 # ══════════════════════════════════════════════════════════════════════════════
 BASE_URL             = "https://webapi.tradezero.com"
-ACCOUNT_ID           = "TZP190C7"
+ACCOUNT_ID           = "DHA41998"
 MAX_LOCATE_COST_PCT  = 0.02    # 2%  — reject if locatePrice / entryPrice > this
 MIN_LOCATE_QUANTITY  = 100     # TZ minimum locate size
 LOCATE_POLL_INTERVAL = 2       # seconds between locate status polls
