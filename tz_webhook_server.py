@@ -230,13 +230,19 @@ def poll_locate_status(symbol, quote_req_id):
     """
     deadline = time.time() + LOCATE_POLL_TIMEOUT
     while time.time() < deadline:
-        r = tz_get(f"/v1/api/accounts/{ACCOUNT_ID}/locates/history", "LOCATE_POLL")
+        url = f"{BASE_URL}/v1/api/accounts/{ACCOUNT_ID}/locates/history"
+        log.info(f"  → LOCATE_POLL GET {url}")
+        r = requests.get(url, headers=tz_headers(), timeout=15)
+        # Log full untruncated response so we can see all history entries
+        log.info(f"  ← status: {r.status_code}  body: {r.text}")
         if r.status_code == 200:
             history = r.json().get("locateHistory", [])
+            log.info(f"  [{symbol}] {len(history)} history entries — searching for {quote_req_id}")
             for item in history:
-                if item.get("quoteReqId") == quote_req_id:
+                # TZ returns quoteReqID (capital D)
+                if item.get("quoteReqID") == quote_req_id:
                     status = item.get("locateStatus")
-                    log.info(f"  [{symbol}] Locate poll: status={status} | "
+                    log.info(f"  [{symbol}] FOUND: status={status} | "
                              f"shares={item.get('locateShares')} | "
                              f"filled={item.get('filledShares')} | "
                              f"price=${item.get('locatePrice')} | "
@@ -245,6 +251,7 @@ def poll_locate_status(symbol, quote_req_id):
                              f"error={item.get('locateError')}")
                     if status in (65, 56, 67, 52):
                         return item
+            log.info(f"  [{symbol}] {quote_req_id} not yet in history — polling again")
         else:
             log.warning(f"  [{symbol}] Locate poll failed: {r.status_code}")
         time.sleep(LOCATE_POLL_INTERVAL)
