@@ -2,7 +2,7 @@
 TradeZero Webhook Execution Server — EOD Short Strategy
 =======================================================
 Receives SHORT / COVER / CANCEL signals from QuantConnect.
-Manages the full locate → short → cover lifecycle with state machine.
+Manages the full locate → short → cover lifecycle with state machine. 
 
 SIGNAL FORMAT (from QC):
   {"action": "SHORT",  "symbol": "LRMR", "quantity": 500, "price": 5.70}
