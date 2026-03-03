@@ -13,7 +13,7 @@ SYMBOL STATES:
   FLAT      → ready, will accept SHORT
   LOCATING  → locate request in progress
   ACTIVE    → short position placed, waiting for COVER
-  BLOCKED   → dead for the day, all signals ignored SORRY
+  BLOCKED   → dead for the day, all signals ignored SORRY again
 
 HOW TO RUN:
   pip install flask requests python-dotenv
