@@ -13,7 +13,7 @@ SYMBOL STATES:
   FLAT      → ready, will accept SHORT
   LOCATING  → locate request in progress
   ACTIVE    → short position placed, waiting for COVER
-  BLOCKED   → dead for the day, all signals ignored SORRY dagain
+  BLOCKED   → dead for the day, all signals ignored
 
 HOW TO RUN:
   pip install flask requests python-dotenv
@@ -193,13 +193,12 @@ def place_order(side, symbol, quantity, limit_price, label="ORDER"):
     client_id = f"QC_{side[:1].upper()}_{uuid.uuid4().hex[:8].upper()}"
     payload = {
         "clientOrderId": client_id,
-        "orderQuantity": int(quantity),
-        "orderType":     "Limit",
-        "securityType":  "Stock",
-        "side":          side,
         "symbol":        symbol,
-        "timeInForce":   "Day",
+        "quantity":      int(quantity),
+        "side":          side.lower(),       # TZ API requires lowercase: "sell", "buy"
+        "orderType":     "limit",            # TZ API requires lowercase
         "limitPrice":    round(limit_price, 2),
+        "timeInForce":   "day",              # TZ API requires lowercase
     }
     r = tz_post(f"/v1/api/accounts/{ACCOUNT_ID}/order", payload, label)
     r.raise_for_status()
@@ -267,6 +266,36 @@ def accept_locate(quote_req_id):
 # ══════════════════════════════════════════════════════════════════════════════
 # LOCATE + SHORT BACKGROUND THREAD
 # ══════════════════════════════════════════════════════════════════════════════
+def check_existing_locate(symbol, required_quantity):
+    """
+    Check if a valid accepted locate already exists for today.
+    Returns (True, quantity) if usable locate found, (False, 0) otherwise.
+    Status 50 = Filled/Accepted locate.
+    """
+    from datetime import date
+    today_str = date.today().isoformat()  # e.g. "2026-03-03"
+    r = tz_get(f"/v1/api/accounts/{ACCOUNT_ID}/locates/history", "LOCATE_CHECK")
+    if r.status_code != 200:
+        log.warning(f"[{symbol}] Could not check existing locates: {r.status_code}")
+        return False, 0
+    history = r.json().get("locateHistory", [])
+    for item in history:
+        if item.get("symbol", "").upper() != symbol.upper():
+            continue
+        if item.get("locateStatus") != 50:  # 50 = Filled/Accepted
+            continue
+        created = item.get("createdDate", "")
+        if not created.startswith(today_str):
+            continue
+        filled = int(item.get("filledShares", 0))
+        if filled >= required_quantity:
+            log.info(f"[{symbol}] Existing locate found today: "
+                     f"{filled} shares accepted | quoteReqID={item.get('quoteReqID')}")
+            return True, filled
+    log.info(f"[{symbol}] No usable existing locate found for today")
+    return False, 0
+
+
 def locate_and_short(symbol, qc_quantity, entry_price):
     log.info(f"[{symbol}] ── LOCATE THREAD STARTED ──────────────────────")
     log.info(f"[{symbol}] QC requested: qty={qc_quantity} entry_price=${entry_price}")
@@ -297,6 +326,27 @@ def locate_and_short(symbol, qc_quantity, entry_price):
     request_quantity = min(qc_quantity, max_affordable)
     log.info(f"[{symbol}] request_quantity={request_quantity} "
              f"(min of qc={qc_quantity}, max_affordable={max_affordable})")
+
+    # ── Step 3b: Check if valid locate already exists for today ─────────────
+    log.info(f"[{symbol}] Step 3b: Checking for existing locate today")
+    has_locate, located_qty = check_existing_locate(symbol, request_quantity)
+    if has_locate:
+        log.info(f"[{symbol}] Skipping locate request — using existing locate "
+                 f"({located_qty} shares already accepted today)")
+        final_quantity = min(request_quantity, located_qty)
+        log.info(f"[{symbol}] Step 11: Placing short | qty={final_quantity} | "
+                 f"entry=${entry_price} | limit=${round(entry_price * (1 - LIMIT_BUFFER), 2)}")
+        try:
+            limit_price = round(entry_price * (1 - LIMIT_BUFFER), 2)
+            result = place_order("Sell", symbol, final_quantity, limit_price, "SHORT_ORDER")
+            set_state(symbol, state="ACTIVE", client_order_id=result.get("clientOrderId"))
+            log.info(f"[{symbol}] STATE → ACTIVE")
+            log.info(f"[{symbol}] SHORT PLACED (existing locate) | qty={final_quantity} | "
+                     f"limit=${limit_price} | clientOrderId={result.get('clientOrderId')} | "
+                     f"status={result.get('orderStatus')}")
+        except Exception as e:
+            block(symbol, f"order placement failed: {e}")
+        return
 
     # ── Step 4: Request locate quote ──────────────────────────────────────────
     quote_req_id = f"Q{int(time.time() * 1000)}"
