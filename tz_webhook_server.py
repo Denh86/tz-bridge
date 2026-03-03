@@ -53,8 +53,10 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s  %(levelname)-8s  %(message)s",
     datefmt="%H:%M:%S",
+    handlers=[logging.StreamHandler()]
 )
 log = logging.getLogger("tz_server")
+log.info("=== tz_webhook_server module loading ===")
 
 # ══════════════════════════════════════════════════════════════════════════════
 # STATE MACHINE  (reset at midnight)
