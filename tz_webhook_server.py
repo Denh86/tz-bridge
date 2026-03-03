@@ -298,9 +298,46 @@ def check_existing_locate(symbol, required_quantity):
     return False, 0
 
 
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PRICE SANITY  (Yahoo Finance)
+# ══════════════════════════════════════════════════════════════════════════════
+PRICE_SANITY_PCT = 0.05   # reject if QC price deviates >5% from Yahoo
+
+def get_yahoo_price(symbol):
+    """Fetch last price from Yahoo Finance. Returns float or None."""
+    import urllib.request as _req
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?interval=1m&range=1d"
+    try:
+        req = _req.Request(url, headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+        })
+        with _req.urlopen(req, timeout=5) as resp:
+            data = __import__('json').loads(resp.read())
+            price = data["chart"]["result"][0]["meta"]["regularMarketPrice"]
+            return float(price)
+    except Exception as e:
+        log.warning(f"Yahoo price lookup failed for {symbol}: {e}")
+        return None
+
 def locate_and_short(symbol, qc_quantity, entry_price):
     log.info(f"[{symbol}] ── LOCATE THREAD STARTED ──────────────────────")
     log.info(f"[{symbol}] QC requested: qty={qc_quantity} entry_price=${entry_price}")
+
+    # ── Step 0: Validate QC price against Yahoo Finance ───────────────────────
+    log.info(f"[{symbol}] Step 0: Price sanity check via Yahoo Finance")
+    yahoo_price = get_yahoo_price(symbol)
+    if yahoo_price is not None:
+        deviation = abs(entry_price - yahoo_price) / yahoo_price
+        log.info(f"[{symbol}] Yahoo=${yahoo_price:.4f} | QC=${entry_price:.4f} | "
+                 f"deviation={deviation*100:.2f}% (limit={PRICE_SANITY_PCT*100:.0f}%)")
+        if deviation > PRICE_SANITY_PCT:
+            block(symbol, f"price sanity FAILED: QC=${entry_price} vs Yahoo=${yahoo_price:.4f} "
+                          f"({deviation*100:.1f}% > {PRICE_SANITY_PCT*100:.0f}% limit — likely bad tick)")
+            return
+        log.info(f"[{symbol}] Price sanity OK ✓")
+    else:
+        log.warning(f"[{symbol}] Yahoo unavailable — proceeding with QC price (unvalidated)")
 
     # ── Step 1: Check buying power + margin ───────────────────────────────────
     log.info(f"[{symbol}] Step 1: Checking buying power and margin")
@@ -325,9 +362,19 @@ def locate_and_short(symbol, qc_quantity, entry_price):
         return
 
     # ── Step 3: Request quantity ───────────────────────────────────────────────
-    request_quantity = min(qc_quantity, max_affordable)
+    # Floor to nearest 100 (never round up — must not exceed affordable)
+    # e.g. 73→100 (min floor), 149→100, 150→100, 251→200
+    raw_quantity = min(qc_quantity, max_affordable)
+    request_quantity = max(MIN_LOCATE_QUANTITY, int(raw_quantity / 100) * 100)
+    # Safety: after flooring to 100s, ensure we can still afford it
+    if request_quantity > max_affordable:
+        request_quantity = int(max_affordable / 100) * 100
+    if request_quantity < MIN_LOCATE_QUANTITY:
+        block(symbol, f"cannot afford minimum {MIN_LOCATE_QUANTITY} shares after rounding — "
+                      f"max_affordable={max_affordable} at ${entry_price}")
+        return
     log.info(f"[{symbol}] request_quantity={request_quantity} "
-             f"(min of qc={qc_quantity}, max_affordable={max_affordable})")
+             f"(floored to 100s | qc={qc_quantity}, raw={raw_quantity}, max_affordable={max_affordable})")
 
     # ── Step 3b: Check if valid locate already exists for today ─────────────
     log.info(f"[{symbol}] Step 3b: Checking for existing locate today")
