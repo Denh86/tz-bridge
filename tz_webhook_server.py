@@ -220,6 +220,7 @@ def place_order(side, symbol, quantity, limit_price, label="ORDER"):
         "orderType":     "limit",
         "limitPrice":    round(limit_price, 2),
         "timeInForce":   tif,
+        "route":         "SMART",
     }
     r = tz_post(f"/v1/api/accounts/{ACCOUNT_ID}/order", payload, label)
     if not r.ok:
@@ -609,6 +610,15 @@ def health():
     with state_lock:
         states = {k: v.get("state") for k, v in symbol_state.items()}
 
+    # Check available routes
+    try:
+        r_routes = requests.get(
+            f"{BASE_URL}/v1/api/accounts/{ACCOUNT_ID}/routes",
+            headers=tz_headers(), timeout=5)
+        routes_info = r_routes.text[:300]
+    except Exception as e:
+        routes_info = f"error: {e}"
+
     status = {
         "server":        "ok",
         "tz_api":        "ok" if tz_ok else "unreachable",
@@ -616,6 +626,7 @@ def health():
         "account":       ACCOUNT_ID,
         "key_preview":   API_KEY[:8] + "..." if API_KEY else "NOT SET",
         "symbol_states": states,
+        "routes":        routes_info,
         "config": {
             "max_locate_cost_pct": MAX_LOCATE_COST_PCT,
             "min_locate_quantity": MIN_LOCATE_QUANTITY,
