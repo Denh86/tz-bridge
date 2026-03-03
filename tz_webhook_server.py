@@ -2,7 +2,7 @@
 TradeZero Webhook Execution Server — EOD Short Strategy
 =======================================================
 Receives SHORT / COVER / CANCEL signals from QuantConnect.
-Manages the full locate → short → cover lifecycle with state machine. 
+Manages the full locate → short → cover lifecycle with state machine.
 
 SIGNAL FORMAT (from QC):
   {"action": "SHORT",  "symbol": "LRMR", "quantity": 500, "price": 5.70}
@@ -201,11 +201,11 @@ def get_time_in_force():
     rth_open  = _dt.time(9, 30)
     rth_close = _dt.time(16, 0)
     is_rth = rth_open <= t < rth_close
-    # TZ valid values: "day", "gtc", "ioc", "fok" — no "ext" option
-    # Use "day" during RTH, "gtc" for pre/post market (stays active AH)
-    tif = "day" if is_rth else "gtc"
+    # TZ requires PascalCase — from routes API: ["Day","GoodTillCancel","Day_Plus","GTC_Plus"]
+    # Use "Day" during RTH, "GoodTillCancel" for pre/post market
+    tif = "Day" if is_rth else "GoodTillCancel"
     log.info(f"  timeInForce={tif} (ET time {t.strftime('%H:%M')} | "
-             f"{'RTH — day order' if is_rth else 'AH — gtc order'})")
+             f"{'RTH — Day order' if is_rth else 'AH — GoodTillCancel order'})")
     return tif
 
 
