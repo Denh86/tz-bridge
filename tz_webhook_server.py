@@ -38,7 +38,7 @@ MAX_LOCATE_COST_PCT  = 0.02    # 2%  — reject if locatePrice / entryPrice > th
 MIN_LOCATE_QUANTITY  = 100     # TZ minimum locate size
 LOCATE_POLL_INTERVAL = 2       # seconds between locate status polls
 LOCATE_POLL_TIMEOUT  = 30      # seconds before giving up on locate
-LIMIT_BUFFER         = 0.005   # 0.5% — short limit below market, cover limit above
+LIMIT_BUFFER         = 0.001   # 0.1% — short limit below market, cover limit above
 
 # ══════════════════════════════════════════════════════════════════════════════
 # CREDENTIALS
@@ -302,7 +302,7 @@ def check_existing_locate(symbol, required_quantity):
 # ══════════════════════════════════════════════════════════════════════════════
 # PRICE SANITY  (Yahoo Finance)
 # ══════════════════════════════════════════════════════════════════════════════
-PRICE_SANITY_PCT = 0.05   # reject if QC price deviates >5% from Yahoo
+PRICE_SANITY_PCT = 0.10   # reject if QC price deviates >10% from Yahoo
 
 def get_yahoo_price(symbol):
     """Fetch last price from Yahoo Finance. Returns float or None."""
