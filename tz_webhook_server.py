@@ -41,7 +41,7 @@ LOCATE_POLL_TIMEOUT  = 30      # seconds before giving up on locate
 LIMIT_BUFFER         = 0.001   # 0.1% — short limit below market, cover limit above
 
 # ══════════════════════════════════════════════════════════════════════════════
-# CREDENTIALS 
+# CREDENTIALS
 # ══════════════════════════════════════════════════════════════════════════════
 API_KEY    = (os.getenv("TZ_API_KEY")    or "").strip()
 API_SECRET = (os.getenv("TZ_API_SECRET") or "").strip()
@@ -191,19 +191,39 @@ def cancel_all_open_orders(symbol):
     return cancelled
 
 
+def get_time_in_force():
+    """Use 'ext' for pre/post market hours, 'day' during regular trading hours."""
+    import datetime as _dt
+    now_et = _dt.datetime.now(_dt.timezone.utc).astimezone(
+        __import__('zoneinfo', fromlist=['ZoneInfo']).ZoneInfo("America/New_York")
+    )
+    t = now_et.time()
+    rth_open  = _dt.time(9, 30)
+    rth_close = _dt.time(16, 0)
+    is_rth = rth_open <= t < rth_close
+    tif = "day" if is_rth else "ext"
+    log.info(f"  timeInForce={tif} (ET time {t.strftime('%H:%M')} | "
+             f"{'regular hours' if is_rth else 'extended hours'})")
+    return tif
+
+
 def place_order(side, symbol, quantity, limit_price, label="ORDER"):
     client_id = f"QC_{side[:1].upper()}_{uuid.uuid4().hex[:8].upper()}"
+    tif = get_time_in_force()
     payload = {
         "clientOrderId": client_id,
         "symbol":        symbol,
         "quantity":      int(quantity),
-        "side":          side.lower(),       # TZ API requires lowercase: "sell", "buy"
-        "orderType":     "limit",            # TZ API requires lowercase
+        "side":          side.lower(),
+        "orderType":     "limit",
         "limitPrice":    round(limit_price, 2),
-        "timeInForce":   "day",              # TZ API requires lowercase
+        "timeInForce":   tif,
     }
     r = tz_post(f"/v1/api/accounts/{ACCOUNT_ID}/order", payload, label)
-    r.raise_for_status()
+    if not r.ok:
+        # Log raw response body before raising — may be HTML error page
+        log.error(f"  [{symbol}] Order FAILED {r.status_code} — raw body: {r.text[:500]}")
+        r.raise_for_status()
     data = r.json()
     log.info(f"  [{symbol}] Order placed: clientOrderId={data.get('clientOrderId')} "
              f"status={data.get('orderStatus')}")
