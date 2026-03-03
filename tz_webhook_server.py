@@ -191,39 +191,9 @@ def cancel_all_open_orders(symbol):
     return cancelled
 
 
-def get_time_in_force():
-    """Use 'GoodTillCancel' for pre/post market, 'Day' during regular trading hours."""
-    import datetime as _dt
-    # ET is UTC-5 (EST) or UTC-4 (EDT) — use UTC offset directly
-    # Render server is UTC; ET = UTC - 5 in winter, UTC - 4 in summer
-    # Use timegm/DST-aware calculation via UTC offset
-    utc_now = _dt.datetime.now(_dt.timezone.utc)
-    # Determine ET offset: DST runs second Sunday March to first Sunday November
-    year = utc_now.year
-    # Second Sunday of March
-    mar1 = _dt.datetime(year, 3, 1)
-    dst_start = mar1 + _dt.timedelta(days=(6 - mar1.weekday()) % 7 + 7)
-    # First Sunday of November
-    nov1 = _dt.datetime(year, 11, 1)
-    dst_end = nov1 + _dt.timedelta(days=(6 - nov1.weekday()) % 7)
-    utc_naive = utc_now.replace(tzinfo=None)
-    is_dst = dst_start <= utc_naive < dst_end
-    et_offset = _dt.timedelta(hours=-4 if is_dst else -5)
-    now_et = utc_now + et_offset
-    t = now_et.time()
-    rth_open  = _dt.time(9, 30)
-    rth_close = _dt.time(16, 0)
-    is_rth = rth_open <= t < rth_close
-    # TZ requires PascalCase — from routes API: ["Day","GoodTillCancel","Day_Plus","GTC_Plus"]
-    tif = "Day" if is_rth else "GoodTillCancel"
-    log.info(f"  timeInForce={tif} (ET time {t.strftime('%H:%M')} | "
-             f"{'RTH — Day order' if is_rth else 'AH — GoodTillCancel order'})")
-    return tif
-
 
 def place_order(side, symbol, quantity, limit_price, label="ORDER"):
     client_id = f"QC_{side[:1].upper()}_{uuid.uuid4().hex[:8].upper()}"
-    tif = get_time_in_force()
     payload = {
         "clientOrderId": client_id,
         "symbol":        symbol,
@@ -231,7 +201,7 @@ def place_order(side, symbol, quantity, limit_price, label="ORDER"):
         "side":          side.lower(),
         "orderType":     "limit",
         "limitPrice":    round(limit_price, 2),
-        "timeInForce":   tif,
+        "timeInForce":   "GoodTillCancel",
         "route":         "SMART",
     }
     r = tz_post(f"/v1/api/accounts/{ACCOUNT_ID}/order", payload, label)
