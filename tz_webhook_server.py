@@ -202,7 +202,6 @@ def place_order(side, symbol, quantity, limit_price, label="ORDER"):
         "orderType":     "limit",
         "limitPrice":    round(limit_price, 2),
         "timeInForce":   "GoodTillCancel",
-        "route":         "SMART",
     }
     r = tz_post(f"/v1/api/accounts/{ACCOUNT_ID}/order", payload, label)
     if not r.ok:
@@ -275,31 +274,31 @@ def accept_locate(quote_req_id):
 # ══════════════════════════════════════════════════════════════════════════════
 def check_existing_locate(symbol, required_quantity):
     """
-    Check if a valid accepted locate already exists for today.
-    Returns (True, quantity) if usable locate found, (False, 0) otherwise.
-    Status 50 = Filled/Accepted locate.
+    Check the inventory endpoint for currently available locate shares.
+    This is the authoritative source — expired, used, or single-use locates
+    will not appear here. Returns (True, available_qty) if usable, (False, 0) otherwise.
     """
-    from datetime import date
-    today_str = date.today().isoformat()  # e.g. "2026-03-03"
-    r = tz_get(f"/v1/api/accounts/{ACCOUNT_ID}/locates/history", "LOCATE_CHECK")
+    r = tz_get(f"/v1/api/accounts/{ACCOUNT_ID}/locates/inventory", "LOCATE_INVENTORY")
     if r.status_code != 200:
-        log.warning(f"[{symbol}] Could not check existing locates: {r.status_code}")
+        log.warning(f"[{symbol}] Could not check locate inventory: {r.status_code}")
         return False, 0
-    history = r.json().get("locateHistory", [])
-    for item in history:
+    inventory = r.json().get("locateInventory", [])
+    for item in inventory:
         if item.get("symbol", "").upper() != symbol.upper():
             continue
-        if item.get("locateStatus") != 50:  # 50 = Filled/Accepted
-            continue
-        created = item.get("createdDate", "")
-        if not created.startswith(today_str):
-            continue
-        filled = int(item.get("filledShares", 0))
-        if filled >= required_quantity:
-            log.info(f"[{symbol}] Existing locate found today: "
-                     f"{filled} shares accepted | quoteReqID={item.get('quoteReqID')}")
-            return True, filled
-    log.info(f"[{symbol}] No usable existing locate found for today")
+        available = int(item.get("available", 0))
+        sold      = int(item.get("sold", 0))
+        log.info(f"[{symbol}] Inventory: available={available} sold={sold} "
+                 f"unavailable={item.get('unavailable',0)} toBeSold={item.get('toBeSold',0)}")
+        if available >= required_quantity:
+            log.info(f"[{symbol}] Existing locate usable: {available} shares available in inventory")
+            return True, available
+        elif available > 0:
+            log.info(f"[{symbol}] Locate inventory insufficient: {available} available < {required_quantity} required — requesting fresh locate")
+        else:
+            log.info(f"[{symbol}] No available inventory for {symbol} — requesting fresh locate")
+        return False, 0
+    log.info(f"[{symbol}] Symbol not found in locate inventory — requesting fresh locate")
     return False, 0
 
 
