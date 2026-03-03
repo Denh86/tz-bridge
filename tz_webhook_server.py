@@ -201,9 +201,11 @@ def get_time_in_force():
     rth_open  = _dt.time(9, 30)
     rth_close = _dt.time(16, 0)
     is_rth = rth_open <= t < rth_close
-    tif = "day" if is_rth else "ext"
+    # TZ valid values: "day", "gtc", "ioc", "fok" — no "ext" option
+    # Use "day" during RTH, "gtc" for pre/post market (stays active AH)
+    tif = "day" if is_rth else "gtc"
     log.info(f"  timeInForce={tif} (ET time {t.strftime('%H:%M')} | "
-             f"{'regular hours' if is_rth else 'extended hours'})")
+             f"{'RTH — day order' if is_rth else 'AH — gtc order'})")
     return tif
 
 
