@@ -194,14 +194,17 @@ def cancel_all_open_orders(symbol):
 
 def place_order(side, symbol, quantity, limit_price, label="ORDER"):
     client_id = f"QC_{side[:1].upper()}_{uuid.uuid4().hex[:8].upper()}"
+    # Field names/casing confirmed from working tz_test.py paper account test
+    side_str = "Sell" if side.lower() == "sell" else "Buy"
     payload = {
         "clientOrderId": client_id,
         "symbol":        symbol,
-        "quantity":      int(quantity),
-        "side":          side.lower(),
-        "orderType":     "limit",
+        "orderQuantity": int(quantity),   # ← orderQuantity not quantity
+        "side":          side_str,        # ← "Sell"/"Buy" PascalCase
+        "orderType":     "Limit",         # ← PascalCase
+        "securityType":  "Stock",         # ← required field
         "limitPrice":    round(limit_price, 2),
-        "timeInForce":   "GoodTillCancel",
+        "timeInForce":   "Day",           # ← PascalCase, worked in test
     }
     r = tz_post(f"/v1/api/accounts/{ACCOUNT_ID}/order", payload, label)
     if not r.ok:
