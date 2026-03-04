@@ -39,6 +39,9 @@ MIN_LOCATE_QUANTITY  = 100     # TZ minimum locate size
 LOCATE_POLL_INTERVAL = 2       # seconds between locate status polls
 LOCATE_POLL_TIMEOUT  = 30      # seconds before giving up on locate
 LIMIT_BUFFER         = 0.001   # 0.1% — short limit below market, cover limit above
+SHORT_FILL_TIMEOUT   = 5       # minutes to wait for short entry to fill before cancelling
+COVER_FILL_TIMEOUT   = 3       # minutes to wait for cover to fill before retrying aggressively
+COVER_RETRY_BUFFER   = 0.005   # 0.5% above Yahoo price for aggressive cover retry
 
 # ══════════════════════════════════════════════════════════════════════════════
 # CREDENTIALS
@@ -440,6 +443,11 @@ def locate_and_short(symbol, qc_quantity, entry_price):
             log.info(f"[{symbol}] SHORT PLACED (existing locate) | qty={final_quantity} | "
                      f"limit=${limit_price} | clientOrderId={result.get('clientOrderId')} | "
                      f"status={result.get('orderStatus')}")
+            threading.Thread(
+                target=monitor_short_fill,
+                args=(symbol, result.get("clientOrderId"), SHORT_FILL_TIMEOUT),
+                daemon=True
+            ).start()
         except Exception as e:
             block(symbol, f"order placement failed: {e}")
         return
@@ -572,6 +580,133 @@ def locate_and_short(symbol, qc_quantity, entry_price):
 # ══════════════════════════════════════════════════════════════════════════════
 # CANCEL + CLEANUP HELPER
 # ══════════════════════════════════════════════════════════════════════════════
+
+def monitor_short_fill(symbol, client_order_id, timeout_minutes):
+    """
+    After placing a short, wait up to timeout_minutes for it to fill.
+    If it doesn't fill, cancel it and block the symbol.
+    Runs in a background thread.
+    """
+    import time as _time
+    deadline = _time.time() + timeout_minutes * 60
+    poll_interval = 15  # seconds
+
+    log.info(f"[{symbol}] SHORT MONITOR started | order={client_order_id} | timeout={timeout_minutes}min")
+
+    while _time.time() < deadline:
+        _time.sleep(poll_interval)
+
+        # If state changed (e.g. COVER arrived and handled it), stop monitoring
+        state = get_state(symbol).get("state")
+        if state != "ACTIVE":
+            log.info(f"[{symbol}] SHORT MONITOR: state={state} — stopping monitor")
+            return
+
+        # Check order status
+        try:
+            r = tz_get(f"/v1/api/accounts/{ACCOUNT_ID}/orders", "SHORT_MONITOR_ORDERS")
+            orders = r.json() if r.ok else []
+            if not isinstance(orders, list):
+                orders = orders.get("orders", [])
+            order = next((o for o in orders if o.get("clientOrderId") == client_order_id), None)
+            if order:
+                status = order.get("orderStatus", "")
+                executed = int(order.get("executed", 0))
+                log.info(f"[{symbol}] SHORT MONITOR: status={status} executed={executed}")
+                if status in ("Filled",) or executed > 0:
+                    log.info(f"[{symbol}] SHORT MONITOR: order filled — monitor done")
+                    return
+                if status in ("Canceled", "Rejected"):
+                    log.warning(f"[{symbol}] SHORT MONITOR: order {status} externally — blocking")
+                    block(symbol, f"short order {status} externally")
+                    return
+        except Exception as e:
+            log.warning(f"[{symbol}] SHORT MONITOR: poll error — {e}")
+
+    # Timeout reached — cancel and block
+    log.warning(f"[{symbol}] SHORT MONITOR: timeout after {timeout_minutes}min — cancelling and blocking")
+    cancel_and_cleanup(symbol, f"short entry did not fill within {timeout_minutes} minutes")
+
+
+def monitor_cover_fill(symbol, client_order_id, timeout_minutes):
+    """
+    After placing a cover, wait up to timeout_minutes for it to fill.
+    If it doesn't fill, cancel it and place an aggressive market-price cover.
+    Runs in a background thread.
+    """
+    import time as _time
+    deadline = _time.time() + timeout_minutes * 60
+    poll_interval = 15  # seconds
+
+    log.info(f"[{symbol}] COVER MONITOR started | order={client_order_id} | timeout={timeout_minutes}min")
+
+    while _time.time() < deadline:
+        _time.sleep(poll_interval)
+
+        state = get_state(symbol).get("state")
+        if state == "FLAT":
+            log.info(f"[{symbol}] COVER MONITOR: already FLAT — done")
+            return
+
+        try:
+            r = tz_get(f"/v1/api/accounts/{ACCOUNT_ID}/orders", "COVER_MONITOR_ORDERS")
+            orders = r.json() if r.ok else []
+            if not isinstance(orders, list):
+                orders = orders.get("orders", [])
+            order = next((o for o in orders if o.get("clientOrderId") == client_order_id), None)
+            if order:
+                status = order.get("orderStatus", "")
+                executed = int(order.get("executed", 0))
+                log.info(f"[{symbol}] COVER MONITOR: status={status} executed={executed}")
+                if status in ("Filled",) or executed > 0:
+                    log.info(f"[{symbol}] COVER MONITOR: cover filled — done")
+                    set_state(symbol, state="FLAT", reason="cover filled (monitor confirmed)")
+                    return
+                if status in ("Canceled", "Rejected"):
+                    log.warning(f"[{symbol}] COVER MONITOR: cover {status} — will retry aggressively")
+                    break
+        except Exception as e:
+            log.warning(f"[{symbol}] COVER MONITOR: poll error — {e}")
+
+    # Timeout or cancellation — cancel stale order and retry aggressively
+    log.warning(f"[{symbol}] COVER MONITOR: cover did not fill — cancelling and retrying aggressively")
+    cancel_all_open_orders(symbol)
+
+    # Check still short
+    position = get_position(symbol)
+    if not position or float(position.get("shares", 0)) >= 0:
+        log.info(f"[{symbol}] COVER MONITOR: no short position remaining — marking FLAT")
+        set_state(symbol, state="FLAT", reason="cover monitor: no position found on retry")
+        return
+
+    # Get aggressive price from Yahoo (current market), fall back to priceClose
+    yahoo_price, yahoo_session = get_yahoo_price(symbol)
+    if yahoo_price:
+        aggressive_price = round(yahoo_price * (1 + COVER_RETRY_BUFFER), 2)
+        log.info(f"[{symbol}] COVER MONITOR: aggressive retry at ${aggressive_price} "
+                 f"(Yahoo={yahoo_price} session={yahoo_session} + {COVER_RETRY_BUFFER*100:.1f}%)")
+    else:
+        # Yahoo unavailable — try priceClose from position as last resort
+        priceClose = float(position.get("priceClose") or 0)
+        if priceClose > 0:
+            aggressive_price = round(priceClose * (1 + COVER_RETRY_BUFFER), 2)
+            log.warning(f"[{symbol}] COVER MONITOR: Yahoo unavailable — using priceClose fallback ${aggressive_price}")
+        else:
+            log.error(f"[{symbol}] COVER MONITOR: no Yahoo and no priceClose — MANUAL ACTION REQUIRED")
+            block(symbol, "aggressive cover failed: no price source available — MANUAL ACTION REQUIRED")
+            return
+
+    cover_qty = abs(int(float(position.get("shares", 0))))
+    try:
+        result = place_order("Buy", symbol, cover_qty, aggressive_price, "COVER_AGGRESSIVE")
+        log.info(f"[{symbol}] COVER MONITOR: aggressive cover placed | "
+                 f"clientOrderId={result.get('clientOrderId')} status={result.get('orderStatus')}")
+        set_state(symbol, state="FLAT", reason="aggressive cover placed")
+    except Exception as e:
+        log.error(f"[{symbol}] COVER MONITOR: aggressive cover FAILED: {e} — MANUAL ACTION REQUIRED")
+        block(symbol, "aggressive cover failed — MANUAL ACTION REQUIRED")
+
+
 def cancel_and_cleanup(symbol, reason):
     log.info(f"[{symbol}] CANCEL+CLEANUP: {reason}")
 
@@ -583,15 +718,22 @@ def cancel_and_cleanup(symbol, reason):
         shares = float(position.get("shares", 0))
         if shares < 0:
             cover_qty   = abs(int(shares))
-            # priceClose is 0.0 during market hours — use priceAvg as fallback
-            last_price  = float(position.get("priceClose") or position.get("priceAvg") or 0)
+            # priceClose = current market price (used for unrealised P&L)
+            # priceAvg   = entry price — NOT useful for cover pricing
+            last_price = float(position.get("priceClose") or 0)
             if last_price <= 0:
-                log.error(f"[{symbol}] Cannot determine cover price — MANUAL ACTION REQUIRED")
-                block(symbol, f"cleanup: has position but no valid price — MANUAL ACTION REQUIRED")
-                return
+                # priceClose unavailable (e.g. AH with no last trade) — try Yahoo
+                yahoo_price, yahoo_session = get_yahoo_price(symbol)
+                if yahoo_price:
+                    last_price = yahoo_price
+                    log.info(f"[{symbol}] priceClose=0, using Yahoo ${last_price} ({yahoo_session})")
+                else:
+                    log.error(f"[{symbol}] Cannot determine cover price — MANUAL ACTION REQUIRED")
+                    block(symbol, "cleanup: no priceClose and Yahoo unavailable — MANUAL ACTION REQUIRED")
+                    return
             cover_limit = round(last_price * (1 + LIMIT_BUFFER), 2)
             log.info(f"[{symbol}] Found short position: {cover_qty} shares | "
-                     f"covering at ${cover_limit}")
+                     f"priceClose=${last_price} | covering at ${cover_limit}")
             try:
                 result = place_order("Buy", symbol, cover_qty, cover_limit, "COVER_ON_CANCEL")
                 log.info(f"[{symbol}] Cover placed: {result.get('clientOrderId')} "
@@ -696,7 +838,7 @@ def webhook():
     log.info(f"  parsed: {json.dumps(body)}")
 
     action   = str(body.get("action", "")).upper()
-    symbol   = str(body.get("symbol", "")).upper().strip()
+    symbol   = str(body.get("symbol", "")).upper().strip().split()[0]  # strip QC SID e.g. "DLXY YTYSIFTLVN8L" → "DLXY"
     quantity = int(body.get("quantity", 0))
     price    = float(body.get("price", 0))
 
@@ -768,12 +910,12 @@ def webhook():
             return jsonify({"status": "ok", "note": "not a short position"}), 200
 
         cover_qty   = abs(int(shares))
-        # priceClose is 0.0 during market hours — use priceAvg as fallback, then signal price
-        last_price  = float(position.get("priceClose") or position.get("priceAvg") or price)
-        cover_limit = round(last_price * (1 + LIMIT_BUFFER), 2)
+        # Use QC's signal price — QC knows the current market price, server does not
+        # Add a small buffer above to ensure fill (buying to cover, so we go higher)
+        cover_limit = round(float(price) * (1 + LIMIT_BUFFER), 2)
 
         log.info(f"[{symbol}] Covering {cover_qty} shares | "
-                 f"last_price=${last_price} | limit=${cover_limit}")
+                 f"qc_price=${price} | limit=${cover_limit} (buffer={LIMIT_BUFFER*100:.1f}%)")
 
         try:
             result = place_order("Buy", symbol, cover_qty, cover_limit, "COVER_ORDER")
@@ -781,6 +923,11 @@ def webhook():
             log.info(f"[{symbol}] COVER PLACED | qty={cover_qty} | limit=${cover_limit} | "
                      f"clientOrderId={result.get('clientOrderId')} | "
                      f"status={result.get('orderStatus')}")
+            threading.Thread(
+                target=monitor_cover_fill,
+                args=(symbol, result.get("clientOrderId"), COVER_FILL_TIMEOUT),
+                daemon=True
+            ).start()
             return jsonify({
                 "status":        "ok",
                 "action":        "COVER",
