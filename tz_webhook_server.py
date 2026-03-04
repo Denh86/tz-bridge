@@ -1,5 +1,5 @@
 """
-TradeZero Webhook Execution Server — EOD Short Strategy 
+TradeZero Webhook Execution Server — EOD Short Strategy
 =======================================================
 Receives SHORT / COVER / CANCEL signals from QuantConnect.
 Manages the full locate → short → cover lifecycle with state machine.
@@ -205,6 +205,7 @@ def place_order(side, symbol, quantity, limit_price, label="ORDER"):
         "securityType":  "Stock",         # ← required field
         "limitPrice":    round(limit_price, 2),
         "timeInForce":   "Day",           # ← PascalCase, worked in test
+        "route":         "SMART",         # ← required, confirmed from routes API
     }
     r = tz_post(f"/v1/api/accounts/{ACCOUNT_ID}/order", payload, label)
     if not r.ok:
@@ -312,20 +313,59 @@ def check_existing_locate(symbol, required_quantity):
 PRICE_SANITY_PCT = 0.10   # reject if QC price deviates >10% from Yahoo
 
 def get_yahoo_price(symbol):
-    """Fetch last price from Yahoo Finance. Returns float or None."""
-    import urllib.request as _req
+    """
+    Fetch the most relevant price from Yahoo Finance based on current market session.
+    Uses postMarketPrice during AH, preMarketPrice during pre-market, regularMarketPrice during RTH.
+    Returns (price, session_label) or (None, None) on failure.
+    """
+    import urllib.request as _req, datetime as _dt
     url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?interval=1m&range=1d"
     try:
         req = _req.Request(url, headers={
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
         })
         with _req.urlopen(req, timeout=5) as resp:
-            data = __import__('json').loads(resp.read())
-            price = data["chart"]["result"][0]["meta"]["regularMarketPrice"]
-            return float(price)
+            meta = __import__('json').loads(resp.read())["chart"]["result"][0]["meta"]
+
+        # Determine ET time (no pytz — manual DST offset)
+        utc_now = _dt.datetime.now(_dt.timezone.utc)
+        year = utc_now.year
+        dst_start = _dt.datetime(year, 3, 1) + _dt.timedelta(
+            days=(6 - _dt.datetime(year, 3, 1).weekday()) % 7 + 7)
+        dst_end = _dt.datetime(year, 11, 1) + _dt.timedelta(
+            days=(6 - _dt.datetime(year, 11, 1).weekday()) % 7)
+        is_dst = dst_start <= utc_now.replace(tzinfo=None) < dst_end
+        et_hour = (utc_now + _dt.timedelta(hours=-4 if is_dst else -5)).hour
+        et_minute = (utc_now + _dt.timedelta(hours=-4 if is_dst else -5)).minute
+        et_time = et_hour * 60 + et_minute  # minutes since midnight ET
+
+        rth_open  = 9 * 60 + 30   # 9:30 AM
+        rth_close = 16 * 60        # 4:00 PM
+        pre_open  = 4 * 60         # 4:00 AM
+
+        if et_time < pre_open or et_time >= 20 * 60:
+            # Overnight — use regular market price, nothing better available
+            price = meta.get("regularMarketPrice")
+            label = "regular(overnight)"
+        elif et_time < rth_open:
+            # Pre-market: 4am–9:30am
+            price = meta.get("preMarketPrice") or meta.get("regularMarketPrice")
+            label = "preMarket" if meta.get("preMarketPrice") else "regular(no-pre)"
+        elif et_time < rth_close:
+            # Regular hours
+            price = meta.get("regularMarketPrice")
+            label = "regular"
+        else:
+            # After-hours: 4pm–8pm
+            price = meta.get("postMarketPrice") or meta.get("regularMarketPrice")
+            label = "postMarket" if meta.get("postMarketPrice") else "regular(no-post)"
+
+        if price:
+            return float(price), label
+        return None, None
     except Exception as e:
         log.warning(f"Yahoo price lookup failed for {symbol}: {e}")
-        return None
+        return None, None
 
 def locate_and_short(symbol, qc_quantity, entry_price):
     log.info(f"[{symbol}] ── LOCATE THREAD STARTED ──────────────────────")
@@ -333,16 +373,16 @@ def locate_and_short(symbol, qc_quantity, entry_price):
 
     # ── Step 0: Validate QC price against Yahoo Finance ───────────────────────
     log.info(f"[{symbol}] Step 0: Price sanity check via Yahoo Finance")
-    yahoo_price = get_yahoo_price(symbol)
+    yahoo_price, yahoo_session = get_yahoo_price(symbol)
     if yahoo_price is not None:
         deviation = abs(entry_price - yahoo_price) / yahoo_price
-        log.info(f"[{symbol}] Yahoo=${yahoo_price:.4f} | QC=${entry_price:.4f} | "
+        log.info(f"[{symbol}] Yahoo=${yahoo_price:.4f} ({yahoo_session}) | QC=${entry_price:.4f} | "
                  f"deviation={deviation*100:.2f}% (limit={PRICE_SANITY_PCT*100:.0f}%)")
         if deviation > PRICE_SANITY_PCT:
             block(symbol, f"price sanity FAILED: QC=${entry_price} vs Yahoo=${yahoo_price:.4f} "
-                          f"({deviation*100:.1f}% > {PRICE_SANITY_PCT*100:.0f}% limit — likely bad tick)")
+                          f"({yahoo_session}, {deviation*100:.1f}% > {PRICE_SANITY_PCT*100:.0f}% limit — likely bad tick)")
             return
-        log.info(f"[{symbol}] Price sanity OK ✓")
+        log.info(f"[{symbol}] Price sanity OK ✓ ({yahoo_session})")
     else:
         log.warning(f"[{symbol}] Yahoo unavailable — proceeding with QC price (unvalidated)")
 
