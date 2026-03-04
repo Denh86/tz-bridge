@@ -315,13 +315,33 @@ def check_existing_locate(symbol, required_quantity):
 # ══════════════════════════════════════════════════════════════════════════════
 PRICE_SANITY_PCT = 0.10   # reject if QC price deviates >10% from Yahoo
 
-def get_yahoo_price(symbol):
-    """
-    Fetch the most relevant price from Yahoo Finance based on current market session.
-    Uses postMarketPrice during AH, preMarketPrice during pre-market, regularMarketPrice during RTH.
-    Returns (price, session_label) or (None, None) on failure.
-    """
-    import urllib.request as _req, datetime as _dt
+def _et_session():
+    """Return (et_time_minutes, session) where session is 'pre', 'rth', 'post', 'overnight'."""
+    import datetime as _dt
+    utc_now = _dt.datetime.now(_dt.timezone.utc)
+    year = utc_now.year
+    dst_start = _dt.datetime(year, 3, 1) + _dt.timedelta(
+        days=(6 - _dt.datetime(year, 3, 1).weekday()) % 7 + 7)
+    dst_end = _dt.datetime(year, 11, 1) + _dt.timedelta(
+        days=(6 - _dt.datetime(year, 11, 1).weekday()) % 7)
+    is_dst = dst_start <= utc_now.replace(tzinfo=None) < dst_end
+    et_offset = _dt.timedelta(hours=-4 if is_dst else -5)
+    et_now = utc_now + et_offset
+    et_time = et_now.hour * 60 + et_now.minute
+    if et_time < 4 * 60 or et_time >= 20 * 60:
+        session = "overnight"
+    elif et_time < 9 * 60 + 30:
+        session = "pre"
+    elif et_time < 16 * 60:
+        session = "rth"
+    else:
+        session = "post"
+    return et_time, session
+
+
+def _yahoo_v8_price(symbol):
+    """Yahoo Finance v8 chart — original method. Returns (price, label) or (None, None)."""
+    import urllib.request as _req
     url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?interval=1m&range=1d"
     try:
         req = _req.Request(url, headers={
@@ -329,46 +349,133 @@ def get_yahoo_price(symbol):
         })
         with _req.urlopen(req, timeout=5) as resp:
             meta = __import__('json').loads(resp.read())["chart"]["result"][0]["meta"]
-
-        # Determine ET time (no pytz — manual DST offset)
-        utc_now = _dt.datetime.now(_dt.timezone.utc)
-        year = utc_now.year
-        dst_start = _dt.datetime(year, 3, 1) + _dt.timedelta(
-            days=(6 - _dt.datetime(year, 3, 1).weekday()) % 7 + 7)
-        dst_end = _dt.datetime(year, 11, 1) + _dt.timedelta(
-            days=(6 - _dt.datetime(year, 11, 1).weekday()) % 7)
-        is_dst = dst_start <= utc_now.replace(tzinfo=None) < dst_end
-        et_hour = (utc_now + _dt.timedelta(hours=-4 if is_dst else -5)).hour
-        et_minute = (utc_now + _dt.timedelta(hours=-4 if is_dst else -5)).minute
-        et_time = et_hour * 60 + et_minute  # minutes since midnight ET
-
-        rth_open  = 9 * 60 + 30   # 9:30 AM
-        rth_close = 16 * 60        # 4:00 PM
-        pre_open  = 4 * 60         # 4:00 AM
-
-        if et_time < pre_open or et_time >= 20 * 60:
-            # Overnight — use regular market price, nothing better available
+        _, session = _et_session()
+        if session == "overnight":
             price = meta.get("regularMarketPrice")
-            label = "regular(overnight)"
-        elif et_time < rth_open:
-            # Pre-market: 4am–9:30am
-            price = meta.get("preMarketPrice") or meta.get("regularMarketPrice")
-            label = "preMarket" if meta.get("preMarketPrice") else "regular(no-pre)"
-        elif et_time < rth_close:
-            # Regular hours
+            label = "v8:regular(overnight)"
+        elif session == "pre":
+            price = meta.get("preMarketPrice")
+            label = "v8:preMarket" if price else None
+            if not price:
+                return None, "v8:no-pre"   # stale — signal caller to try next source
+        elif session == "rth":
             price = meta.get("regularMarketPrice")
-            label = "regular"
+            label = "v8:regular"
         else:
-            # After-hours: 4pm–8pm
-            price = meta.get("postMarketPrice") or meta.get("regularMarketPrice")
-            label = "postMarket" if meta.get("postMarketPrice") else "regular(no-post)"
-
-        if price:
-            return float(price), label
-        return None, None
+            price = meta.get("postMarketPrice")
+            label = "v8:postMarket" if price else None
+            if not price:
+                return None, "v8:no-post"
+        return (float(price), label) if price else (None, None)
     except Exception as e:
-        log.warning(f"Yahoo price lookup failed for {symbol}: {e}")
+        log.warning(f"Yahoo v8 lookup failed for {symbol}: {e}")
         return None, None
+
+
+def _yahoo_v7_price(symbol):
+    """Yahoo Finance v7 quote — richer pre/post market fields. Returns (price, label) or (None, None)."""
+    import urllib.request as _req
+    url = f"https://query1.finance.yahoo.com/v7/finance/quote?symbols={symbol}"
+    try:
+        req = _req.Request(url, headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Accept": "application/json"
+        })
+        with _req.urlopen(req, timeout=5) as resp:
+            result = __import__('json').loads(resp.read())
+        r = result.get("quoteResponse", {}).get("result", [])
+        if not r:
+            return None, None
+        q = r[0]
+        _, session = _et_session()
+        if session == "pre":
+            price = q.get("preMarketPrice")
+            label = "v7:preMarket" if price else None
+            if not price:
+                return None, "v7:no-pre"
+        elif session == "post":
+            price = q.get("postMarketPrice")
+            label = "v7:postMarket" if price else None
+            if not price:
+                return None, "v7:no-post"
+        else:
+            price = q.get("regularMarketPrice")
+            label = f"v7:regular({session})"
+        return (float(price), label) if price else (None, None)
+    except Exception as e:
+        log.warning(f"Yahoo v7 lookup failed for {symbol}: {e}")
+        return None, None
+
+
+def _nasdaq_price(symbol):
+    """
+    NASDAQ public API — covers all US exchanges (NYSE, AMEX, NASDAQ, OTC).
+    Returns (price, label) or (None, None).
+    """
+    import urllib.request as _req
+    url = f"https://api.nasdaq.com/api/quote/{symbol}/info?assetclass=stocks"
+    try:
+        req = _req.Request(url, headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Accept": "application/json, text/plain, */*",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Origin": "https://www.nasdaq.com",
+            "Referer": "https://www.nasdaq.com/"
+        })
+        with _req.urlopen(req, timeout=5) as resp:
+            data = __import__('json').loads(resp.read())
+        if data.get("status", {}).get("rCode") != 200:
+            return None, None
+        _, session = _et_session()
+        primary = data.get("data", {}).get("primaryData", {})
+        secondary = data.get("data", {}).get("secondaryData") or {}
+        # primaryData = current session price, secondaryData = extended hours
+        # During pre/post market, secondaryData holds the extended price
+        if session in ("pre", "post") and secondary.get("lastSalePrice"):
+            raw = secondary["lastSalePrice"].replace("$", "").replace(",", "").strip()
+            label = f"nasdaq:{'preMarket' if session == 'pre' else 'postMarket'}"
+        else:
+            raw = primary.get("lastSalePrice", "").replace("$", "").replace(",", "").strip()
+            label = f"nasdaq:regular({session})"
+        price = float(raw) if raw else None
+        return (price, label) if price else (None, None)
+    except Exception as e:
+        log.warning(f"NASDAQ lookup failed for {symbol}: {e}")
+        return None, None
+
+
+def get_market_price(symbol):
+    """
+    Waterfall price lookup: Yahoo v7 → Yahoo v8 → NASDAQ.
+    Each source is tried in order. If a source returns stale data (no pre/post price
+    during extended hours) we try the next source rather than blocking on bad data.
+    Returns (price, source_label) or (None, None) if all sources fail/stale.
+    """
+    _, session = _et_session()
+    sources = [
+        ("Yahoo-v7",  _yahoo_v7_price),
+        ("Yahoo-v8",  _yahoo_v8_price),
+        ("NASDAQ",    _nasdaq_price),
+    ]
+    for name, fn in sources:
+        try:
+            price, label = fn(symbol)
+            if price is not None:
+                log.info(f"[{symbol}] Price source: {label} = ${price:.4f} (session={session})")
+                return price, label
+            elif label and "no-pre" in label or label and "no-post" in label:
+                log.warning(f"[{symbol}] {name}: no extended-hours price available — trying next source")
+            else:
+                log.warning(f"[{symbol}] {name}: returned no price — trying next source")
+        except Exception as e:
+            log.warning(f"[{symbol}] {name} error: {e} — trying next source")
+    log.warning(f"[{symbol}] All price sources exhausted — proceeding unvalidated")
+    return None, None
+
+
+# Keep old name as alias so any other call sites still work
+def get_yahoo_price(symbol):
+    return get_market_price(symbol)
 
 def locate_and_short(symbol, qc_quantity, entry_price):
     log.info(f"[{symbol}] ── LOCATE THREAD STARTED ──────────────────────")
@@ -379,15 +486,15 @@ def locate_and_short(symbol, qc_quantity, entry_price):
     yahoo_price, yahoo_session = get_yahoo_price(symbol)
     if yahoo_price is not None:
         deviation = abs(entry_price - yahoo_price) / yahoo_price
-        log.info(f"[{symbol}] Yahoo=${yahoo_price:.4f} ({yahoo_session}) | QC=${entry_price:.4f} | "
+        log.info(f"[{symbol}] Price check: {yahoo_session}=${yahoo_price:.4f} | QC=${entry_price:.4f} | "
                  f"deviation={deviation*100:.2f}% (limit={PRICE_SANITY_PCT*100:.0f}%)")
         if deviation > PRICE_SANITY_PCT:
-            block(symbol, f"price sanity FAILED: QC=${entry_price} vs Yahoo=${yahoo_price:.4f} "
-                          f"({yahoo_session}, {deviation*100:.1f}% > {PRICE_SANITY_PCT*100:.0f}% limit — likely bad tick)")
+            block(symbol, f"price sanity FAILED: QC=${entry_price} vs {yahoo_session}=${yahoo_price:.4f} "
+                          f"({deviation*100:.1f}% > {PRICE_SANITY_PCT*100:.0f}% limit — likely bad tick)")
             return
         log.info(f"[{symbol}] Price sanity OK ✓ ({yahoo_session})")
     else:
-        log.warning(f"[{symbol}] Yahoo unavailable — proceeding with QC price (unvalidated)")
+        log.warning(f"[{symbol}] All price sources exhausted — proceeding with QC price (unvalidated)")
 
     # ── Step 1: Check buying power + margin ───────────────────────────────────
     log.info(f"[{symbol}] Step 1: Checking buying power and margin")
