@@ -351,6 +351,12 @@ def check_existing_locate(symbol, required_quantity):
 # ══════════════════════════════════════════════════════════════════════════════
 PRICE_SANITY_PCT = 0.10   # reject if QC price deviates >10% from Yahoo
 
+# Ticker aliases — QC sometimes uses new tickers before TZ updates their system.
+# Add entries here as needed: { "QC_TICKER": "TZ_TICKER" }
+TICKER_ALIASES = {
+    "FPGP": "ALTO",   # Alto Ingredients rebranded; TZ still uses ALTO
+}
+
 def get_yahoo_price(symbol):
     """
     Fetch the most relevant price from Yahoo Finance based on current market session.
@@ -406,6 +412,12 @@ def get_yahoo_price(symbol):
 def locate_and_short(symbol, qc_quantity, entry_price):
     log.info(f"[{symbol}] ── LOCATE THREAD STARTED ──────────────────────")
     log.info(f"[{symbol}] QC requested: qty={qc_quantity} entry_price=${entry_price}")
+
+    # Apply ticker alias if TZ uses a different symbol than QC
+    tz_symbol = TICKER_ALIASES.get(symbol, symbol)
+    if tz_symbol != symbol:
+        log.info(f"[{symbol}] Ticker alias: QC={symbol} → TZ={tz_symbol}")
+        symbol = tz_symbol
 
     # ── Step 0: Validate QC price against Yahoo Finance ───────────────────────
     log.info(f"[{symbol}] Step 0: Price sanity check via Yahoo Finance")
