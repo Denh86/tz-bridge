@@ -1,5 +1,5 @@
 """
-TradeZero Webhook Execution Server — EOD Short Strategy 
+TradeZero Webhook Execution Server — EOD Short Strategy
 =======================================================
 Receives SHORT / COVER / CANCEL signals from QuantConnect.
 Manages the full locate → short → cover lifecycle with state machine.
@@ -443,17 +443,43 @@ def locate_and_short(symbol, qc_quantity, entry_price):
 
     usable_capital = min(available_cash, margin_available)
 
-    # TZ margin requirement for short selling (as of Aug 2, 2024):
-    # Stocks < $5.00: $5.00 per share flat (regardless of actual price)
-    # Stocks >= $5.00: actual price per share (100% standard margin)
-    if entry_price < 5.0:
-        margin_per_share = 5.0
+    # TZ margin requirements for short selling (session-aware):
+    # https://tradezero.com/support/questions/what-are-your-margin-requirements-tradezero-international
+    #
+    # Session       < $2.50          $2.50–$5.00      >= $5.00
+    # 4am–4pm       $2.50/share      16.67% (6×)      16.67% (6×)
+    # 4pm–8pm       $5.00/share      $5.00/share      50%   (2×)
+    #
+    now_et = datetime.now(ZoneInfo("America/New_York"))
+    et_time = now_et.time()
+    from datetime import time as _time
+    rth_open  = _time(4,  0)
+    rth_close = _time(16, 0)
+    ah_close  = _time(20, 0)
+    in_premarket_or_rth = rth_open <= et_time < rth_close
+    in_ah               = rth_close <= et_time < ah_close
+
+    if in_premarket_or_rth:
+        if entry_price < 2.50:
+            margin_per_share = 2.50
+        else:
+            # 6× leverage → margin = price / 6
+            margin_per_share = entry_price / 6.0
+    elif in_ah:
+        if entry_price < 5.0:
+            margin_per_share = 5.0
+        else:
+            # 2× leverage → margin = price / 2
+            margin_per_share = entry_price / 2.0
     else:
-        margin_per_share = entry_price
+        # Outside trading hours — use conservative AH rate
+        margin_per_share = max(5.0, entry_price / 2.0)
+
     max_affordable = int(usable_capital / margin_per_share)
-    log.info(f"[{symbol}] margin_per_share=${margin_per_share:.2f} | "
+    log.info(f"[{symbol}] session={'pre/RTH' if in_premarket_or_rth else 'AH' if in_ah else 'closed'} | "
+             f"margin_per_share=${margin_per_share:.4f} | "
              f"max_affordable={max_affordable} "
-             f"(usable=${usable_capital:,.2f} / margin=${margin_per_share:.2f}/share)")
+             f"(usable=${usable_capital:,.2f} / margin=${margin_per_share:.4f}/share)")
 
     # ── Step 2: Can we afford minimum? ────────────────────────────────────────
     if max_affordable < MIN_LOCATE_QUANTITY:
