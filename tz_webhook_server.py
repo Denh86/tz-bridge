@@ -413,11 +413,7 @@ def locate_and_short(symbol, qc_quantity, entry_price):
     log.info(f"[{symbol}] ── LOCATE THREAD STARTED ──────────────────────")
     log.info(f"[{symbol}] QC requested: qty={qc_quantity} entry_price=${entry_price}")
 
-    # Apply ticker alias if TZ uses a different symbol than QC
-    tz_symbol = TICKER_ALIASES.get(symbol, symbol)
-    if tz_symbol != symbol:
-        log.info(f"[{symbol}] Ticker alias: QC={symbol} → TZ={tz_symbol}")
-        symbol = tz_symbol
+    # (ticker alias already applied at webhook entry point)
 
     # ── Step 0: Validate QC price against Yahoo Finance ───────────────────────
     log.info(f"[{symbol}] Step 0: Price sanity check via Yahoo Finance")
@@ -892,13 +888,18 @@ def webhook():
 
     log.info(f"  parsed: {json.dumps(body)}")
 
-    action   = str(body.get("action", "")).upper()
-    symbol   = str(body.get("symbol", "")).upper().strip().split()[0]  # strip QC SID e.g. "DLXY YTYSIFTLVN8L" → "DLXY"
-    quantity = int(body.get("quantity", 0))
-    price    = float(body.get("price", 0))
+    action      = str(body.get("action", "")).upper()
+    qc_symbol   = str(body.get("symbol", "")).upper().strip().split()[0]  # strip QC SID e.g. "DLXY YTYSIFTLVN8L" → "DLXY"
+    quantity    = int(body.get("quantity", 0))
+    price       = float(body.get("price", 0))
 
-    if not symbol:
+    if not qc_symbol:
         return jsonify({"error": "missing symbol"}), 400
+
+    # Apply ticker alias at entry point so all state tracking uses TZ symbol
+    symbol = TICKER_ALIASES.get(qc_symbol, qc_symbol)
+    if symbol != qc_symbol:
+        log.info(f"[{qc_symbol}] Ticker alias: QC={qc_symbol} → TZ={symbol}")
 
     s             = get_state(symbol)
     current_state = s.get("state", "FLAT")
