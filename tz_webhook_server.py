@@ -450,9 +450,9 @@ def locate_and_short(symbol, qc_quantity, entry_price):
     # 4am–4pm       $2.50/share      16.67% (6×)      16.67% (6×)
     # 4pm–8pm       $5.00/share      $5.00/share      50%   (2×)
     #
-    now_et = datetime.now(ZoneInfo("America/New_York"))
+    from datetime import datetime as _datetime, time as _time
+    now_et = _datetime.now(ZoneInfo("America/New_York"))
     et_time = now_et.time()
-    from datetime import time as _time
     rth_open  = _time(4,  0)
     rth_close = _time(16, 0)
     ah_close  = _time(20, 0)
@@ -838,6 +838,8 @@ def root():
     return jsonify({"status": "ok", "server": "tz-eod-short-webhook"}), 200
 
 
+_last_health_log = 0  # epoch seconds of last health log
+
 @app.route("/health", methods=["GET", "HEAD"])
 def health():
     url = f"{BASE_URL}/v1/api/accounts"
@@ -877,7 +879,12 @@ def health():
             "limit_buffer":        LIMIT_BUFFER,
         },
     }
-    log.info(f"HEALTH: {status}")
+    global _last_health_log
+    import time as _t
+    now_ts = _t.time()
+    if now_ts - _last_health_log >= 300:  # log at most once every 5 minutes
+        log.info(f"HEALTH: {status}")
+        _last_health_log = now_ts
     return jsonify(status), 200
 
 
