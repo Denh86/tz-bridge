@@ -103,6 +103,42 @@ def midnight_reset_thread():
 threading.Thread(target=midnight_reset_thread, daemon=True).start()
 
 
+def self_watchdog_thread():
+    """
+    Pings own /health endpoint every 60 seconds.
+    If 3 consecutive failures, forces gunicorn to recycle the worker
+    by raising SIGTERM on the current process — gunicorn master will
+    spawn a fresh worker automatically.
+    """
+    import signal as _signal, urllib.request as _req, os as _os
+    time.sleep(30)  # wait for server to fully start before first ping
+
+    port = int(_os.environ.get("PORT", 10000))
+    url  = f"http://127.0.0.1:{port}/health"
+    fails = 0
+
+    while True:
+        time.sleep(60)
+        try:
+            with _req.urlopen(url, timeout=10) as r:
+                if r.status == 200:
+                    fails = 0
+                else:
+                    fails += 1
+                    log.warning(f"WATCHDOG: /health returned {r.status} ({fails}/3)")
+        except Exception as e:
+            fails += 1
+            log.warning(f"WATCHDOG: /health unreachable — {e} ({fails}/3)")
+
+        if fails >= 3:
+            log.error("WATCHDOG: 3 consecutive health failures — recycling worker")
+            _os.kill(_os.getpid(), _signal.SIGTERM)
+            return  # thread exits; gunicorn spawns new worker
+
+
+threading.Thread(target=self_watchdog_thread, daemon=True).start()
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # TZ API HELPERS — every call logs full request + response
 # ══════════════════════════════════════════════════════════════════════════════
@@ -207,7 +243,7 @@ def place_order(side, symbol, quantity, limit_price, label="ORDER"):
         "orderType":     "Limit",         # ← PascalCase
         "securityType":  "Stock",         # ← required field
         "limitPrice":    round(limit_price, 2),
-        "timeInForce":   "Day",           # ← PascalCase, worked in test
+        "timeInForce":   "Day_Plus",      # Day_Plus covers pre-market + AH; Day gets rejected at/after 4pm ET
         "route":         "SMART",         # ← required, confirmed from routes API
     }
     r = tz_post(f"/v1/api/accounts/{ACCOUNT_ID}/order", payload, label)
@@ -398,9 +434,18 @@ def locate_and_short(symbol, qc_quantity, entry_price):
     log.info(f"[{symbol}] buyingPower=${available_cash:,.2f} | marginAvailable=${margin_available:,.2f}")
 
     usable_capital = min(available_cash, margin_available)
-    max_affordable = int(usable_capital / entry_price)
-    log.info(f"[{symbol}] max_affordable={max_affordable} "
-             f"(usable=${usable_capital:,.2f} / entry=${entry_price})")
+
+    # TZ margin requirement for short selling (as of Aug 2, 2024):
+    # Stocks < $5.00: $5.00 per share flat (regardless of actual price)
+    # Stocks >= $5.00: actual price per share (100% standard margin)
+    if entry_price < 5.0:
+        margin_per_share = 5.0
+    else:
+        margin_per_share = entry_price
+    max_affordable = int(usable_capital / margin_per_share)
+    log.info(f"[{symbol}] margin_per_share=${margin_per_share:.2f} | "
+             f"max_affordable={max_affordable} "
+             f"(usable=${usable_capital:,.2f} / margin=${margin_per_share:.2f}/share)")
 
     # ── Step 2: Can we afford minimum? ────────────────────────────────────────
     if max_affordable < MIN_LOCATE_QUANTITY:
@@ -614,8 +659,9 @@ def monitor_short_fill(symbol, client_order_id, timeout_minutes):
                     log.info(f"[{symbol}] SHORT MONITOR: order filled — monitor done")
                     return
                 if status in ("Canceled", "Rejected"):
-                    log.warning(f"[{symbol}] SHORT MONITOR: order {status} externally — blocking")
-                    block(symbol, f"short order {status} externally")
+                    reject_text = order.get("text") or order.get("rejectReason") or "no reason given"
+                    log.warning(f"[{symbol}] SHORT MONITOR: order {status} | reason: {reject_text}")
+                    block(symbol, f"short order {status}: {reject_text}")
                     return
         except Exception as e:
             log.warning(f"[{symbol}] SHORT MONITOR: poll error — {e}")
