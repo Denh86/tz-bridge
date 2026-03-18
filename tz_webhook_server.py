@@ -23,6 +23,7 @@ HOW TO RUN:
 
 import os, json, uuid, logging, threading, time
 from datetime import date
+from zoneinfo import ZoneInfo
 import requests
 from flask import Flask, request, jsonify
 from dotenv import load_dotenv
@@ -840,38 +841,55 @@ def root():
 
 _last_health_log = 0  # epoch seconds of last health log
 
+# Cache TZ API status so health endpoint never blocks on external calls
+_tz_cache = {"ok": True, "detail": "startup", "routes": "", "account_bp": None}
+_tz_cache_lock = threading.Lock()
+_last_tz_check = 0
+
+def _refresh_tz_cache():
+    """Background thread: refresh TZ API status every 60s."""
+    global _last_tz_check
+    while True:
+        time.sleep(60)
+        try:
+            r = requests.get(f"{BASE_URL}/v1/api/accounts", headers=tz_headers(), timeout=8)
+            ok = r.status_code == 200
+            detail = f"http_{r.status_code}: {r.text[:200]}"
+            # Also grab account bp
+            r2 = requests.get(f"{BASE_URL}/v1/api/account/{ACCOUNT_ID}", headers=tz_headers(), timeout=8)
+            bp = r2.json().get("bp") if r2.ok else None
+            # Routes (less critical, longer cache ok)
+            try:
+                r3 = requests.get(f"{BASE_URL}/v1/api/accounts/{ACCOUNT_ID}/routes", headers=tz_headers(), timeout=5)
+                routes = r3.text[:300]
+            except Exception:
+                routes = _tz_cache.get("routes", "")
+            with _tz_cache_lock:
+                _tz_cache.update({"ok": ok, "detail": detail, "routes": routes, "account_bp": bp})
+            _last_tz_check = time.time()
+        except Exception as e:
+            with _tz_cache_lock:
+                _tz_cache["ok"] = False
+                _tz_cache["detail"] = f"error: {e}"
+
+threading.Thread(target=_refresh_tz_cache, daemon=True).start()
+
+
 @app.route("/health", methods=["GET", "HEAD"])
 def health():
-    url = f"{BASE_URL}/v1/api/accounts"
-    try:
-        r = requests.get(url, headers=tz_headers(), timeout=10)
-        tz_ok     = r.status_code == 200
-        tz_detail = f"http_{r.status_code}: {r.text[:200]}"
-    except requests.exceptions.Timeout:
-        tz_ok, tz_detail = False, "timeout"
-    except Exception as e:
-        tz_ok, tz_detail = False, f"error: {str(e)[:100]}"
-
     with state_lock:
         states = {k: v.get("state") for k, v in symbol_state.items()}
-
-    # Check available routes
-    try:
-        r_routes = requests.get(
-            f"{BASE_URL}/v1/api/accounts/{ACCOUNT_ID}/routes",
-            headers=tz_headers(), timeout=5)
-        routes_info = r_routes.text[:300]
-    except Exception as e:
-        routes_info = f"error: {e}"
+    with _tz_cache_lock:
+        cache = dict(_tz_cache)
 
     status = {
         "server":        "ok",
-        "tz_api":        "ok" if tz_ok else "unreachable",
-        "tz_detail":     tz_detail,
+        "tz_api":        "ok" if cache["ok"] else "unreachable",
+        "tz_detail":     cache["detail"],
         "account":       ACCOUNT_ID,
         "key_preview":   API_KEY[:8] + "..." if API_KEY else "NOT SET",
         "symbol_states": states,
-        "routes":        routes_info,
+        "routes":        cache["routes"],
         "config": {
             "max_locate_cost_pct": MAX_LOCATE_COST_PCT,
             "min_locate_quantity": MIN_LOCATE_QUANTITY,
@@ -882,7 +900,7 @@ def health():
     global _last_health_log
     import time as _t
     now_ts = _t.time()
-    if now_ts - _last_health_log >= 300:  # log at most once every 5 minutes
+    if now_ts - _last_health_log >= 300:
         log.info(f"HEALTH: {status}")
         _last_health_log = now_ts
     return jsonify(status), 200
