@@ -362,7 +362,7 @@ def check_existing_locate(symbol, required_quantity):
 # ══════════════════════════════════════════════════════════════════════════════
 # PRICE SANITY  (Yahoo Finance)
 # ══════════════════════════════════════════════════════════════════════════════
-PRICE_SANITY_PCT = 0.10   # reject if QC price deviates >10% from Yahoo
+PRICE_SANITY_PCT = 0.15   # reject if QC price deviates >15% from Twelve Data/Yahoo — wide enough for volatile stocks
 
 # ── TICKER ALIAS MAP ─────────────────────────────────────────────────────────
 # QC data sometimes lags on ticker renames. Static fallback — entries here
@@ -581,12 +581,14 @@ def locate_and_short(symbol, qc_quantity, entry_price):
 
     # (ticker alias already applied at webhook entry point)
 
-    # ── Step 0: Price sanity check + live price update ────────────────────────
-    # Use Finnhub (real-time) → Yahoo (fallback) to:
-    #   a) Reject if QC price is a bad/stale tick (>PRICE_SANITY_PCT deviation)
-    #   b) Update entry_price to the current live price so the order reflects
-    #      what the stock is actually trading at, not the 8pm scan price
-    log.info(f"[{symbol}] Step 0: Live price check (Finnhub → Yahoo fallback)")
+    #── Step 0: Price sanity check (validation only — QC price is trusted) ──────
+    # Twelve Data / Yahoo are used ONLY to catch wildly wrong QC prices
+    # (e.g. stale warmup bar prices, bad ticks). They are NOT used to set the
+    # entry price — both sources have 3-15 min delays on free tiers which would
+    # give a worse price than QC's own live feed.
+    # QC receives real-time data in live mode — it is the most accurate source.
+    # PRICE_SANITY_PCT (15%) is deliberately wide to catch only genuine errors (e.g. 236% bad ticks),
+    log.info(f"[{symbol}] Step 0: Price sanity check (QC=${entry_price:.4f})")
     live_price, live_session = get_live_price(symbol)
     if live_price is not None:
         deviation = abs(entry_price - live_price) / live_price
@@ -596,13 +598,12 @@ def locate_and_short(symbol, qc_quantity, entry_price):
             block(symbol, f"price sanity FAILED: QC=${entry_price} vs {live_session}=${live_price:.4f} "
                           f"({deviation*100:.1f}% > {PRICE_SANITY_PCT*100:.0f}% limit — likely bad/stale tick)")
             return
-        log.info(f"[{symbol}] Price sanity OK ✓ — updating entry_price "
-                 f"${entry_price:.4f} → ${live_price:.4f} ({live_session})")
-        entry_price = live_price   # use live price for margin calc, locate cost, and order
+        log.info(f"[{symbol}] Price sanity OK ✓ — using QC price ${entry_price:.4f} "
+                 f"({live_session} ${live_price:.4f} is reference only, not used for order)")
     else:
         log.warning(f"[{symbol}] All price sources exhausted — proceeding with QC price (unvalidated)")
 
-    # ── Step 1: Check buying power + margin ───────────────────────────────────
+        # ── Step 1: Check buying power + margin ───────────────────────────────────
     log.info(f"[{symbol}] Step 1: Checking buying power and margin")
     account = get_account_details()
     if account is None:
@@ -879,10 +880,25 @@ def monitor_short_fill(symbol, client_order_id, timeout_minutes):
     while _time.time() < deadline:
         _time.sleep(poll_interval)
 
-        # If state changed (e.g. COVER arrived and handled it), stop monitoring
+        # If state changed, handle carefully:
+        # FLAT/COVER handled it → safe to exit
+        # BLOCKED → order may still be live on TZ — cancel it before exiting
         state = get_state(symbol).get("state")
         if state != "ACTIVE":
-            log.info(f"[{symbol}] SHORT MONITOR: state={state} — stopping monitor")
+            if state == "BLOCKED":
+                log.warning(f"[{symbol}] SHORT MONITOR: state=BLOCKED — cancelling orphaned order {client_order_id}")
+                try:
+                    cancelled = cancel_all_open_orders(symbol)
+                    log.info(f"[{symbol}] SHORT MONITOR: cancelled {cancelled} open order(s) after BLOCKED state")
+                    # Check if the order actually filled before we could cancel
+                    position = get_position(symbol)
+                    if position and float(position.get("shares", 0)) < 0:
+                        log.warning(f"[{symbol}] SHORT MONITOR: order filled BEFORE cancel — short position exists! "
+                                    f"Manual action required or wait for COVER webhook.")
+                except Exception as e:
+                    log.error(f"[{symbol}] SHORT MONITOR: error cancelling order after BLOCKED: {e}")
+            else:
+                log.info(f"[{symbol}] SHORT MONITOR: state={state} — stopping monitor")
             return
 
         # Check order status
