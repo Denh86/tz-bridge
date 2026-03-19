@@ -231,7 +231,6 @@ def cancel_all_open_orders(symbol):
     return cancelled
 
 
-
 def place_order(side, symbol, quantity, limit_price, label="ORDER"):
     client_id = f"QC_{side[:1].upper()}_{uuid.uuid4().hex[:8].upper()}"
     # Field names/casing confirmed from working tz_test.py paper account test
@@ -346,17 +345,120 @@ def check_existing_locate(symbol, required_quantity):
     return False, 0
 
 
-
 # ══════════════════════════════════════════════════════════════════════════════
 # PRICE SANITY  (Yahoo Finance)
 # ══════════════════════════════════════════════════════════════════════════════
 PRICE_SANITY_PCT = 0.10   # reject if QC price deviates >10% from Yahoo
 
-# Ticker aliases — QC sometimes uses new tickers before TZ updates their system.
-# Add entries here as needed: { "QC_TICKER": "TZ_TICKER" }
+# ── TICKER ALIAS MAP ─────────────────────────────────────────────────────────
+# QC data sometimes lags on ticker renames. Static fallback — entries here
+# are used instantly with zero network calls and survive any Polygon outage.
+# New renames are caught automatically by resolve_symbol() via Polygon and
+# logged with instructions to add them here permanently.
+#
+#   "OLD_QC_TICKER": "CURRENT_TZ_TICKER"
 TICKER_ALIASES = {
     "FPGP": "ALTO",   # Alto Ingredients rebranded; TZ still uses ALTO
+    "AGE":  "SER",    # AgeX Therapeutics merged into Serina Therapeutics (Mar 27 2024)
 }
+
+# Polygon.io API key — used for live ticker rename detection
+POLYGON_API_KEY = (os.getenv("POLYGON_API_KEY") or "").strip()
+
+# Runtime cache: resolved renames discovered via Polygon this session.
+# Avoids repeat Polygon calls for the same symbol within a day.
+_polygon_rename_cache = {}
+_polygon_cache_lock   = threading.Lock()
+
+
+def resolve_symbol(qc_symbol):
+    """
+    Resolve a QC ticker to the current TZ-tradeable ticker.
+
+    Resolution order:
+      1. Static TICKER_ALIASES dict  — instant, no network, catches known renames
+      2. Runtime cache               — avoids repeat Polygon calls within a session
+      3. Polygon two-step CIK lookup — live auto-detection for unknown renames:
+           a. GET /v3/reference/tickers?ticker=OLD&active=false  → cik
+           b. GET /v3/reference/tickers?cik=CIK&active=true      → current ticker
+      4. QC symbol as-is             — Polygon unavailable or no rename found
+
+    On a new Polygon-detected rename, logs a loud warning with the exact line
+    to add to TICKER_ALIASES so it's cached permanently on next deploy.
+
+    Returns resolved symbol string.
+    """
+    # Pass 1: static alias map
+    if qc_symbol in TICKER_ALIASES:
+        resolved = TICKER_ALIASES[qc_symbol]
+        log.info(f"[{qc_symbol}] Alias map → {resolved}")
+        return resolved
+
+    # Pass 2: runtime cache (Polygon result from earlier in this session)
+    with _polygon_cache_lock:
+        if qc_symbol in _polygon_rename_cache:
+            resolved = _polygon_rename_cache[qc_symbol]
+            log.info(f"[{qc_symbol}] Runtime cache → {resolved}")
+            return resolved
+
+    # Pass 3: Polygon live lookup
+    if not POLYGON_API_KEY:
+        log.info(f"[{qc_symbol}] POLYGON_API_KEY not set — skipping rename check")
+        return qc_symbol
+
+    try:
+        base = "https://api.polygon.io/v3/reference/tickers"
+
+        # Step 3a: look up old ticker (may be delisted/renamed)
+        r1 = requests.get(
+            base,
+            params={"ticker": qc_symbol, "active": "false", "apiKey": POLYGON_API_KEY},
+            timeout=8,
+        )
+        if not r1.ok or not r1.json().get("results"):
+            log.info(f"[{qc_symbol}] Polygon: ticker not found in delisted list — no rename")
+            return qc_symbol
+
+        cik = r1.json()["results"][0].get("cik")
+        if not cik:
+            log.info(f"[{qc_symbol}] Polygon: no CIK returned — cannot resolve rename")
+            return qc_symbol
+
+        # Step 3b: look up current active ticker by CIK
+        r2 = requests.get(
+            base,
+            params={"cik": cik, "active": "true", "apiKey": POLYGON_API_KEY},
+            timeout=8,
+        )
+        if not r2.ok or not r2.json().get("results"):
+            log.info(f"[{qc_symbol}] Polygon: no active ticker found for CIK {cik}")
+            return qc_symbol
+
+        current_ticker = r2.json()["results"][0].get("ticker", "").upper()
+        if not current_ticker or current_ticker == qc_symbol:
+            log.info(f"[{qc_symbol}] Polygon: no rename detected (CIK={cik})")
+            return qc_symbol
+
+        # New rename found — cache it and log a loud warning
+        with _polygon_cache_lock:
+            _polygon_rename_cache[qc_symbol] = current_ticker
+
+        log.warning(
+            f"\n"
+            f"╔══════════════════════════════════════════════════════════╗\n"
+            f"║  TICKER RENAME DETECTED via Polygon                      ║\n"
+            f"║  QC ticker : {qc_symbol:<10}  →  Current : {current_ticker:<10}       ║\n"
+            f"║  CIK       : {cik:<46} ║\n"
+            f"║  ACTION    : add to TICKER_ALIASES in server code:       ║\n"
+            f'║    "{qc_symbol}": "{current_ticker}",{" " * max(0, 43 - len(qc_symbol) - len(current_ticker))}║\n'
+            f"╚══════════════════════════════════════════════════════════╝"
+        )
+        return current_ticker
+
+    except Exception as e:
+        log.warning(f"[{qc_symbol}] Polygon rename lookup failed: {e} — using QC symbol as-is")
+        return qc_symbol
+
 
 def get_yahoo_price(symbol):
     """
@@ -409,6 +511,8 @@ def get_yahoo_price(symbol):
     except Exception as e:
         log.warning(f"Yahoo price lookup failed for {symbol}: {e}")
         return None, None
+
+
 
 def locate_and_short(symbol, qc_quantity, entry_price):
     log.info(f"[{symbol}] ── LOCATE THREAD STARTED ──────────────────────")
@@ -650,6 +754,11 @@ def locate_and_short(symbol, qc_quantity, entry_price):
         log.info(f"[{symbol}] SHORT PLACED | qty={final_quantity} | "
                  f"limit=${limit_price} | clientOrderId={result.get('clientOrderId')} | "
                  f"status={result.get('orderStatus')}")
+        threading.Thread(
+            target=monitor_short_fill,
+            args=(symbol, result.get("clientOrderId"), SHORT_FILL_TIMEOUT),
+            daemon=True
+        ).start()
     except Exception as e:
         block(symbol, f"order placement failed: {e}")
 
@@ -890,6 +999,8 @@ def health():
         "key_preview":   API_KEY[:8] + "..." if API_KEY else "NOT SET",
         "symbol_states": states,
         "routes":        cache["routes"],
+        "ticker_aliases": TICKER_ALIASES,
+        "polygon_key":   POLYGON_API_KEY[:8] + "..." if POLYGON_API_KEY else "NOT SET",
         "config": {
             "max_locate_cost_pct": MAX_LOCATE_COST_PCT,
             "min_locate_quantity": MIN_LOCATE_QUANTITY,
@@ -947,10 +1058,10 @@ def webhook():
     if not qc_symbol:
         return jsonify({"error": "missing symbol"}), 400
 
-    # Apply ticker alias at entry point so all state tracking uses TZ symbol
-    symbol = TICKER_ALIASES.get(qc_symbol, qc_symbol)
+    # ── Resolve ticker: static alias map → Polygon live lookup ─────────────
+    symbol = resolve_symbol(qc_symbol)
     if symbol != qc_symbol:
-        log.info(f"[{qc_symbol}] Ticker alias: QC={qc_symbol} → TZ={symbol}")
+        log.info(f"[{qc_symbol}→{symbol}] Ticker resolved")
 
     s             = get_state(symbol)
     current_state = s.get("state", "FLAT")
@@ -1082,6 +1193,8 @@ if __name__ == "__main__":
     log.info("║  POST /reset/<symbol>   ← manually reset symbol to FLAT ║")
     log.info("╚══════════════════════════════════════════════════════════╝")
     log.info(f"  Account:           {ACCOUNT_ID}")
+    log.info(f"  Ticker aliases:    {TICKER_ALIASES}")
+    log.info(f"  Polygon key:       {POLYGON_API_KEY[:8] + '...' if POLYGON_API_KEY else 'NOT SET — rename auto-detection disabled'}")
     log.info(f"  Max locate cost:   {MAX_LOCATE_COST_PCT*100:.1f}%")
     log.info(f"  Min locate qty:    {MIN_LOCATE_QUANTITY}")
     log.info(f"  Locate timeout:    {LOCATE_POLL_TIMEOUT}s")
