@@ -120,33 +120,40 @@ threading.Thread(target=midnight_reset_thread, daemon=True).start()
 
 def self_watchdog_thread():
     """
-    Pings own /health endpoint every 60 seconds.
-    If 3 consecutive failures, forces gunicorn to recycle the worker
+    Pings own /health endpoint every 90 seconds.
+    If 5 consecutive failures, forces gunicorn to recycle the worker
     by raising SIGTERM on the current process — gunicorn master will
     spawn a fresh worker automatically.
+
+    Initial delay of 180s gives Render's port scanner time to confirm
+    the port is open before the watchdog starts pinging — avoids false-
+    positive self-kills during cold start / deploy.
     """
     import signal as _signal, urllib.request as _req, os as _os
-    time.sleep(30)  # wait for server to fully start before first ping
+    time.sleep(180)  # wait for Render port scan + full startup before first ping
 
     port = int(_os.environ.get("PORT", 10000))
     url  = f"http://127.0.0.1:{port}/health"
     fails = 0
+    log.info("WATCHDOG: starting health monitoring")
 
     while True:
-        time.sleep(60)
+        time.sleep(90)
         try:
             with _req.urlopen(url, timeout=10) as r:
                 if r.status == 200:
+                    if fails > 0:
+                        log.info(f"WATCHDOG: /health recovered (was {fails} failures)")
                     fails = 0
                 else:
                     fails += 1
-                    log.warning(f"WATCHDOG: /health returned {r.status} ({fails}/3)")
+                    log.warning(f"WATCHDOG: /health returned {r.status} ({fails}/5)")
         except Exception as e:
             fails += 1
-            log.warning(f"WATCHDOG: /health unreachable — {e} ({fails}/3)")
+            log.warning(f"WATCHDOG: /health unreachable — {e} ({fails}/5)")
 
-        if fails >= 3:
-            log.error("WATCHDOG: 3 consecutive health failures — recycling worker")
+        if fails >= 5:
+            log.error("WATCHDOG: 5 consecutive health failures — recycling worker")
             _os.kill(_os.getpid(), _signal.SIGTERM)
             return  # thread exits; gunicorn spawns new worker
 
