@@ -39,16 +39,20 @@ MAX_LOCATE_COST_PCT  = 0.02    # 2%  — reject if locatePrice / entryPrice > th
 MIN_LOCATE_QUANTITY  = 100     # TZ minimum locate size
 LOCATE_POLL_INTERVAL = 2       # seconds between locate status polls
 LOCATE_POLL_TIMEOUT  = 30      # seconds before giving up on locate
+LOCATE_ACCEPT_SLEEP  = 3       # seconds to wait after locate accept before placing order
+                               # TZ sends "locateAcceptSent:true" before fully registering
+                               # the locate — placing the order too fast causes R43 rejection
 LIMIT_BUFFER         = 0.001   # 0.1% — short limit below market, cover limit above
 SHORT_FILL_TIMEOUT   = 5       # minutes to wait for short entry to fill before cancelling
 COVER_FILL_TIMEOUT   = 3       # minutes to wait for cover to fill before retrying aggressively
-COVER_RETRY_BUFFER   = 0.005   # 0.5% above Yahoo price for aggressive cover retry
+COVER_RETRY_BUFFER   = 0.005   # 0.5% above live price for aggressive cover retry
 
 # ══════════════════════════════════════════════════════════════════════════════
 # CREDENTIALS
 # ══════════════════════════════════════════════════════════════════════════════
-API_KEY    = (os.getenv("TZ_API_KEY")    or "").strip()
-API_SECRET = (os.getenv("TZ_API_SECRET") or "").strip()
+API_KEY         = (os.getenv("TZ_API_KEY")      or "").strip()
+API_SECRET      = (os.getenv("TZ_API_SECRET")   or "").strip()
+TWELVEDATA_API_KEY = (os.getenv("TWELVEDATA_API_KEY") or "").strip()
 
 # ══════════════════════════════════════════════════════════════════════════════
 # LOGGING
@@ -61,6 +65,16 @@ logging.basicConfig(
 )
 log = logging.getLogger("tz_server")
 log.info("=== tz_webhook_server module loading ===")
+
+# Suppress gunicorn access log spam from Render's health check pings.
+# These hit /health every 5s from 10.225.x.x and flood the logs.
+class _HealthCheckFilter(logging.Filter):
+    def filter(self, record):
+        msg = record.getMessage()
+        return "GET /health" not in msg
+
+for _gunicorn_logger in ("gunicorn.access", "gunicorn.error", "werkzeug"):
+    logging.getLogger(_gunicorn_logger).addFilter(_HealthCheckFilter())
 
 # ══════════════════════════════════════════════════════════════════════════════
 # STATE MACHINE  (reset at midnight)
@@ -460,11 +474,40 @@ def resolve_symbol(qc_symbol):
         return qc_symbol
 
 
-def get_yahoo_price(symbol):
+def _get_twelvedata_price(symbol):
     """
-    Fetch the most relevant price from Yahoo Finance based on current market session.
-    Uses postMarketPrice during AH, preMarketPrice during pre-market, regularMarketPrice during RTH.
+    Fetch current price from Twelve Data.
+    Returns (price, "twelvedata") or (None, None) on failure.
+    Free tier: 800 calls/day, 8/min. No session logic needed — returns
+    live price for whatever session is active (pre, RTH, AH).
+    Signup: twelvedata.com — free, no credit card.
+    """
+    if not TWELVEDATA_API_KEY:
+        return None, None
+    import urllib.request as _req
+    url = f"https://api.twelvedata.com/price?symbol={symbol}&apikey={TWELVEDATA_API_KEY}"
+    try:
+        req = _req.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with _req.urlopen(req, timeout=5) as resp:
+            data = __import__('json').loads(resp.read())
+        if "price" not in data:
+            log.warning(f"Twelve Data error for {symbol}: {data.get('message', data)}")
+            return None, None
+        price = float(data["price"])
+        if price > 0:
+            return price, "twelvedata"
+        return None, None
+    except Exception as e:
+        log.warning(f"Twelve Data price lookup failed for {symbol}: {e}")
+        return None, None
+
+
+def _get_yahoo_price(symbol):
+    """
+    Fetch price from Yahoo Finance — fallback when Finnhub unavailable.
+    Session-aware: uses preMarketPrice / postMarketPrice / regularMarketPrice.
     Returns (price, session_label) or (None, None) on failure.
+    NOTE: Yahoo occasionally returns 404 due to auth changes — Twelve Data is preferred.
     """
     import urllib.request as _req, datetime as _dt
     url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?interval=1m&range=1d"
@@ -475,42 +518,60 @@ def get_yahoo_price(symbol):
         with _req.urlopen(req, timeout=5) as resp:
             meta = __import__('json').loads(resp.read())["chart"]["result"][0]["meta"]
 
-        # Determine ET time (no pytz — manual DST offset)
-        utc_now = _dt.datetime.now(_dt.timezone.utc)
-        year = utc_now.year
+        # Determine ET time (manual DST offset — no pytz dependency)
+        utc_now   = _dt.datetime.now(_dt.timezone.utc)
+        year      = utc_now.year
         dst_start = _dt.datetime(year, 3, 1) + _dt.timedelta(
             days=(6 - _dt.datetime(year, 3, 1).weekday()) % 7 + 7)
-        dst_end = _dt.datetime(year, 11, 1) + _dt.timedelta(
+        dst_end   = _dt.datetime(year, 11, 1) + _dt.timedelta(
             days=(6 - _dt.datetime(year, 11, 1).weekday()) % 7)
-        is_dst = dst_start <= utc_now.replace(tzinfo=None) < dst_end
-        et_hour = (utc_now + _dt.timedelta(hours=-4 if is_dst else -5)).hour
-        et_minute = (utc_now + _dt.timedelta(hours=-4 if is_dst else -5)).minute
-        et_time = et_hour * 60 + et_minute  # minutes since midnight ET
+        is_dst    = dst_start <= utc_now.replace(tzinfo=None) < dst_end
+        offset    = -4 if is_dst else -5
+        et_now    = utc_now + _dt.timedelta(hours=offset)
+        et_time   = et_now.hour * 60 + et_now.minute
 
-        rth_open  = 9 * 60 + 30   # 9:30 AM
-        rth_close = 16 * 60        # 4:00 PM
-        pre_open  = 4 * 60         # 4:00 AM
+        rth_open  = 9 * 60 + 30
+        rth_close = 16 * 60
+        pre_open  = 4 * 60
 
         if et_time < pre_open or et_time >= 20 * 60:
             price = meta.get("regularMarketPrice")
-            label = "regular(overnight)"
+            label = "yahoo(overnight)"
         elif et_time < rth_open:
-            # Pre-market: only use preMarketPrice — do NOT fall back to prior close
-            price = meta.get("preMarketPrice")
-            label = "preMarket" if price else "regular(no-pre)"
+            price = meta.get("preMarketPrice")   # never fall back to prior close pre-market
+            label = "yahoo(preMarket)" if price else None
         elif et_time < rth_close:
             price = meta.get("regularMarketPrice")
-            label = "regular"
+            label = "yahoo(regular)"
         else:
             price = meta.get("postMarketPrice")
-            label = "postMarket" if price else "regular(no-post)"
+            label = "yahoo(postMarket)" if price else None
 
-        if price:
+        if price and label:
             return float(price), label
-        return None, "regular(no-pre)"   # signal: no usable price for this session
+        return None, None
     except Exception as e:
         log.warning(f"Yahoo price lookup failed for {symbol}: {e}")
         return None, None
+
+
+def get_live_price(symbol):
+    """
+    Get the best available real-time price for a symbol.
+    Priority: Twelve Data (real-time, all sessions) → Yahoo (real-time but flaky).
+    Returns (price, source_label) or (None, None) if all sources fail.
+    """
+    price, label = _get_twelvedata_price(symbol)
+    if price:
+        return price, label
+    log.info(f"[{symbol}] Twelve Data unavailable — trying Yahoo fallback")
+    return _get_yahoo_price(symbol)
+
+
+# Keep get_yahoo_price as an alias so cover monitor and cancel_and_cleanup
+# still work without changes — they call get_yahoo_price for aggressive cover pricing
+def get_yahoo_price(symbol):
+    return get_live_price(symbol)
 
 
 
@@ -520,18 +581,24 @@ def locate_and_short(symbol, qc_quantity, entry_price):
 
     # (ticker alias already applied at webhook entry point)
 
-    # ── Step 0: Validate QC price against Yahoo Finance ───────────────────────
-    log.info(f"[{symbol}] Step 0: Price sanity check via Yahoo Finance")
-    yahoo_price, yahoo_session = get_yahoo_price(symbol)
-    if yahoo_price is not None:
-        deviation = abs(entry_price - yahoo_price) / yahoo_price
-        log.info(f"[{symbol}] Price check: {yahoo_session}=${yahoo_price:.4f} | QC=${entry_price:.4f} | "
+    # ── Step 0: Price sanity check + live price update ────────────────────────
+    # Use Finnhub (real-time) → Yahoo (fallback) to:
+    #   a) Reject if QC price is a bad/stale tick (>PRICE_SANITY_PCT deviation)
+    #   b) Update entry_price to the current live price so the order reflects
+    #      what the stock is actually trading at, not the 8pm scan price
+    log.info(f"[{symbol}] Step 0: Live price check (Finnhub → Yahoo fallback)")
+    live_price, live_session = get_live_price(symbol)
+    if live_price is not None:
+        deviation = abs(entry_price - live_price) / live_price
+        log.info(f"[{symbol}] Price check: {live_session}=${live_price:.4f} | QC=${entry_price:.4f} | "
                  f"deviation={deviation*100:.2f}% (limit={PRICE_SANITY_PCT*100:.0f}%)")
         if deviation > PRICE_SANITY_PCT:
-            block(symbol, f"price sanity FAILED: QC=${entry_price} vs {yahoo_session}=${yahoo_price:.4f} "
-                          f"({deviation*100:.1f}% > {PRICE_SANITY_PCT*100:.0f}% limit — likely bad tick)")
+            block(symbol, f"price sanity FAILED: QC=${entry_price} vs {live_session}=${live_price:.4f} "
+                          f"({deviation*100:.1f}% > {PRICE_SANITY_PCT*100:.0f}% limit — likely bad/stale tick)")
             return
-        log.info(f"[{symbol}] Price sanity OK ✓ ({yahoo_session})")
+        log.info(f"[{symbol}] Price sanity OK ✓ — updating entry_price "
+                 f"${entry_price:.4f} → ${live_price:.4f} ({live_session})")
+        entry_price = live_price   # use live price for margin calc, locate cost, and order
     else:
         log.warning(f"[{symbol}] All price sources exhausted — proceeding with QC price (unvalidated)")
 
@@ -733,6 +800,36 @@ def locate_and_short(symbol, qc_quantity, entry_price):
         block(symbol, f"locate accept failed: {r_accept.status_code} | {r_accept.text[:200]}")
         return
     log.info(f"[{symbol}] Locate accepted successfully")
+
+    # ── Poll inventory until locate is registered (fixes R43) ────────────
+    # TZ sends "locateAcceptSent:true" before fully processing the accept.
+    # Placing the order immediately causes R43 "not enough located shares".
+    # Poll the inventory endpoint until the shares appear, hard timeout 15s.
+    log.info(f"[{symbol}] Step 10b: Polling inventory to confirm locate registered...")
+    inventory_confirmed = False
+    poll_deadline = time.time() + 15   # max 15s wait
+    poll_attempt  = 0
+    while time.time() < poll_deadline:
+        poll_attempt += 1
+        time.sleep(1)
+        r_inv = tz_get(f"/v1/api/accounts/{ACCOUNT_ID}/locates/inventory", "LOCATE_CONFIRM")
+        if r_inv.status_code == 200:
+            inventory = r_inv.json().get("locateInventory", [])
+            for item in inventory:
+                if item.get("symbol", "").upper() == symbol.upper():
+                    available = int(item.get("available", 0))
+                    if available >= final_quantity:
+                        log.info(f"[{symbol}] Inventory confirmed: {available} shares available "
+                                 f"(attempt {poll_attempt})")
+                        inventory_confirmed = True
+                        break
+        if inventory_confirmed:
+            break
+        log.info(f"[{symbol}] Locate not yet in inventory — retrying (attempt {poll_attempt})")
+
+    if not inventory_confirmed:
+        block(symbol, f"locate inventory not confirmed after 15s — R43 risk too high, aborting")
+        return
 
     if get_state(symbol).get("state") != "LOCATING":
         log.warning(f"[{symbol}] State changed after accept — aborting order")
@@ -1001,6 +1098,7 @@ def health():
         "routes":        cache["routes"],
         "ticker_aliases": TICKER_ALIASES,
         "polygon_key":   POLYGON_API_KEY[:8] + "..." if POLYGON_API_KEY else "NOT SET",
+        "twelvedata_key": TWELVEDATA_API_KEY[:8] + "..." if TWELVEDATA_API_KEY else "NOT SET",
         "config": {
             "max_locate_cost_pct": MAX_LOCATE_COST_PCT,
             "min_locate_quantity": MIN_LOCATE_QUANTITY,
@@ -1195,6 +1293,7 @@ if __name__ == "__main__":
     log.info(f"  Account:           {ACCOUNT_ID}")
     log.info(f"  Ticker aliases:    {TICKER_ALIASES}")
     log.info(f"  Polygon key:       {POLYGON_API_KEY[:8] + '...' if POLYGON_API_KEY else 'NOT SET — rename auto-detection disabled'}")
+    log.info(f"  Twelve Data key:   {TWELVEDATA_API_KEY[:8] + '...' if TWELVEDATA_API_KEY else 'NOT SET — price check falls back to Yahoo'}")
     log.info(f"  Max locate cost:   {MAX_LOCATE_COST_PCT*100:.1f}%")
     log.info(f"  Min locate qty:    {MIN_LOCATE_QUANTITY}")
     log.info(f"  Locate timeout:    {LOCATE_POLL_TIMEOUT}s")
