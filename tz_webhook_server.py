@@ -288,35 +288,40 @@ def place_order(side, symbol, quantity, limit_price, label="ORDER"):
 # ══════════════════════════════════════════════════════════════════════════════
 def place_order_with_stepdown(symbol, initial_quantity, limit_price, label="SHORT_ORDER"):
     """
-    Attempt to place a short order, stepping down in 20% increments each time
-    the order is rejected (e.g. insufficient BP at order time).
-    Minimum short order size is MIN_SHORT_QUANTITY (1 share) — completely
-    separate from MIN_LOCATE_QUANTITY which only applies to locate requests.
+    Attempt to place a short order at fixed percentage tiers of the located
+    quantity. Steps: 100% → 80% → 60% → 40% → 20%. Stops at 20% — if that
+    is also rejected, the symbol is blocked. Never goes below 20% of located.
 
-    Example with initial_quantity=100:
-      100 → 80 → 64 → 51 → 40 → 32 → ... → MIN_SHORT_QUANTITY
+    Example with initial_quantity=100 located shares:
+      attempt 1: 100sh (100%)
+      attempt 2:  80sh  (80%)
+      attempt 3:  60sh  (60%)
+      attempt 4:  40sh  (40%)
+      attempt 5:  20sh  (20%) ← minimum, quit if this fails
     """
-    qty = int(initial_quantity)
+    tiers    = [1.0, 0.8, 0.6, 0.4, 0.2]
     last_exc = None
-    attempt  = 0
-    while qty >= MIN_SHORT_QUANTITY:
-        attempt += 1
+    for attempt, pct in enumerate(tiers, 1):
+        qty = max(1, int(initial_quantity * pct))
         try:
             result = place_order("Sell", symbol, qty, limit_price, label)
-            if qty < initial_quantity:
-                log.info(f"[{symbol}] Order accepted after {attempt} attempt(s): "
-                         f"placed {qty}sh (started at {initial_quantity}sh)")
+            if attempt > 1:
+                log.info(f"[{symbol}] Order accepted on attempt {attempt} "
+                         f"at {int(pct*100)}%: placed {qty}sh "
+                         f"(located {initial_quantity}sh)")
             return result
         except Exception as e:
             last_exc = e
-            next_qty = max(MIN_SHORT_QUANTITY, int(qty * 0.8))
-            log.warning(f"[{symbol}] Order rejected at qty={qty}: {e} — "
-                        f"stepping down to {next_qty}sh (20% reduction, attempt {attempt})")
-            if next_qty == qty:
-                # Can't reduce further
-                break
-            qty = next_qty
-    raise last_exc or Exception(f"[{symbol}] All stepdown attempts failed")
+            if attempt < len(tiers):
+                next_pct = int(tiers[attempt] * 100)
+                log.warning(f"[{symbol}] Order rejected at {qty}sh "
+                            f"({int(pct*100)}%): {e} — "
+                            f"stepping down to {next_pct}%")
+            else:
+                log.warning(f"[{symbol}] Order rejected at {qty}sh "
+                            f"(20% minimum): {e} — giving up")
+    raise last_exc or Exception(f"[{symbol}] All stepdown tiers failed "
+                                f"(located {initial_quantity}sh)")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
