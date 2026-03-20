@@ -99,7 +99,11 @@ def set_state(symbol, **kwargs):
 
 
 def block(symbol, reason):
-    set_state(symbol, state="BLOCKED", reason=reason)
+    # Preserve the last stored cycle so a higher cycle from any strategy
+    # can lift this block. If no cycle was stored yet it stays 0,
+    # meaning even cycle=1 from any strategy will lift it.
+    last_cycle = symbol_state.get(symbol, {}).get("cycle", 0)
+    set_state(symbol, state="BLOCKED", reason=reason, cycle=last_cycle)
     log.warning(f"[{symbol}] BLOCKED: {reason}")
 
 
@@ -543,7 +547,7 @@ def _get_yahoo_price(symbol):
     # We take the last non-null close from the price array as the live price.
     try:
         url = (f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
-               f"?interval=1m&range=1d&includePrePost=true")
+               f"?interval=1m&range=2d&includePrePost=true")
         req = _req.Request(url, headers={
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
         })
@@ -560,8 +564,17 @@ def _get_yahoo_price(symbol):
             label = "yahoo_v8(regular)" if price else None
         else:
             # AH / pre-market: walk backwards through bars to find last non-null
-            # close that falls within the expected session window
-            now_ts = utc_now.timestamp()
+            # close from the most recent trading session.
+            #
+            # Lookback window:
+            #   AH (4pm-8pm):       4 hours  — only accept today's AH bars
+            #   Pre-market (4am-9:30am): 13 hours — covers yesterday's AH session
+            #     (yesterday AH ended 8pm ET = ~12h ago at 4am ET, so 13h catches it)
+            #
+            # This prevents pre-market entries from falling back to yesterday's
+            # 4pm RTH close when a stock ran in AH and has no pre-market bars yet.
+            now_ts     = utc_now.timestamp()
+            lookback_s = 4 * 3600 if is_ah else 13 * 3600
             price  = None
             label  = None
             for i in range(len(closes) - 1, -1, -1):
@@ -569,17 +582,19 @@ def _get_yahoo_price(symbol):
                 if c is None:
                     continue
                 ts = timestamps[i] if i < len(timestamps) else 0
-                # Only accept bars from the last 4 hours to avoid stale RTH bars
-                if now_ts - ts > 4 * 3600:
+                if now_ts - ts > lookback_s:
                     break
                 price = float(c)
                 label = "yahoo_v8(postMarket)" if is_ah else "yahoo_v8(preMarket)"
                 break
 
-            # If no AH/pre bar found yet (no trades), fall back to meta close
+            # If no session bar found, fall back to meta close but log clearly
             if price is None:
                 price = meta.get("regularMarketPrice")
                 label = "yahoo_v8(lastClose)" if price else None
+                if price:
+                    log.warning(f"Yahoo: no session bars found within {lookback_s//3600}h — "
+                                f"using lastClose ${price:.4f} (may be stale)")
 
         if price and label:
             log.info(f"[{symbol}] Yahoo price: {label} = ${price:.4f}")
