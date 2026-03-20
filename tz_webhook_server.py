@@ -37,6 +37,7 @@ BASE_URL             = "https://webapi.tradezero.com"
 ACCOUNT_ID           = "DHA41998"
 MAX_LOCATE_COST_PCT  = 0.02    # 2%  — reject if locatePrice / entryPrice > this
 MIN_LOCATE_QUANTITY  = 100     # TZ minimum locate size
+MIN_SHORT_QUANTITY   = 1       # TZ minimum short order size (any size accepted)
 LOCATE_POLL_INTERVAL = 2       # seconds between locate status polls
 LOCATE_POLL_TIMEOUT  = 30      # seconds before giving up on locate
 LOCATE_ACCEPT_SLEEP  = 3       # seconds to wait after locate accept before placing order
@@ -280,6 +281,42 @@ def place_order(side, symbol, quantity, limit_price, label="ORDER"):
     log.info(f"  [{symbol}] Order placed: clientOrderId={data.get('clientOrderId')} "
              f"status={data.get('orderStatus')}")
     return data
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# GRACEFUL ORDER STEPDOWN
+# ══════════════════════════════════════════════════════════════════════════════
+def place_order_with_stepdown(symbol, initial_quantity, limit_price, label="SHORT_ORDER"):
+    """
+    Attempt to place a short order, stepping down in 20% increments each time
+    the order is rejected (e.g. insufficient BP at order time).
+    Minimum short order size is MIN_SHORT_QUANTITY (1 share) — completely
+    separate from MIN_LOCATE_QUANTITY which only applies to locate requests.
+
+    Example with initial_quantity=100:
+      100 → 80 → 64 → 51 → 40 → 32 → ... → MIN_SHORT_QUANTITY
+    """
+    qty = int(initial_quantity)
+    last_exc = None
+    attempt  = 0
+    while qty >= MIN_SHORT_QUANTITY:
+        attempt += 1
+        try:
+            result = place_order("Sell", symbol, qty, limit_price, label)
+            if qty < initial_quantity:
+                log.info(f"[{symbol}] Order accepted after {attempt} attempt(s): "
+                         f"placed {qty}sh (started at {initial_quantity}sh)")
+            return result
+        except Exception as e:
+            last_exc = e
+            next_qty = max(MIN_SHORT_QUANTITY, int(qty * 0.8))
+            log.warning(f"[{symbol}] Order rejected at qty={qty}: {e} — "
+                        f"stepping down to {next_qty}sh (20% reduction, attempt {attempt})")
+            if next_qty == qty:
+                # Can't reduce further
+                break
+            qty = next_qty
+    raise last_exc or Exception(f"[{symbol}] All stepdown attempts failed")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -754,15 +791,20 @@ def locate_and_short(symbol, qc_quantity, entry_price):
     if has_locate:
         log.info(f"[{symbol}] Skipping locate request — using existing locate "
                  f"({located_qty} shares already accepted today)")
-        final_quantity = min(request_quantity, located_qty)
+        # Use located_qty directly — locate was already paid for at that quantity.
+        # Do NOT cap by request_quantity: BP may have ticked down slightly since the
+        # locate was obtained (locate cost itself reduces BP), which would cause the
+        # order to be placed for fewer shares than we hold locates for.
+        final_quantity = located_qty
         log.info(f"[{symbol}] Step 11: Placing short | qty={final_quantity} | "
                  f"entry=${entry_price} | limit=${round(entry_price * (1 - LIMIT_BUFFER), 2)}")
         try:
             limit_price = round(entry_price * (1 - LIMIT_BUFFER), 2)
-            result = place_order("Sell", symbol, final_quantity, limit_price, "SHORT_ORDER")
+            result = place_order_with_stepdown(symbol, final_quantity, limit_price, "SHORT_ORDER")
+            placed_qty = result.get("orderQuantity", final_quantity)
             set_state(symbol, state="ACTIVE", client_order_id=result.get("clientOrderId"))
             log.info(f"[{symbol}] STATE → ACTIVE")
-            log.info(f"[{symbol}] SHORT PLACED (existing locate) | qty={final_quantity} | "
+            log.info(f"[{symbol}] SHORT PLACED (existing locate) | qty={placed_qty} | "
                      f"limit=${limit_price} | clientOrderId={result.get('clientOrderId')} | "
                      f"status={result.get('orderStatus')}")
             threading.Thread(
@@ -771,7 +813,7 @@ def locate_and_short(symbol, qc_quantity, entry_price):
                 daemon=True
             ).start()
         except Exception as e:
-            block(symbol, f"order placement failed: {e}")
+            block(symbol, f"order placement failed after all stepdown attempts: {e}")
         return
 
     # ── Step 4: Request locate quote ──────────────────────────────────────────
@@ -914,15 +956,16 @@ def locate_and_short(symbol, qc_quantity, entry_price):
     log.info(f"[{symbol}] Step 11: Placing short | qty={final_quantity} | "
              f"entry=${entry_price} | limit=${limit_price}")
     try:
-        result = place_order("Sell", symbol, final_quantity, limit_price, "SHORT_ORDER")
+        result = place_order_with_stepdown(symbol, final_quantity, limit_price, "SHORT_ORDER")
+        placed_qty = result.get("orderQuantity", final_quantity)
         set_state(
             symbol,
             state="ACTIVE",
             entry_price=entry_price,
-            quantity=final_quantity,
+            quantity=placed_qty,
             client_order_id=result.get("clientOrderId"),
         )
-        log.info(f"[{symbol}] SHORT PLACED | qty={final_quantity} | "
+        log.info(f"[{symbol}] SHORT PLACED | qty={placed_qty} | "
                  f"limit=${limit_price} | clientOrderId={result.get('clientOrderId')} | "
                  f"status={result.get('orderStatus')}")
         threading.Thread(
@@ -931,7 +974,7 @@ def locate_and_short(symbol, qc_quantity, entry_price):
             daemon=True
         ).start()
     except Exception as e:
-        block(symbol, f"order placement failed: {e}")
+        block(symbol, f"order placement failed after all stepdown attempts: {e}")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
