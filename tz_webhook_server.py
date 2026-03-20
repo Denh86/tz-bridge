@@ -1226,6 +1226,7 @@ def webhook():
     qc_symbol   = str(body.get("symbol", "")).upper().strip().split()[0]  # strip QC SID e.g. "DLXY YTYSIFTLVN8L" → "DLXY"
     quantity    = int(body.get("quantity", 0))
     price       = float(body.get("price", 0))
+    cycle       = int(body.get("cycle", 1))  # trade cycle counter — used to lift BLOCKED on re-entry
 
     if not qc_symbol:
         return jsonify({"error": "missing symbol"}), 400
@@ -1244,8 +1245,14 @@ def webhook():
     # ── SHORT ─────────────────────────────────────────────────────────────────
     if action == "SHORT":
         if current_state == "BLOCKED":
-            log.info(f"[{symbol}] SHORT ignored — blocked today: {s.get('reason', '')}")
-            return jsonify({"status": "ignored", "reason": "blocked"}), 200
+            last_cycle = s.get("cycle", 0)
+            if cycle > last_cycle:
+                log.info(f"[{symbol}] BLOCKED lifted — new cycle {cycle} > last cycle {last_cycle} (QC started new trade)")
+                set_state(symbol, state="FLAT")  # reset so it falls through to LOCATING below
+                current_state = "FLAT"
+            else:
+                log.info(f"[{symbol}] SHORT ignored — blocked today (cycle={cycle}, last={last_cycle}): {s.get('reason', '')}")
+                return jsonify({"status": "ignored", "reason": "blocked", "cycle": cycle, "last_cycle": last_cycle}), 200
 
         if current_state == "LOCATING":
             log.warning(f"[{symbol}] SHORT ignored — locate already in progress")
@@ -1259,7 +1266,7 @@ def webhook():
         if quantity <= 0 or price <= 0:
             return jsonify({"error": "quantity and price required for SHORT"}), 400
 
-        set_state(symbol, state="LOCATING", entry_price=price, quantity=quantity)
+        set_state(symbol, state="LOCATING", entry_price=price, quantity=quantity, cycle=cycle)
         threading.Thread(target=locate_and_short, args=(symbol, quantity, price), daemon=True).start()
         log.info(f"[{symbol}] Locate thread launched — returning 200 immediately")
         return jsonify({"status": "ok", "action": "SHORT", "symbol": symbol, "state": "LOCATING"}), 200
