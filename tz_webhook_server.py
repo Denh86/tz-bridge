@@ -1,5 +1,5 @@
 """
-TradeZero Webhook Execution Server — EOD Short Strategy
+TradeZero Webhook Execution Server — EOD Short Strategy 
 =======================================================
 Receives SHORT / COVER / CANCEL signals from QuantConnect.
 Manages the full locate → short → cover lifecycle with state machine.
