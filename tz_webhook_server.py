@@ -1,5 +1,5 @@
 """
-TradeZero Webhook Execution Server — EOD Short Strategy 
+TradeZero Webhook Execution Server — EOD Short Strategy
 =======================================================
 Receives SHORT / COVER / CANCEL signals from QuantConnect.
 Manages the full locate → short → cover lifecycle with state machine.
@@ -43,7 +43,7 @@ LOCATE_POLL_TIMEOUT  = 30      # seconds before giving up on locate
 LOCATE_ACCEPT_SLEEP  = 3       # seconds to wait after locate accept before placing order
                                # TZ sends "locateAcceptSent:true" before fully registering
                                # the locate — placing the order too fast causes R43 rejection
-LIMIT_BUFFER         = 0.001   # 0.1% — short limit below market, cover limit above
+# QC strategies send already-buffered limit prices in webhooks — server uses them directly
 SHORT_FILL_TIMEOUT   = 5       # minutes to wait for short entry to fill before cancelling
 COVER_FILL_TIMEOUT   = 3       # minutes to wait for cover to fill before retrying aggressively
 COVER_RETRY_BUFFER   = 0.005   # 0.5% above live price for aggressive cover retry
@@ -802,9 +802,9 @@ def locate_and_short(symbol, qc_quantity, entry_price):
         # order to be placed for fewer shares than we hold locates for.
         final_quantity = located_qty
         log.info(f"[{symbol}] Step 11: Placing short | qty={final_quantity} | "
-                 f"entry=${entry_price} | limit=${round(entry_price * (1 - LIMIT_BUFFER), 2)}")
+                 f"limit=${entry_price} (QC pre-buffered)")
         try:
-            limit_price = round(entry_price * (1 - LIMIT_BUFFER), 2)
+            limit_price = entry_price  # QC already applied its buffer
             result = place_order_with_stepdown(symbol, final_quantity, limit_price, "SHORT_ORDER")
             placed_qty = result.get("orderQuantity", final_quantity)
             set_state(symbol, state="ACTIVE", client_order_id=result.get("clientOrderId"))
@@ -957,9 +957,9 @@ def locate_and_short(symbol, qc_quantity, entry_price):
         return
 
     # ── Step 11: Place short limit order ──────────────────────────────────────
-    limit_price = round(entry_price * (1 - LIMIT_BUFFER), 2)
+    limit_price = entry_price  # QC already applied its buffer
     log.info(f"[{symbol}] Step 11: Placing short | qty={final_quantity} | "
-             f"entry=${entry_price} | limit=${limit_price}")
+             f"entry/limit=${limit_price} (QC pre-buffered)")
     try:
         result = place_order_with_stepdown(symbol, final_quantity, limit_price, "SHORT_ORDER")
         placed_qty = result.get("orderQuantity", final_quantity)
@@ -1152,7 +1152,7 @@ def cancel_and_cleanup(symbol, reason):
                     log.error(f"[{symbol}] Cannot determine cover price — MANUAL ACTION REQUIRED")
                     block(symbol, "cleanup: no priceClose and Yahoo unavailable — MANUAL ACTION REQUIRED")
                     return
-            cover_limit = round(last_price * (1 + LIMIT_BUFFER), 2)
+            cover_limit = round(last_price * 1.005, 2)  # server retry: 0.5% above live price
             log.info(f"[{symbol}] Found short position: {cover_qty} shares | "
                      f"priceClose=${last_price} | covering at ${cover_limit}")
             try:
@@ -1240,7 +1240,7 @@ def health():
             "max_locate_cost_pct": MAX_LOCATE_COST_PCT,
             "min_locate_quantity": MIN_LOCATE_QUANTITY,
             "locate_poll_timeout": LOCATE_POLL_TIMEOUT,
-            "limit_buffer":        LIMIT_BUFFER,
+            "price_handling": "QC pre-buffered — server uses received price directly",
         },
     }
     global _last_health_log
@@ -1372,10 +1372,10 @@ def webhook():
         cover_qty   = abs(int(shares))
         # Use QC's signal price — QC knows the current market price, server does not
         # Add a small buffer above to ensure fill (buying to cover, so we go higher)
-        cover_limit = round(float(price) * (1 + LIMIT_BUFFER), 2)
+        cover_limit = float(price)  # QC already applied its buffer
 
         log.info(f"[{symbol}] Covering {cover_qty} shares | "
-                 f"qc_price=${price} | limit=${cover_limit} (buffer={LIMIT_BUFFER*100:.1f}%)")
+                 f"qc_price=${price} | limit=${cover_limit} (QC pre-buffered)")
 
         try:
             result = place_order("Buy", symbol, cover_qty, cover_limit, "COVER_ORDER")
@@ -1441,7 +1441,7 @@ if __name__ == "__main__":
     log.info(f"  Max locate cost:   {MAX_LOCATE_COST_PCT*100:.1f}%")
     log.info(f"  Min locate qty:    {MIN_LOCATE_QUANTITY}")
     log.info(f"  Locate timeout:    {LOCATE_POLL_TIMEOUT}s")
-    log.info(f"  Limit buffer:      {LIMIT_BUFFER*100:.1f}%")
+    log.info(f"  Price handling: QC pre-buffered — server uses received price directly")
     log.info(f"  Listening on port: {port}")
     log.info("")
     app.run(host="0.0.0.0", port=port, debug=False)
