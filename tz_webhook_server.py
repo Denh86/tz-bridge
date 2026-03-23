@@ -798,10 +798,19 @@ def locate_and_short(symbol, qc_quantity, entry_price):
     # TZ margin requirements for short selling (session-aware):
     # https://tradezero.com/support/questions/what-are-your-margin-requirements-tradezero-international
     #
-    # Session       < $2.50          $2.50–$5.00      >= $5.00
-    # 4am–4pm       $2.50/share      16.67% (6×)      16.67% (6×)
-    # 4pm–8pm       $5.00/share      $5.00/share      50%   (2×)
+    # SHORT EQUITY POSITION
+    # Price           4am–4pm ET         4pm–8pm ET         Overnight maintenance
+    # < $2.50         $2.50/share        $5.00/share        $2.50/share
+    # $2.50–$5.00     16.67% (6×)        $5.00/share        16.67% (6×)
+    # ≥ $5.00         16.67% (6×)        50% (2×)           16.67% (6×)
     #
+    # IMPORTANT: TZ may apply higher margin to "higher risk securities" without
+    # notice. We add a 25% safety buffer for stocks ≥$5.00 where this is most
+    # likely, reducing our max_affordable to avoid async R35 rejections.
+    # If R35 still occurs, the monitor retries at stepdown quantities.
+    #
+    HIGH_RISK_BUFFER = 1.25   # 25% extra margin buffer for ≥$5 stocks
+
     from datetime import datetime as _datetime, time as _time
     now_et = _datetime.now(ZoneInfo("America/New_York"))
     et_time = now_et.time()
@@ -814,22 +823,26 @@ def locate_and_short(symbol, qc_quantity, entry_price):
     if in_premarket_or_rth:
         if entry_price < 2.50:
             margin_per_share = 2.50
+        elif entry_price < 5.00:
+            margin_per_share = entry_price / 6.0          # 16.67% (6×)
         else:
-            # 6× leverage → margin = price / 6
-            margin_per_share = entry_price / 6.0
+            margin_per_share = (entry_price / 6.0) * HIGH_RISK_BUFFER  # 16.67% + 25% buffer
     elif in_ah:
-        if entry_price < 5.0:
-            margin_per_share = 5.0
+        if entry_price < 2.50:
+            margin_per_share = 5.00
+        elif entry_price < 5.00:
+            margin_per_share = 5.00
         else:
-            # 2× leverage → margin = price / 2
-            margin_per_share = entry_price / 2.0
+            margin_per_share = (entry_price / 2.0) * HIGH_RISK_BUFFER  # 50% + 25% buffer
     else:
-        # Outside trading hours — use conservative AH rate
-        margin_per_share = max(5.0, entry_price / 2.0)
+        # Outside trading hours — use conservative AH rate + buffer
+        margin_per_share = max(5.0, (entry_price / 2.0) * HIGH_RISK_BUFFER)
 
     max_affordable = int(usable_capital / margin_per_share)
-    log.info(f"[{symbol}] session={'pre/RTH' if in_premarket_or_rth else 'AH' if in_ah else 'closed'} | "
-             f"margin_per_share=${margin_per_share:.4f} | "
+    session_label = 'pre/RTH' if in_premarket_or_rth else 'AH' if in_ah else 'closed'
+    buffer_note   = f" (incl {int((HIGH_RISK_BUFFER-1)*100)}% safety buffer)" if entry_price >= 5.0 else ""
+    log.info(f"[{symbol}] session={session_label} | "
+             f"margin_per_share=${margin_per_share:.4f}{buffer_note} | "
              f"max_affordable={max_affordable} "
              f"(usable=${usable_capital:,.2f} / margin=${margin_per_share:.4f}/share)")
 
@@ -1120,6 +1133,37 @@ def monitor_short_fill(symbol, client_order_id, timeout_minutes):
                 if status in ("Canceled", "Rejected"):
                     reject_text = order.get("text") or order.get("rejectReason") or "no reason given"
                     log.warning(f"[{symbol}] SHORT MONITOR: order {status} | reason: {reject_text}")
+
+                    # R35 = insufficient BP — TZ accepted then asynchronously rejected.
+                    # Our BP calc may not match TZ's internal calc (other locates consume
+                    # margin on their side). Retry at stepdown tiers rather than blocking.
+                    if "R35" in reject_text or "Buying Power" in reject_text:
+                        s = get_state(symbol)
+                        prev_qty  = int(s.get("quantity", 0))
+                        lp        = float(s.get("entry_price", 0))
+                        if prev_qty > 0 and lp > 0:
+                            # Step down to 80% of previous attempt
+                            next_qty = max(1, int(prev_qty * 0.8))
+                            log.warning(f"[{symbol}] R35 — stepping down from {prev_qty}sh to {next_qty}sh")
+                            set_state(symbol, state="LOCATING")
+                            try:
+                                result = place_order_with_stepdown(symbol, next_qty, lp, "SHORT_ORDER_RETRY")
+                                placed_qty = result.get("orderQuantity", next_qty)
+                                set_state(symbol, state="ACTIVE",
+                                          entry_price=lp, quantity=placed_qty,
+                                          client_order_id=result.get("clientOrderId"))
+                                log.info(f"[{symbol}] SHORT RETRY PLACED | qty={placed_qty} | "
+                                         f"clientOrderId={result.get('clientOrderId')}")
+                                # Restart monitor with new order id
+                                import threading as _threading
+                                _threading.Thread(
+                                    target=monitor_short_fill,
+                                    args=(symbol, result.get("clientOrderId"), timeout_minutes),
+                                    daemon=True
+                                ).start()
+                            except Exception as e:
+                                block(symbol, f"short order R35 retry failed: {e}")
+                            return
                     block(symbol, f"short order {status}: {reject_text}")
                     return
         except Exception as e:
