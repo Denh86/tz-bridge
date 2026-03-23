@@ -637,6 +637,24 @@ def _get_yahoo_price(symbol):
                 if price:
                     log.warning(f"Yahoo: no session bars found within {lookback_s//3600}h — "
                                 f"using lastClose ${price:.4f} (may be stale)")
+                # Log diagnostic info so we can debug future cases:
+                # show total bar count, last timestamp in array, and last non-null close
+                total_bars   = len(closes)
+                last_ts      = timestamps[-1] if timestamps else 0
+                last_ts_age  = int(now_ts - last_ts)
+                # find last non-null close regardless of lookback
+                last_nonnull = next((closes[i] for i in range(len(closes)-1, -1, -1) if closes[i] is not None), None)
+                last_nonnull_ts = 0
+                for i in range(len(closes)-1, -1, -1):
+                    if closes[i] is not None:
+                        last_nonnull_ts = timestamps[i] if i < len(timestamps) else 0
+                        break
+                log.warning(f"Yahoo diagnostic: total_bars={total_bars} | "
+                            f"last_ts={last_ts} (age={last_ts_age}s) | "
+                            f"last_nonnull_close=${last_nonnull} @ ts={last_nonnull_ts} "
+                            f"(age={int(now_ts - last_nonnull_ts)}s) | "
+                            f"lookback={lookback_s}s | "
+                            f"url=?interval=1m&range=2d&includePrePost=true")
 
         if price and label:
             log.info(f"[{symbol}] Yahoo price: {label} = ${price:.4f}")
@@ -709,12 +727,21 @@ def locate_and_short(symbol, qc_quantity, entry_price):
         deviation = abs(entry_price - live_price) / live_price
         log.info(f"[{symbol}] Price check: {live_session}=${live_price:.4f} | QC=${entry_price:.4f} | "
                  f"deviation={deviation*100:.2f}% (limit={PRICE_SANITY_PCT*100:.0f}%)")
-        if deviation > PRICE_SANITY_PCT:
+
+        if live_session == "yahoo_v8(lastClose)":
+            # lastClose is yesterday's RTH close — gap stocks will always deviate from it.
+            # A deviation here means the stock moved overnight, which is exactly what we
+            # are trading. Skip the sanity check entirely when lastClose is the only reference.
+            log.info(f"[{symbol}] Price sanity SKIPPED — {live_session} is yesterday's close, "
+                     f"not a valid reference for pre-market gap stocks. "
+                     f"Proceeding with QC price ${entry_price:.4f}")
+        elif deviation > PRICE_SANITY_PCT:
             block(symbol, f"price sanity FAILED: QC=${entry_price} vs {live_session}=${live_price:.4f} "
                           f"({deviation*100:.1f}% > {PRICE_SANITY_PCT*100:.0f}% limit — likely bad/stale tick)")
             return
-        log.info(f"[{symbol}] Price sanity OK ✓ — using QC price ${entry_price:.4f} "
-                 f"({live_session} ${live_price:.4f} is reference only, not used for order)")
+        else:
+            log.info(f"[{symbol}] Price sanity OK ✓ — using QC price ${entry_price:.4f} "
+                     f"({live_session} ${live_price:.4f} is reference only, not used for order)")
     else:
         log.warning(f"[{symbol}] All price sources exhausted — proceeding with QC price (unvalidated)")
 
