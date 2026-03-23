@@ -1,1361 +1,1517 @@
-# Place these lines AT THE VERY TOP of your file, outside any class definitions.
-import clr
-clr.AddReference("NodaTime")
-from NodaTime import DateTimeZoneProviders
-# End CLR Imports
-# region Imports
-from AlgorithmImports import *
-from datetime import timedelta, time, date
-import numpy as np
-import pandas as pd
-from QuantConnect.Indicators import RelativeStrengthIndex, IntradayVwap
-from QuantConnect.Data.Market import TradeBar
-from QuantConnect.Orders.Fees import OrderFee
-from QuantConnect.Securities import Security
-# ── WEBHOOK ADDITIONS ──────────────────────────────────────────────────────────
-import threading
-import urllib.request
-import json as _json
-# ──────────────────────────────────────────────────────────────────────────────
-# endregion
+"""
+TradeZero Webhook Execution Server — EOD Short Strategy
+=======================================================
+Receives SHORT / COVER / CANCEL signals from QuantConnect.
+Manages the full locate → short → cover lifecycle with state machine.
+
+SIGNAL FORMAT (from QC):
+  {"action": "SHORT",  "symbol": "LRMR", "quantity": 500, "price": 5.70}
+  {"action": "COVER",  "symbol": "LRMR", "quantity": 500, "price": 5.50}
+  {"action": "CANCEL", "symbol": "LRMR"}
+
+SYMBOL STATES:
+  FLAT      → ready, will accept SHORT
+  LOCATING  → locate request in progress
+  ACTIVE    → short position placed, waiting for COVER
+  BLOCKED   → dead for the day, all signals ignored
+
+HOW TO RUN:
+  pip install flask requests python-dotenv
+  .env:  TZ_API_KEY=...  TZ_API_SECRET=...
+  python tz_webhook_server.py
+"""
+
+import os, json, uuid, logging, threading, time
+from datetime import date
+from zoneinfo import ZoneInfo
+import requests
+from flask import Flask, request, jsonify
+from dotenv import load_dotenv
+
+load_dotenv()
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CONFIG — adjust these without touching any other code
+# ══════════════════════════════════════════════════════════════════════════════
+BASE_URL             = "https://webapi.tradezero.com"
+ACCOUNT_ID           = "DHA41998"
+MAX_LOCATE_COST_PCT  = 0.02    # 2%  — reject if locatePrice / entryPrice > this
+MIN_LOCATE_QUANTITY  = 100     # TZ minimum locate size
+MIN_SHORT_QUANTITY   = 1       # TZ minimum short order size (any size accepted)
+LOCATE_POLL_INTERVAL = 2       # seconds between locate status polls
+LOCATE_POLL_TIMEOUT  = 30      # seconds before giving up on locate
+LOCATE_ACCEPT_SLEEP  = 3       # seconds to wait after locate accept before placing order
+                               # TZ sends "locateAcceptSent:true" before fully registering
+                               # the locate — placing the order too fast causes R43 rejection
+# QC strategies send already-buffered limit prices in webhooks — server uses them directly
+SHORT_FILL_TIMEOUT   = 1       # minutes to wait for short entry to fill before cancelling
+                               # genuine signals fill in seconds — 1 min is generous
+COVER_FILL_TIMEOUT   = 3       # minutes to wait for cover to fill before retrying aggressively
+COVER_RETRY_BUFFER   = 0.005   # 0.5% above live price for aggressive cover retry
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CREDENTIALS
+# ══════════════════════════════════════════════════════════════════════════════
+API_KEY         = (os.getenv("TZ_API_KEY")      or "").strip()
+API_SECRET      = (os.getenv("TZ_API_SECRET")   or "").strip()
+TWELVEDATA_API_KEY = (os.getenv("TWELVEDATA_API_KEY") or "").strip()
+
+# ══════════════════════════════════════════════════════════════════════════════
+# LOGGING
+# ══════════════════════════════════════════════════════════════════════════════
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s  %(levelname)-8s  %(message)s",
+    datefmt="%H:%M:%S",
+    handlers=[logging.StreamHandler()]
+)
+log = logging.getLogger("tz_server")
+log.info("=== tz_webhook_server module loading ===")
+
+# Suppress gunicorn access log spam from Render's health check pings.
+# These hit /health every 5s from 10.225.x.x and flood the logs.
+class _HealthCheckFilter(logging.Filter):
+    def filter(self, record):
+        msg = record.getMessage()
+        return "GET /health" not in msg
+
+for _gunicorn_logger in ("gunicorn.access", "gunicorn.error", "werkzeug"):
+    logging.getLogger(_gunicorn_logger).addFilter(_HealthCheckFilter())
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STATE MACHINE  (reset at midnight)
+# ══════════════════════════════════════════════════════════════════════════════
+symbol_state = {}
+state_lock   = threading.Lock()
+reset_date   = date.today()
 
 
-# ========================================
-# TRADEZERO FEE MODEL
-# ========================================
-class TradeZeroFeeModel(FeeModel):
-    def GetOrderFee(self, parameters):
-        order = parameters.Order
-        security = parameters.Security
-        quantity = abs(order.Quantity)
-        fill_price = security.Price
-        is_marketable = True
+def get_state(symbol):
+    with state_lock:
+        return symbol_state.get(symbol, {}).copy()
 
-        if order.Type == OrderType.Limit:
-            limit_price = order.LimitPrice
-            current_price = security.Price
-            if order.Quantity < 0:
-                is_marketable = (limit_price <= current_price)
+
+def set_state(symbol, **kwargs):
+    with state_lock:
+        if symbol not in symbol_state:
+            symbol_state[symbol] = {"state": "FLAT"}
+        symbol_state[symbol].update(kwargs)
+    log.info(f"[{symbol}] STATE → {symbol_state[symbol]['state']}"
+             + (f" ({kwargs.get('reason', '')})" if kwargs.get("reason") else ""))
+
+
+def block(symbol, reason):
+    # Preserve the last stored cycle so a higher cycle from any strategy
+    # can lift this block. If no cycle was stored yet it stays 0,
+    # meaning even cycle=1 from any strategy will lift it.
+    last_cycle = symbol_state.get(symbol, {}).get("cycle", 0)
+    set_state(symbol, state="BLOCKED", reason=reason, cycle=last_cycle)
+    log.warning(f"[{symbol}] BLOCKED: {reason}")
+
+
+def midnight_reset_thread():
+    global reset_date
+    while True:
+        time.sleep(30)
+        today = date.today()
+        if today != reset_date:
+            with state_lock:
+                symbol_state.clear()
+            reset_date = today
+            log.info("MIDNIGHT RESET: all symbol states cleared")
+
+
+threading.Thread(target=midnight_reset_thread, daemon=True).start()
+
+
+def self_watchdog_thread():
+    """
+    Pings own /health endpoint every 90 seconds.
+    If 5 consecutive failures, forces gunicorn to recycle the worker
+    by raising SIGTERM on the current process — gunicorn master will
+    spawn a fresh worker automatically.
+
+    Initial delay of 180s gives Render's port scanner time to confirm
+    the port is open before the watchdog starts pinging — avoids false-
+    positive self-kills during cold start / deploy.
+    """
+    import signal as _signal, urllib.request as _req, os as _os
+    time.sleep(180)  # wait for Render port scan + full startup before first ping
+
+    port = int(_os.environ.get("PORT", 10000))
+    url  = f"http://127.0.0.1:{port}/health"
+    fails = 0
+    log.info("WATCHDOG: starting health monitoring")
+
+    while True:
+        time.sleep(90)
+        try:
+            with _req.urlopen(url, timeout=10) as r:
+                if r.status == 200:
+                    if fails > 0:
+                        log.info(f"WATCHDOG: /health recovered (was {fails} failures)")
+                    fails = 0
+                else:
+                    fails += 1
+                    log.warning(f"WATCHDOG: /health returned {r.status} ({fails}/5)")
+        except Exception as e:
+            fails += 1
+            log.warning(f"WATCHDOG: /health unreachable — {e} ({fails}/5)")
+
+        if fails >= 5:
+            log.error("WATCHDOG: 5 consecutive health failures — recycling worker")
+            _os.kill(_os.getpid(), _signal.SIGTERM)
+            return  # thread exits; gunicorn spawns new worker
+
+
+threading.Thread(target=self_watchdog_thread, daemon=True).start()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TZ API HELPERS — every call logs full request + response
+# ══════════════════════════════════════════════════════════════════════════════
+def tz_headers():
+    return {
+        "TZ-API-KEY-ID":     API_KEY,
+        "TZ-API-SECRET-KEY": API_SECRET,
+        "Content-Type":      "application/json",
+        "Accept":            "application/json",
+    }
+
+
+def tz_get(path, label="GET"):
+    url = f"{BASE_URL}{path}"
+    log.info(f"  → {label} GET {url}")
+    r = requests.get(url, headers=tz_headers(), timeout=15)
+    log.info(f"  ← status: {r.status_code}  body: {r.text[:600]}")
+    return r
+
+
+def tz_post(path, payload, label="POST"):
+    url = f"{BASE_URL}{path}"
+    log.info(f"  → {label} POST {url}")
+    log.info(f"    body: {json.dumps(payload)}")
+    r = requests.post(url, headers=tz_headers(), json=payload, timeout=15)
+    log.info(f"  ← status: {r.status_code}  body: {r.text[:600]}")
+    return r
+
+
+def tz_delete(path, label="DELETE"):
+    url = f"{BASE_URL}{path}"
+    log.info(f"  → {label} DELETE {url}")
+    r = requests.delete(url, headers=tz_headers(), timeout=15)
+    log.info(f"  ← status: {r.status_code}  body: {r.text[:200]}")
+    return r
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ACCOUNT / POSITION HELPERS
+# ══════════════════════════════════════════════════════════════════════════════
+def get_account_details():
+    r = tz_get(f"/v1/api/account/{ACCOUNT_ID}", "ACCOUNT")
+    if r.status_code == 200:
+        return r.json()
+    log.error(f"  Failed to get account details: {r.status_code}")
+    return None
+
+
+def get_position(symbol):
+    r = tz_get(f"/v1/api/accounts/{ACCOUNT_ID}/positions", "POSITIONS")
+    if r.status_code != 200:
+        log.error(f"  Failed to get positions: {r.status_code}")
+        return None
+    positions = r.json()
+    if not isinstance(positions, list):
+        positions = positions.get("positions", [])
+    for p in positions:
+        if p.get("symbol", "").upper() == symbol.upper():
+            log.info(f"  Found position for {symbol}: {json.dumps(p)}")
+            return p
+    log.info(f"  No open position found for {symbol}")
+    return None
+
+
+def cancel_all_open_orders(symbol):
+    r = tz_get(f"/v1/api/accounts/{ACCOUNT_ID}/orders", "ORDERS")
+    if r.status_code != 200:
+        log.error(f"  Failed to fetch orders: {r.status_code}")
+        return 0
+    orders = r.json()
+    if not isinstance(orders, list):
+        orders = orders.get("orders", [])
+    open_statuses = {"PendingNew", "New", "PartiallyFilled", "Submitted"}
+    open_orders = [
+        o for o in orders
+        if o.get("symbol", "").upper() == symbol.upper()
+        and o.get("orderStatus", "") in open_statuses
+    ]
+    log.info(f"  Found {len(open_orders)} open order(s) for {symbol}")
+    cancelled = 0
+    for o in open_orders:
+        oid = o.get("clientOrderId")
+        if oid:
+            rc = tz_delete(f"/v1/api/accounts/{ACCOUNT_ID}/orders/{oid}", "CANCEL_ORDER")
+            if rc.status_code in (200, 204):
+                cancelled += 1
             else:
-                is_marketable = (limit_price >= current_price)
+                log.warning(f"  Failed to cancel order {oid}: {rc.status_code}")
+    return cancelled
 
-        if quantity < 200:
-            return OrderFee(CashAmount(0.99, "USD"))
 
-        if fill_price < 1.0:
-            if quantity <= 250000:
-                fee = max(0.99, min(7.95, quantity * 0.005))
+def place_order(side, symbol, quantity, limit_price, label="ORDER"):
+    client_id = f"QC_{side[:1].upper()}_{uuid.uuid4().hex[:8].upper()}"
+    # Field names/casing confirmed from working tz_test.py paper account test
+    side_str = "Sell" if side.lower() == "sell" else "Buy"
+    payload = {
+        "clientOrderId": client_id,
+        "symbol":        symbol,
+        "orderQuantity": int(quantity),   # ← orderQuantity not quantity
+        "side":          side_str,        # ← "Sell"/"Buy" PascalCase
+        "orderType":     "Limit",         # ← PascalCase
+        "securityType":  "Stock",         # ← required field
+        "limitPrice":    round(limit_price, 2),
+        "timeInForce":   "Day_Plus",      # Day_Plus covers pre-market + AH; Day gets rejected at/after 4pm ET
+        "route":         "SMART",         # ← required, confirmed from routes API
+    }
+    r = tz_post(f"/v1/api/accounts/{ACCOUNT_ID}/order", payload, label)
+    if not r.ok:
+        # Log raw response body before raising — may be HTML error page
+        log.error(f"  [{symbol}] Order FAILED {r.status_code} — raw body: {r.text[:500]}")
+        r.raise_for_status()
+    data = r.json()
+    log.info(f"  [{symbol}] Order placed: clientOrderId={data.get('clientOrderId')} "
+             f"status={data.get('orderStatus')}")
+    return data
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# GRACEFUL ORDER STEPDOWN
+# ══════════════════════════════════════════════════════════════════════════════
+def place_order_with_stepdown(symbol, initial_quantity, limit_price, label="SHORT_ORDER"):
+    """
+    Attempt to place a short order at fixed percentage tiers of the located
+    quantity. Steps: 100% → 80% → 60% → 40% → 20%. Stops at 20% — if that
+    is also rejected, the symbol is blocked. Never goes below 20% of located.
+
+    Example with initial_quantity=100 located shares:
+      attempt 1: 100sh (100%)
+      attempt 2:  80sh  (80%)
+      attempt 3:  60sh  (60%)
+      attempt 4:  40sh  (40%)
+      attempt 5:  20sh  (20%) ← minimum, quit if this fails
+    """
+    tiers    = [1.0, 0.8, 0.6, 0.4, 0.2]
+    last_exc = None
+    for attempt, pct in enumerate(tiers, 1):
+        qty = max(1, int(initial_quantity * pct))
+        try:
+            result = place_order("Sell", symbol, qty, limit_price, label)
+            if attempt > 1:
+                log.info(f"[{symbol}] Order accepted on attempt {attempt} "
+                         f"at {int(pct*100)}%: placed {qty}sh "
+                         f"(located {initial_quantity}sh)")
+            return result
+        except Exception as e:
+            last_exc = e
+            if attempt < len(tiers):
+                next_pct = int(tiers[attempt] * 100)
+                log.warning(f"[{symbol}] Order rejected at {qty}sh "
+                            f"({int(pct*100)}%): {e} — "
+                            f"stepping down to {next_pct}%")
             else:
-                fee = 7.95 + ((quantity - 250000) * 0.005)
-            return OrderFee(CashAmount(fee, "USD"))
-
-        if is_marketable:
-            fee = max(0.99, quantity * 0.005)
-            return OrderFee(CashAmount(fee, "USD"))
-        else:
-            return OrderFee(CashAmount(0.0, "USD"))
-
-
-# ========================================
-# LOCATE FEE MODEL
-# ========================================
-class LocateFeeModel:
-    def __init__(self):
-        self.daily_locates_charged = {}
-        self.last_reset_date = None
-
-    def ResetDaily(self, current_date):
-        if self.last_reset_date != current_date:
-            self.daily_locates_charged = {}
-            self.last_reset_date = current_date
-
-    def GetLocateFeePercentage(self, price):
-        if price >= 10.0:
-            return 0.0003
-        elif price >= 2.0:
-            return 0.0035
-        elif price < 1.0:
-            return 0.015
-        else:
-            return 0.010
-
-    def CalculateLocateFee(self, symbol, price, quantity):
-        current_date = self.algorithm.Time.date() if hasattr(self, 'algorithm') else None
-        if current_date:
-            self.ResetDaily(current_date)
-
-        if symbol in self.daily_locates_charged:
-            return 0.0
-
-        position_value = abs(price * quantity)
-        fee_percentage = self.GetLocateFeePercentage(price)
-        locate_fee = position_value * fee_percentage
-        self.daily_locates_charged[symbol] = locate_fee
-        return locate_fee
-
-
-# ========================================
-# MAIN STRATEGY: RSI CROSSDOWN SHORT
-# WITH KALMAN-SMOOTHED ROLLING KELLY SIZING
-# ========================================
-class SimpleRsiCrossdownShort(QCAlgorithm):
-    def Initialize(self):
-        self.SetStartDate(2026, 1, 1)
-        self.SetEndDate(2026, 3, 21)
-        self.SetCash(30000)
-
-        # ========================================
-        # WEBHOOK CONFIG
-        # ========================================
-        self.webhook_url          = self.GetParameter("webhook_url") or "https://tz-bridge.onrender.com/webhook"
-        self._webhook_short_fired = {}
-        self._webhook_cover_fired = {}
-        self._webhook_cycle       = {}
-
-        # ========================================
-        # CONSOLIDATION SETTINGS
-        # ========================================
-        self.consolidation_minutes = 1
-
-        # ========================================
-        # RSI SETTINGS
-        # ========================================
-        self.rsi_period         = 9
-        self.rsi_entry_level    = 69
-        self.rsi_oversold_level = 31
-
-        # ========================================
-        # UNIVERSE SELECTION
-        # ========================================
-        self.max_positions       = 1
-        self.min_gainer_rank     = 1
-        self.max_gainer_rank     = 7
-        self.min_gain_percent    = 0.3
-        self.min_absolute_volume = 10000
-
-        # ========================================
-        # ENTRY REQUIREMENTS
-        # ========================================
-        self.require_above_vwap             = False
-        self.require_higher_than_last_entry = False
-
-        # ========================================
-        # EXIT CRITERIA
-        # ========================================
-        self.profit_target_percent = 0.2
-        self.use_rsi_recross_exit  = False
-        self.max_holding_minutes   = 120
-        self.hard_stop_percent     = 0.05
-
-        # ========================================
-        # POSITION SIZING — TARGET AND HARD LIMITS
-        # ========================================
-        # Target position size in a NEUTRAL regime —
-        # i.e. when Kalman signal = 1.0 and rolling
-        # Kelly = global_kelly.  This is the "typical"
-        # position size you want the strategy to deploy.
-        # The Kalman/Kelly system scales around this.
-        self.target_size_pct  = 0.20   # 20% of equity at baseline
-
-        # Hard ceiling — the system cannot exceed this
-        # even in exceptional regimes (signal > 1.0).
-        # Set to 1.0 if you want uncapped upside.
-        self.max_position_pct = 0.35   # 35% of equity absolute maximum
-
-        # Hard floor — we still trade at this minimum
-        # even in mildly unfavourable regimes.
-        # Set to 0.0 to allow full system shutdown.
-        self.min_position_pct = 0.05   # 5% of equity minimum
-
-        # ========================================
-        # KALMAN + ROLLING KELLY CONFIG
-        # ========================================
-
-        # Rolling window for Kelly estimation.
-        # 200 trades ≈ 4–6 weeks of activity at
-        # this strategy's typical trade frequency.
-        # Shorter = more reactive, noisier.
-        # Longer = smoother, slower to adapt.
-        self.kelly_window     = 200
-
-        # Minimum trades before we trust the
-        # rolling estimate. Before this threshold
-        # the fallback global_kelly is used.
-        self.kelly_min_trades = 30
-
-        # Pre-computed baseline Kelly fraction from
-        # prior backtests on this strategy variant.
-        # Used as:
-        #   (a) fallback before min_trades reached
-        #   (b) denominator for Kalman normalisation
-        # Re-derive this after any major param change.
-        self.global_kelly = 0.061   # 6.1% — from 2025 full-year backtest
-
-        # Trade history ring buffer: list of
-        # (profit_pct: float, is_win: bool).
-        # Capped at kelly_window * 2 to avoid
-        # unbounded memory growth over long runs.
-        self.trade_history = []
-
-        # ── Kalman Filter State ───────────────────
-        # The Kalman filter tracks a DIMENSIONLESS
-        # performance MULTIPLIER — not a Kelly
-        # fraction, not a P&L percentage.
-        #
-        #   State:  kalman_x  = smoothed multiplier
-        #                       1.0 = baseline (normal)
-        #                       > 1 = outperforming
-        #                       < 1 = underperforming
-        #
-        # The Kalman is updated ONCE per day in
-        # DailyReset.  The observation fed to it is:
-        #
-        #   obs = ComputeRollingKelly() / global_kelly
-        #
-        # This is also a dimensionless ratio around 1.0,
-        # so state and observation live on the SAME SCALE.
-        # The filter smooths out the day-to-day noise in
-        # the rolling Kelly estimate.
-        #
-        # CRITICAL: Do NOT feed daily_return_frac as the
-        # observation.  Daily returns (~0.5–2%) are on a
-        # completely different scale to Kelly (~6%), which
-        # causes K≈0.95 to immediately collapse the state.
-        #
-        # Tuning:
-        #   Q = process noise — how fast true performance
-        #       can drift.  0.005 = allows ~0.07× drift
-        #       per day at steady state.
-        #   R = observation noise — how noisy the rolling
-        #       Kelly ratio is as a daily signal.  0.10
-        #       is appropriate for a 200-trade window at
-        #       ~35% win rate.
-        #   Increase Q → reacts faster to regime change
-        #   Increase R → smoother, trusts observations less
-        self.kalman_x = 1.0    # multiplier: 1.0 = baseline performance
-        self.kalman_P = 0.50   # initial uncertainty: high (no history yet)
-        self.kalman_Q = 0.005  # process noise: moderate daily drift allowed
-        self.kalman_R = 0.10   # observation noise: rolling Kelly is noisy
-
-        # ── Drawdown Gate ─────────────────────────
-        # A hard scalar that cuts position size
-        # when the portfolio is in a drawdown from
-        # its all-time peak.  Applied on top of the
-        # Kelly/Kalman signal.
-        #
-        #   DD from peak    →  scalar applied
-        #   0% – 5%         →  1.00  (full size)
-        #   5% – 15%        →  0.50  (half size)
-        #   15% – 25%       →  0.25  (quarter size)
-        #   > 25%           →  0.00  (stop trading)
-        #
-        # Adjust thresholds to taste.  Tighter
-        # thresholds = more protection but more
-        # missed recovery.
-        self.dd_thresholds = [
-            (-0.05,  1.00),   # < 5% DD  → full
-            (-0.15,  0.50),   # < 15% DD → half
-            (-0.25,  0.25),   # < 25% DD → quarter
-        ]
-        self.dd_stop_scalar = 0.00          # beyond worst threshold
-
-        # Peak equity for DD calculation.
-        # Initialised in OnWarmupFinished once
-        # the starting equity is known.
-        self.peak_equity = None
-
-        # ========================================
-        # RISK CONTROLS
-        # ========================================
-        self.max_daily_loss_percent   = 0.5
-        self.daily_starting_equity    = None
-        self.daily_loss_limit_hit     = False
-        self.block_reentry_after_loss = False
-        self.daily_traded_symbols     = {}
-        self.ticker_trade_counts      = {}
-        self.max_trades_per_ticker    = 10
-
-        # ========================================
-        # TRADING HOURS
-        # ========================================
-        self.entry_start_time   = time(9, 5)
-        self.entry_end_time     = time(15, 25)
-        self.monitor_start_time = time(9, 0)
-        self.monitor_end_time   = time(16, 0)
-
-        # ========================================
-        # TRACKING & DATA
-        # ========================================
-        self.symbol_data           = {}
-        self.gainer_rankings       = {}
-        self.position_entry_times  = {}
-        self.position_entry_prices = {}
-        self.last_entry_prices     = {}
-        self.closing_in_progress   = set()
-
-        # Track current trade's entry price for
-        # recording the result in OnOrderEvent.
-        self._pending_entry_prices = {}
-
-        # ========================================
-        # FEE MODELS
-        # ========================================
-        self.locate_fee_model          = LocateFeeModel()
-        self.locate_fee_model.algorithm = self
-        self.total_locate_fees_paid    = 0.0
-
-        # ========================================
-        # DAILY SUMMARY
-        # ========================================
-        self.daily_trades_log          = []
-        self.daily_fees_locate         = 0.0
-        self.daily_starting_total_fees = 0.0
-        self.daily_realized_pnl        = 0
-
-        # ========================================
-        # SETUP
-        # ========================================
-        self.SetWarmUp(timedelta(days=2))
-        self.UniverseSettings.Resolution = Resolution.Minute
-        self.UniverseSettings.ExtendedMarketHours = True
-
-        self.nyse_tz = DateTimeZoneProviders.Tzdb.GetZoneOrNull("America/New_York")
-        self.SetTimeZone(self.nyse_tz)
-        self.Securities.DataTimeZone = self.nyse_tz
-
-        self.AddUniverse(self.CoarseFilter, self.FineFilter)
-        self.SetSecurityInitializer(lambda security: security.SetFeeModel(TradeZeroFeeModel()))
-
-        # ========================================
-        # SCHEDULING
-        # ========================================
-        self.Schedule.On(self.DateRules.EveryDay(), self.TimeRules.At(16, 10), self.DailyReset)
-        self.Schedule.On(self.DateRules.EveryDay(), self.TimeRules.At(15, 55), self.NuclearLiquidation)
-        self.Schedule.On(self.DateRules.EveryDay(), self.TimeRules.At(15, 59), self.NuclearLiquidation)
-
-        self.last_top_time           = None
-        self.cached_top_gainers      = []
-        self.cached_gainer_rankings  = {}
-        self._last_status_min        = -1
-
-        self.Debug(f"WEBHOOK: {'SET -> ' + self.webhook_url if self.webhook_url else 'NOT SET (dry-run)'}")
-        self.Debug(
-            f"SIZING: target={self.target_size_pct*100:.0f}%  "
-            f"Kelly window={self.kelly_window}  "
-            f"global_kelly={self.global_kelly*100:.2f}%  "
-            f"max={self.max_position_pct*100:.0f}%  "
-            f"min={self.min_position_pct*100:.0f}%  "
-            f"Kalman_x0={self.kalman_x:.1f}× Q={self.kalman_Q} R={self.kalman_R}"
-        )
-
-    # ============================================================
-    # KALMAN + ROLLING KELLY SIZING SYSTEM
-    # ============================================================
-
-    def ComputeRollingKelly(self):
-        """
-        Compute the Kelly fraction from the most recent
-        kelly_window trades.
-
-        Returns the raw Kelly fraction (e.g. 0.061 = 6.1%).
-        Returns self.global_kelly if insufficient history.
-
-        Kelly formula:  f* = W - L/R
-          W = win rate
-          L = 1 - W
-          R = avg_win_pct / avg_loss_pct  (both positive)
-        """
-        recent = self.trade_history[-self.kelly_window:]
-        if len(recent) < self.kelly_min_trades:
-            return self.global_kelly
-
-        wins   = [p for p, w in recent if w]
-        losses = [p for p, w in recent if not w]
-
-        if not wins or not losses:
-            return self.global_kelly
-
-        W       = len(wins) / len(recent)
-        L       = 1.0 - W
-        avg_win = sum(wins) / len(wins)
-        avg_los = abs(sum(losses) / len(losses))
-
-        if avg_los < 1e-9:
-            return self.global_kelly
-
-        R = avg_win / avg_los
-        k = W - (L / R)
-        # Clamp: never negative (Kelly says don't trade),
-        # never above 1.0 (that would be leverage).
-        return max(0.0, min(k, 1.0))
-
-    def KalmanUpdate(self, observation):
-        """
-        Update the Kalman filter with today's rolling Kelly ratio.
-
-        observation = ComputeRollingKelly() / global_kelly
-
-        Both the state (kalman_x) and the observation are
-        dimensionless multipliers centred on 1.0, so they
-        live on the same scale and the filter works correctly.
-
-        The filter is conservative (Q=0.005, R=0.10) so a
-        single bad day moves the state modestly.  After P
-        settles (~1 week), K ≈ 0.25, meaning each new
-        observation shifts the state by ~25% of the gap —
-        smooth enough to ignore noise, responsive enough
-        to catch genuine regime changes.
-        """
-        # Predict step (no dynamics: alpha drifts slowly)
-        P_pred = self.kalman_P + self.kalman_Q
-
-        # Update step
-        K              = P_pred / (P_pred + self.kalman_R)
-        self.kalman_x += K * (observation - self.kalman_x)
-        self.kalman_P  = (1.0 - K) * P_pred
-
-    def ComputeDrawdownScalar(self):
-        """
-        Return the drawdown gearing scalar based on current
-        distance from peak equity.
-
-        0% – 5%  drawdown  → 1.00 (full size)
-        5% – 15% drawdown  → 0.50 (half)
-        15% – 25% drawdown → 0.25 (quarter)
-        > 25% drawdown     → 0.00 (stop)
-        """
-        if self.peak_equity is None or self.peak_equity <= 0:
-            return 1.0
-
-        current = self.Portfolio.TotalPortfolioValue
-        dd      = (current - self.peak_equity) / self.peak_equity  # negative in drawdown
-
-        for threshold, scalar in self.dd_thresholds:
-            if dd >= threshold:
-                return scalar
-
-        return self.dd_stop_scalar  # beyond worst threshold → stop
-
-    def ComputeDynamicSizePct(self):
-        """
-        Compute position size as a fraction of equity.
-
-        Formula:
-            size = target_size_pct × kalman_x × dd_scalar
-
-        target_size_pct (20%)
-            Anchor — the position size at baseline
-            performance.  Tune this to change the
-            "normal" size.  Not related to Kelly.
-
-        kalman_x  (0 – 2×, baseline = 1.0)
-            Smoothed regime multiplier from the Kalman
-            filter.  Starts at 1.0 (= baseline = 20%).
-            Updated daily with the rolling Kelly ratio
-            (rk / global_kelly), so it drifts toward
-            current strategy conditions.
-              Good regime  → kalman_x > 1 → size > 20%
-              Baseline     → kalman_x = 1 → size = 20%
-              Bad regime   → kalman_x < 1 → size < 20%
-            The Kalman filter smooths out the noisiness
-            of the rolling Kelly estimate.
-
-        dd_scalar  (0 – 1×)
-            Drawdown gearing.  Applied as a final
-            multiplier.  Returns 0.0 to fully stop
-            trading past the worst threshold.
-
-        Result is clamped to [min_position_pct, max_position_pct].
-        """
-        # Kalman multiplier — clamp to [0, 2×]
-        kal_mult  = max(0.0, min(self.kalman_x, 2.0))
-
-        # Drawdown gate
-        dd_scalar = self.ComputeDrawdownScalar()
-        if dd_scalar == 0.0:
-            return 0.0
-
-        raw_size = self.target_size_pct * kal_mult * dd_scalar
-
-        return max(self.min_position_pct, min(raw_size, self.max_position_pct))
-
-    def RecordTradeResult(self, symbol, fill_price, quantity):
-        """
-        Called from OnOrderEvent when a buy-to-cover fills.
-        Records the completed trade (profit_pct, is_win) into
-        the rolling trade_history buffer for Kelly estimation.
-
-        Uses self._pending_entry_prices to retrieve the entry
-        price that was saved at order placement.
-        """
-        entry_price = self._pending_entry_prices.pop(symbol, None)
-        if entry_price is None or entry_price <= 0:
-            return
-
-        # Short P&L: positive when price fell
-        profit_pct = (entry_price - fill_price) / entry_price * 100.0
-        is_win     = profit_pct > 0.0
-
-        self.trade_history.append((profit_pct, is_win))
-
-        # Trim buffer to 2 × window to bound memory
-        max_buffer = self.kelly_window * 2
-        if len(self.trade_history) > max_buffer:
-            self.trade_history = self.trade_history[-max_buffer:]
-
-    def GetSizingDebugStr(self):
-        rk       = self.ComputeRollingKelly()
-        rk_ratio = rk / max(self.global_kelly, 1e-9)
-        kal_mult = max(0.0, min(self.kalman_x, 2.0))
-        dd_sc    = self.ComputeDrawdownScalar()
-        final    = self.ComputeDynamicSizePct()
-        n        = len(self.trade_history)
-        peak_dd  = (
-            (self.Portfolio.TotalPortfolioValue - self.peak_equity)
-            / self.peak_equity * 100
-            if self.peak_equity else 0
-        )
-        return (
-            f"rk={rk*100:.2f}% ({rk_ratio:.2f}×base) | "
-            f"Kal_x={self.kalman_x:.3f}× | "
-            f"DD_gate={dd_sc:.2f} | "
-            f"→ size={final*100:.2f}% | "
-            f"n_hist={n} | DD_from_peak={peak_dd:.1f}%"
-        )
-
-    # ============================================================
-    # WEBHOOK HELPERS
-    # ============================================================
-
-    def _fire_webhook(self, action, symbol, quantity, price):
-        ticker = str(symbol).split(" ")[0]
-        cycle  = self._webhook_cycle.get(ticker, 1)
-        payload = _json.dumps({
-            "action":   action,
-            "symbol":   ticker,
-            "quantity": int(quantity),
-            "price":    round(float(price), 4),
-            "cycle":    int(cycle),
-        }).encode("utf-8")
-        if not self.LiveMode or self.IsWarmingUp:
-            self.Debug(
-                f"WEBHOOK (backtest/warmup, not sent) → action={action} symbol={ticker} "
-                f"qty={quantity} price={price:.4f} cycle={cycle}"
+                log.warning(f"[{symbol}] Order rejected at {qty}sh "
+                            f"(20% minimum): {e} — giving up")
+    raise last_exc or Exception(f"[{symbol}] All stepdown tiers failed "
+                                f"(located {initial_quantity}sh)")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# LOCATE HELPERS
+# ══════════════════════════════════════════════════════════════════════════════
+def request_locate_quote(symbol, quantity, quote_req_id):
+    payload = {
+        "account":    ACCOUNT_ID,
+        "symbol":     symbol,
+        "quantity":   int(quantity),
+        "quoteReqID": quote_req_id,
+    }
+    return tz_post("/v1/api/accounts/locates/quote", payload, "LOCATE_REQUEST")
+
+
+def poll_locate_status(symbol, quote_req_id):
+    """
+    Poll locate history every LOCATE_POLL_INTERVAL seconds.
+    Returns locate dict on actionable status, None on timeout.
+    Status 65=Offered, 56=Rejected, 67=Expired, 52=Canceled
+
+    TZ automatically generates a Single Use (.SU) variant of every locate
+    request alongside the primary (pre-borrow) request. They appear in history
+    as {quoteReqID} (type=3, primary) and {quoteReqID}.SU (type=4, single use).
+    When the primary is unavailable (error=11) but the .SU variant is offered
+    (status=65), we use the .SU locate — it is cheaper and sufficient for
+    intraday short trades.
+    """
+    su_id = f"{quote_req_id}.SU"
+    deadline = time.time() + LOCATE_POLL_TIMEOUT
+    while time.time() < deadline:
+        url = f"{BASE_URL}/v1/api/accounts/{ACCOUNT_ID}/locates/history"
+        log.info(f"  → LOCATE_POLL GET {url}")
+        r = requests.get(url, headers=tz_headers(), timeout=15)
+        log.info(f"  ← status: {r.status_code}  body: {r.text}")
+        if r.status_code == 200:
+            history = r.json().get("locateHistory", [])
+            log.info(f"  [{symbol}] {len(history)} history entries — "
+                     f"searching for {quote_req_id} or {su_id}")
+
+            primary_item = None
+            su_item      = None
+            for item in history:
+                qid = item.get("quoteReqID")
+                if qid == quote_req_id:
+                    primary_item = item
+                elif qid == su_id:
+                    su_item = item
+
+            # Log both if found
+            for label, item in (("PRIMARY", primary_item), ("SU", su_item)):
+                if item:
+                    log.info(f"  [{symbol}] {label} ({item.get('quoteReqID')}): "
+                             f"status={item.get('locateStatus')} | "
+                             f"shares={item.get('locateShares')} | "
+                             f"price=${item.get('locatePrice')} | "
+                             f"type={item.get('locateType')} | "
+                             f"error={item.get('locateError')} | "
+                             f"text={item.get('text', '')}")
+
+            # Primary is actionable — use it (covers offered, rejected, expired, canceled)
+            if primary_item and primary_item.get("locateStatus") in (65, 56, 67, 52):
+                return primary_item
+
+            # Primary is unavailable (error=11 / status=54) — check .SU variant
+            primary_unavailable = (
+                primary_item is not None
+                and primary_item.get("locateError") == 11
             )
-            return
-        if not self.webhook_url:
-            self.Debug(f"WEBHOOK DRY-RUN | {action} {ticker} qty={quantity} price=${price:.4f}")
-            return
-        def _send():
-            try:
-                req = urllib.request.Request(
-                    self.webhook_url, data=payload,
-                    headers={"Content-Type": "application/json"}, method="POST"
-                )
-                with urllib.request.urlopen(req, timeout=10) as resp:
-                    body = resp.read().decode("utf-8", errors="replace")[:200]
-                self.Debug(f"WEBHOOK OK | {action} {ticker} | {resp.status} | {body}")
-            except Exception as e:
-                self.Debug(f"WEBHOOK ERROR | {action} {ticker} | {e}")
-        threading.Thread(target=_send, daemon=True).start()
+            if primary_unavailable and su_item:
+                su_status = su_item.get("locateStatus")
+                if su_status == 65:
+                    log.info(f"  [{symbol}] Primary unavailable — using SU locate "
+                             f"({su_id}) offered at ${su_item.get('locatePrice')}/share")
+                    return su_item
+                elif su_status in (56, 67, 52):
+                    log.info(f"  [{symbol}] SU locate also rejected/expired/canceled "
+                             f"(status={su_status}) — giving up")
+                    return su_item  # let caller handle rejection
 
-    def _reset_webhook_flags(self, ticker):
-        self._webhook_short_fired.pop(ticker, None)
-        self._webhook_cover_fired.pop(ticker, None)
+            log.info(f"  [{symbol}] {quote_req_id} not yet actionable — polling again")
+        else:
+            log.warning(f"  [{symbol}] Locate poll failed: {r.status_code}")
+        time.sleep(LOCATE_POLL_INTERVAL)
+    log.warning(f"  [{symbol}] Locate poll timed out after {LOCATE_POLL_TIMEOUT}s")
+    return None
 
-    # ============================================================
-    # WARMUP FINISHED
-    # ============================================================
 
-    def OnWarmupFinished(self):
-        self.Debug(f"OnWarmupFinished at {self.Time} — universe size: {len(self.symbol_data)}")
-        seeded      = self.SeedDayOpenPrices(list(self.symbol_data.keys()))
-        already_set = sum(1 for sd in self.symbol_data.values() if sd.day_open_price is not None)
-        if seeded > 0:
-            self.Debug(f"Seeded day_open_price for {seeded} symbol(s) via history fallback.")
-        self.Debug(
-            f"day_open_price populated: {already_set}/{len(self.symbol_data)} symbols "
-            f"({'warmup replay' if seeded == 0 else 'warmup + seed'})"
+def accept_locate(quote_req_id):
+    payload = {"accountId": ACCOUNT_ID, "quoteReqID": quote_req_id}
+    return tz_post("/v1/api/accounts/locates/accept", payload, "LOCATE_ACCEPT")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# LOCATE + SHORT BACKGROUND THREAD
+# ══════════════════════════════════════════════════════════════════════════════
+def check_existing_locate(symbol, required_quantity):
+    """
+    Check the inventory endpoint for currently available locate shares.
+    This is the authoritative source — expired, used, or single-use locates
+    will not appear here. Returns (True, available_qty) if usable, (False, 0) otherwise.
+    """
+    r = tz_get(f"/v1/api/accounts/{ACCOUNT_ID}/locates/inventory", "LOCATE_INVENTORY")
+    if r.status_code != 200:
+        log.warning(f"[{symbol}] Could not check locate inventory: {r.status_code}")
+        return False, 0
+    inventory = r.json().get("locateInventory", [])
+    for item in inventory:
+        if item.get("symbol", "").upper() != symbol.upper():
+            continue
+        available = int(item.get("available", 0))
+        sold      = int(item.get("sold", 0))
+        log.info(f"[{symbol}] Inventory: available={available} sold={sold} "
+                 f"unavailable={item.get('unavailable',0)} toBeSold={item.get('toBeSold',0)}")
+        if available >= required_quantity:
+            log.info(f"[{symbol}] Existing locate usable: {available} shares available in inventory")
+            return True, available
+        elif available > 0:
+            log.info(f"[{symbol}] Locate inventory insufficient: {available} available < {required_quantity} required — requesting fresh locate")
+        else:
+            log.info(f"[{symbol}] No available inventory for {symbol} — requesting fresh locate")
+        return False, 0
+    log.info(f"[{symbol}] Symbol not found in locate inventory — requesting fresh locate")
+    return False, 0
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PRICE SANITY  (Yahoo Finance)
+# ══════════════════════════════════════════════════════════════════════════════
+PRICE_SANITY_PCT = 0.15   # reject if QC price deviates >15% from Twelve Data/Yahoo — wide enough for volatile stocks
+
+# ── TICKER ALIAS MAP ─────────────────────────────────────────────────────────
+# QC data sometimes lags on ticker renames. Static fallback — entries here
+# are used instantly with zero network calls and survive any Polygon outage.
+# New renames are caught automatically by resolve_symbol() via Polygon and
+# logged with instructions to add them here permanently.
+#
+#   "OLD_QC_TICKER": "CURRENT_TZ_TICKER"
+TICKER_ALIASES = {
+    "FPGP": "ALTO",   # Alto Ingredients rebranded; TZ still uses ALTO
+    "AGE":  "SER",    # AgeX Therapeutics merged into Serina Therapeutics (Mar 27 2024)
+}
+
+# Polygon.io API key — used for live ticker rename detection
+POLYGON_API_KEY = (os.getenv("POLYGON_API_KEY") or "").strip()
+
+# Runtime cache: resolved renames discovered via Polygon this session.
+# Avoids repeat Polygon calls for the same symbol within a day.
+_polygon_rename_cache = {}
+_polygon_cache_lock   = threading.Lock()
+
+
+def resolve_symbol(qc_symbol):
+    """
+    Resolve a QC ticker to the current TZ-tradeable ticker.
+
+    Resolution order:
+      1. Static TICKER_ALIASES dict  — instant, no network, catches known renames
+      2. Runtime cache               — avoids repeat Polygon calls within a session
+      3. Polygon two-step CIK lookup — live auto-detection for unknown renames:
+           a. GET /v3/reference/tickers?ticker=OLD&active=false  → cik
+           b. GET /v3/reference/tickers?cik=CIK&active=true      → current ticker
+      4. QC symbol as-is             — Polygon unavailable or no rename found
+
+    On a new Polygon-detected rename, logs a loud warning with the exact line
+    to add to TICKER_ALIASES so it's cached permanently on next deploy.
+
+    Returns resolved symbol string.
+    """
+    # Pass 1: static alias map
+    if qc_symbol in TICKER_ALIASES:
+        resolved = TICKER_ALIASES[qc_symbol]
+        log.info(f"[{qc_symbol}] Alias map → {resolved}")
+        return resolved
+
+    # Pass 2: runtime cache (Polygon result from earlier in this session)
+    with _polygon_cache_lock:
+        if qc_symbol in _polygon_rename_cache:
+            resolved = _polygon_rename_cache[qc_symbol]
+            log.info(f"[{qc_symbol}] Runtime cache → {resolved}")
+            return resolved
+
+    # Pass 3: Polygon live lookup
+    if not POLYGON_API_KEY:
+        log.info(f"[{qc_symbol}] POLYGON_API_KEY not set — skipping rename check")
+        return qc_symbol
+
+    try:
+        base = "https://api.polygon.io/v3/reference/tickers"
+
+        # Step 3a: look up old ticker (may be delisted/renamed)
+        r1 = requests.get(
+            base,
+            params={"ticker": qc_symbol, "active": "false", "apiKey": POLYGON_API_KEY},
+            timeout=8,
         )
+        if not r1.ok or not r1.json().get("results"):
+            log.info(f"[{qc_symbol}] Polygon: ticker not found in delisted list — no rename")
+            return qc_symbol
 
-        equity = self.Portfolio.TotalPortfolioValue
-        self.daily_starting_equity     = equity
-        self.daily_starting_total_fees = self.Portfolio.TotalFees
-        self.peak_equity               = equity   # initialise peak tracker
+        cik = r1.json()["results"][0].get("cik")
+        if not cik:
+            log.info(f"[{qc_symbol}] Polygon: no CIK returned — cannot resolve rename")
+            return qc_symbol
 
-        self.Debug(f"daily_starting_equity set to ${equity:.2f}")
-        self.Debug(f"Kalman initial state: x={self.kalman_x:.3f}× (multiplier) P={self.kalman_P:.4f}")
-        if self.LiveMode:
-            self.LogMarketStatus(force=True)
-
-    def SeedDayOpenPrices(self, symbols):
-        today        = self.Time.date()
-        seeded_count = 0
-        for symbol in symbols:
-            sym_data = self.symbol_data.get(symbol)
-            if sym_data is None or sym_data.day_open_price is not None:
-                continue
-            try:
-                history = self.History(symbol, timedelta(hours=24), Resolution.Minute)
-                if history is None or history.empty:
-                    continue
-                bar_times  = (history.index.get_level_values('time')
-                              if isinstance(history.index, pd.MultiIndex)
-                              else history.index)
-                today_bars = history.iloc[[t.date() == today for t in bar_times]]
-                if today_bars.empty:
-                    continue
-                sym_data.day_open_price = float(today_bars.iloc[0]['open'])
-                seeded_count += 1
-                self.Debug(f"  SeedDayOpen: {symbol} open=${sym_data.day_open_price:.4f}")
-            except Exception as e:
-                self.Debug(f"  SeedDayOpen ERROR for {symbol}: {e}")
-        return seeded_count
-
-    # ============================================================
-    # UNIVERSE FILTERS
-    # ============================================================
-
-    def CoarseFilter(self, coarse):
-        return [x.Symbol for x in coarse
-                if x.HasFundamentalData
-                and x.DollarVolume > 1
-                and x.Price >= 0.2
-                and x.Price <= 15]
-
-    def FineFilter(self, fine):
-        return [f.Symbol for f in fine
-                if f.CompanyProfile.SharesOutstanding >= 50000
-                and f.CompanyProfile.SharesOutstanding <= 30_000_000]
-
-    # ============================================================
-    # SECURITY MANAGEMENT
-    # ============================================================
-
-    def OnSecuritiesChanged(self, changes):
-        for security in changes.RemovedSecurities:
-            symbol = security.Symbol
-            if symbol in self.Portfolio and self.Portfolio[symbol].Invested:
-                continue
-            if symbol in self.symbol_data:
-                self.CancelOrdersForSymbol(symbol)
-                del self.symbol_data[symbol]
-
-        for security in changes.AddedSecurities:
-            symbol = security.Symbol
-            if symbol not in self.symbol_data:
-                self.symbol_data[symbol] = SymbolData(self, symbol)
-
-            if self.consolidation_minutes > 1:
-                self.Consolidate(
-                    symbol,
-                    timedelta(minutes=self.consolidation_minutes),
-                    self.OnConsolidatedBar
-                )
-
-            if not self.IsWarmingUp:
-                sym_data = self.symbol_data[symbol]
-                if sym_data.day_open_price is None:
-                    seeded = self.SeedDayOpenPrices([symbol])
-                    if seeded > 0:
-                        self.Debug(
-                            f"OnSecuritiesChanged: seeded {symbol} "
-                            f"open=${sym_data.day_open_price:.4f}"
-                        )
-
-    # ============================================================
-    # CONSOLIDATED BAR HANDLER (3/5/10 min)
-    # ============================================================
-
-    def OnConsolidatedBar(self, bar):
-        symbol = bar.Symbol
-        if symbol not in self.symbol_data:
-            return
-        sym_data = self.symbol_data[symbol]
-
-        sym_data.rsi.Update(bar.EndTime, bar.Close)
-
-        if bar.Time.date() == self.Time.date() and sym_data.day_open_price is None:
-            sym_data.day_open_price = bar.Open
-
-        self.ProcessRsiCross(symbol, bar, sym_data)
-
-        if self.Portfolio[symbol].Invested:
-            self.CheckExitConditions(symbol, bar)
-
-    # ============================================================
-    # ONDATA — MAIN LOOP
-    # ============================================================
-
-    def OnData(self, data):
-        if (self.LiveMode
-                and not self.IsWarmingUp
-                and self.Time.minute % 5 == 0
-                and self.Time.minute != self._last_status_min):
-            self._last_status_min = self.Time.minute
-            self.LogMarketStatus()
-
-        for symbol in data.keys():
-            if symbol not in self.symbol_data:
-                continue
-            if data[symbol] is None:
-                continue
-            bar = data[symbol]
-            if not hasattr(bar, 'EndTime') or not hasattr(bar, 'Close'):
-                continue
-
-            sym_data = self.symbol_data[symbol]
-            sym_data.vwap.Update(bar)
-
-            if self.consolidation_minutes == 1:
-                sym_data.rsi.Update(bar.EndTime, bar.Close)
-
-                if bar.Time.date() == self.Time.date() and sym_data.day_open_price is None:
-                    sym_data.day_open_price = bar.Open
-
-                self.ProcessRsiCross(symbol, bar, sym_data)
-
-                if self.Portfolio[symbol].Invested and symbol not in self.closing_in_progress:
-                    self.CheckExitConditions(symbol, bar)
-
-        # Cancel stale open orders (> 10 min old)
-        if not self.IsWarmingUp:
-            for order in self.Transactions.GetOpenOrders():
-                if (self.UtcTime - order.Time).total_seconds() > 600:
-                    self.Transactions.CancelOrder(order.Id)
-
-        # Age-based time stop
-        if not self.IsWarmingUp:
-            for symbol in list(self.position_entry_times.keys()):
-                if symbol in self.Portfolio and self.Portfolio[symbol].Invested:
-                    minutes_held = (
-                        (self.Time - self.position_entry_times[symbol]).total_seconds() / 60.0
-                    )
-                    if minutes_held > self.max_holding_minutes:
-                        price = self.GetValidPrice(symbol)
-                        self.daily_trades_log.append(
-                            f"AGE-OUT {symbol}: held {minutes_held:.1f}min"
-                        )
-                        self.Debug(f"AGE-OUT {symbol}: held {minutes_held:.1f}min")
-                        self.ClosePosition(symbol, f"AGE-OUT ({minutes_held:.1f}min)", price)
-
-    # ============================================================
-    # RSI CROSS PROCESSING
-    # ============================================================
-
-    def ProcessRsiCross(self, symbol, bar, sym_data):
-        if not sym_data.rsi.IsReady:
-            return
-
-        rsi_value = sym_data.rsi.Current.Value
-        prev_rsi  = sym_data.last_rsi_value
-
-        if prev_rsi is None:
-            sym_data.last_rsi_value = rsi_value
-            return
-
-        if prev_rsi >= self.rsi_entry_level and rsi_value < self.rsi_entry_level:
-            sym_data.last_rsi_cross_time = self.Time
-            if not self.Portfolio[symbol].Invested:
-                self.CheckRsiCrossEntry(symbol, bar)
-
-        if self.use_rsi_recross_exit:
-            if prev_rsi < self.rsi_entry_level and rsi_value >= self.rsi_entry_level:
-                if (self.Portfolio[symbol].Invested
-                        and symbol not in self.closing_in_progress
-                        and not self.Transactions.GetOpenOrders(symbol)):
-                    self.ClosePosition(
-                        symbol,
-                        f"RSI RECROSS ABOVE {self.rsi_entry_level}",
-                        bar.Close
-                    )
-
-        sym_data.last_rsi_value = rsi_value
-
-    # ============================================================
-    # ENTRY LOGIC
-    # ============================================================
-
-    def CheckRsiCrossEntry(self, symbol, bar):
-        if self.IsWarmingUp:
-            return
-        if self.daily_loss_limit_hit or not self.IsInEntryHours():
-            return
-        if self.Portfolio.Invested or self.Transactions.GetOpenOrders():
-            return
-
-        if self.daily_starting_equity is not None:
-            current_daily_pnl = self.Portfolio.TotalPortfolioValue - self.daily_starting_equity
-            daily_loss_pct    = current_daily_pnl / self.daily_starting_equity
-            if daily_loss_pct < -self.max_daily_loss_percent:
-                if not self.daily_loss_limit_hit:
-                    self.daily_loss_limit_hit = True
-                    self.Debug(f"DAILY LOSS LIMIT HIT: {daily_loss_pct*100:.2f}%")
-                return
-
-        if self.ticker_trade_counts.get(symbol, 0) >= self.max_trades_per_ticker:
-            return
-
-        if symbol not in self.GetOrComputeTopGainers(self.CurrentSlice):
-            return
-
-        if self.block_reentry_after_loss:
-            if self.daily_traded_symbols.get(symbol) == 'loss':
-                return
-
-        if self.CheckEntryConditions(symbol, bar):
-            self.EnterShortPosition(symbol, bar)
-
-    def CheckEntryConditions(self, symbol, bar):
-        sym_data      = self.symbol_data[symbol]
-        current_price = bar.Close
-
-        if not sym_data.rsi.IsReady:
-            return False
-        if sym_data.day_open_price is None or sym_data.day_open_price <= 0:
-            return False
-        if sym_data.last_rsi_cross_time is None:
-            return False
-
-        minutes_since_cross = (
-            (self.Time - sym_data.last_rsi_cross_time).total_seconds() / 60
+        # Step 3b: look up current active ticker by CIK
+        r2 = requests.get(
+            base,
+            params={"cik": cik, "active": "true", "apiKey": POLYGON_API_KEY},
+            timeout=8,
         )
-        if minutes_since_cross > self.consolidation_minutes * 2:
-            return False
+        if not r2.ok or not r2.json().get("results"):
+            log.info(f"[{qc_symbol}] Polygon: no active ticker found for CIK {cik}")
+            return qc_symbol
 
-        if self.require_above_vwap:
-            if not sym_data.vwap.IsReady or sym_data.vwap.Current.Value <= 0:
-                return False
-            if current_price <= sym_data.vwap.Current.Value:
-                return False
+        current_ticker = r2.json()["results"][0].get("ticker", "").upper()
+        if not current_ticker or current_ticker == qc_symbol:
+            log.info(f"[{qc_symbol}] Polygon: no rename detected (CIK={cik})")
+            return qc_symbol
 
-        if self.require_higher_than_last_entry:
-            if symbol in self.last_entry_prices:
-                if current_price <= self.last_entry_prices[symbol]:
-                    return False
+        # New rename found — cache it and log a loud warning
+        with _polygon_cache_lock:
+            _polygon_rename_cache[qc_symbol] = current_ticker
 
-        return True
+        log.warning(
+            f"\n"
+            f"╔══════════════════════════════════════════════════════════╗\n"
+            f"║  TICKER RENAME DETECTED via Polygon                      ║\n"
+            f"║  QC ticker : {qc_symbol:<10}  →  Current : {current_ticker:<10}       ║\n"
+            f"║  CIK       : {cik:<46} ║\n"
+            f"║  ACTION    : add to TICKER_ALIASES in server code:       ║\n"
+            f'║    "{qc_symbol}": "{current_ticker}",{" " * max(0, 43 - len(qc_symbol) - len(current_ticker))}║\n'
+            f"╚══════════════════════════════════════════════════════════╝"
+        )
+        return current_ticker
 
-    def EnterShortPosition(self, symbol, bar):
-        price = bar.Close
-        if price <= 0:
+    except Exception as e:
+        log.warning(f"[{qc_symbol}] Polygon rename lookup failed: {e} — using QC symbol as-is")
+        return qc_symbol
+
+
+def _get_twelvedata_price(symbol):
+    """
+    Fetch current price from Twelve Data.
+    Returns (price, "twelvedata") or (None, None) on failure.
+    Free tier: 800 calls/day, 8/min. No session logic needed — returns
+    live price for whatever session is active (pre, RTH, AH).
+    Signup: twelvedata.com — free, no credit card.
+    """
+    if not TWELVEDATA_API_KEY:
+        return None, None
+    import urllib.request as _req
+    url = f"https://api.twelvedata.com/price?symbol={symbol}&apikey={TWELVEDATA_API_KEY}"
+    try:
+        req = _req.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with _req.urlopen(req, timeout=5) as resp:
+            data = __import__('json').loads(resp.read())
+        if "price" not in data:
+            log.warning(f"Twelve Data error for {symbol}: {data.get('message', data)}")
+            return None, None
+        price = float(data["price"])
+        if price > 0:
+            return price, "twelvedata"
+        return None, None
+    except Exception as e:
+        log.warning(f"Twelve Data price lookup failed for {symbol}: {e}")
+        return None, None
+
+
+def _get_yahoo_price(symbol):
+    """
+    Fetch price from Yahoo Finance — session-aware.
+    Uses v7/finance/quote endpoint which carries live postMarketPrice/preMarketPrice
+    even when the v8/chart endpoint only returns the prior RTH close.
+    Falls back to v8/chart if v7 fails.
+    Returns (price, session_label) or (None, None) on failure.
+    """
+    import urllib.request as _req, datetime as _dt, json as _json
+
+    # Determine ET session
+    utc_now   = _dt.datetime.now(_dt.timezone.utc)
+    year      = utc_now.year
+    dst_start = _dt.datetime(year, 3, 1) + _dt.timedelta(
+        days=(6 - _dt.datetime(year, 3, 1).weekday()) % 7 + 7)
+    dst_end   = _dt.datetime(year, 11, 1) + _dt.timedelta(
+        days=(6 - _dt.datetime(year, 11, 1).weekday()) % 7)
+    is_dst    = dst_start <= utc_now.replace(tzinfo=None) < dst_end
+    offset    = -4 if is_dst else -5
+    et_now    = utc_now + _dt.timedelta(hours=offset)
+    et_time   = et_now.hour * 60 + et_now.minute
+    rth_open  = 9 * 60 + 30
+    rth_close = 16 * 60
+    pre_open  = 4 * 60
+    is_pre    = pre_open <= et_time < rth_open
+    is_rth    = rth_open <= et_time < rth_close
+    is_ah     = rth_close <= et_time < 20 * 60
+
+    # ── v8 chart with includePrePost=true — read last bar, not meta ────────
+    # Yahoo meta.regularMarketPrice never updates in AH even with hasPrePostMarketData=true.
+    # The actual AH/pre-market prices are only in the bar arrays when includePrePost=true.
+    # We take the last non-null close from the price array as the live price.
+    try:
+        url = (f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
+               f"?interval=1m&range=2d&includePrePost=true")
+        req = _req.Request(url, headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+        })
+        with _req.urlopen(req, timeout=5) as resp:
+            raw   = _json.loads(resp.read())
+        result    = raw["chart"]["result"][0]
+        meta      = result["meta"]
+        closes    = result["indicators"]["quote"][0].get("close", [])
+        timestamps = result.get("timestamp", [])
+
+        if is_rth:
+            # RTH: meta.regularMarketPrice is accurate during regular hours
+            price = meta.get("regularMarketPrice")
+            label = "yahoo_v8(regular)" if price else None
+        else:
+            # AH / pre-market: walk backwards through bars to find last non-null
+            # close from the most recent trading session.
+            #
+            # Lookback window:
+            #   AH (4pm-8pm):       4 hours  — only accept today's AH bars
+            #   Pre-market (4am-9:30am): 13 hours — covers yesterday's AH session
+            #     (yesterday AH ended 8pm ET = ~12h ago at 4am ET, so 13h catches it)
+            #
+            # This prevents pre-market entries from falling back to yesterday's
+            # 4pm RTH close when a stock ran in AH and has no pre-market bars yet.
+            now_ts     = utc_now.timestamp()
+            lookback_s = 4 * 3600 if is_ah else 13 * 3600
+            price  = None
+            label  = None
+            for i in range(len(closes) - 1, -1, -1):
+                c = closes[i]
+                if c is None:
+                    continue
+                ts = timestamps[i] if i < len(timestamps) else 0
+                if now_ts - ts > lookback_s:
+                    break
+                price = float(c)
+                label = "yahoo_v8(postMarket)" if is_ah else "yahoo_v8(preMarket)"
+                break
+
+            # If no session bar found, fall back to meta close but log clearly
+            if price is None:
+                price = meta.get("regularMarketPrice")
+                label = "yahoo_v8(lastClose)" if price else None
+                if price:
+                    log.warning(f"Yahoo: no session bars found within {lookback_s//3600}h — "
+                                f"using lastClose ${price:.4f} (may be stale)")
+                # Log diagnostic info so we can debug future cases:
+                # show total bar count, last timestamp in array, and last non-null close
+                total_bars   = len(closes)
+                last_ts      = timestamps[-1] if timestamps else 0
+                last_ts_age  = int(now_ts - last_ts)
+                # find last non-null close regardless of lookback
+                last_nonnull = next((closes[i] for i in range(len(closes)-1, -1, -1) if closes[i] is not None), None)
+                last_nonnull_ts = 0
+                for i in range(len(closes)-1, -1, -1):
+                    if closes[i] is not None:
+                        last_nonnull_ts = timestamps[i] if i < len(timestamps) else 0
+                        break
+                log.warning(f"Yahoo diagnostic: total_bars={total_bars} | "
+                            f"last_ts={last_ts} (age={last_ts_age}s) | "
+                            f"last_nonnull_close=${last_nonnull} @ ts={last_nonnull_ts} "
+                            f"(age={int(now_ts - last_nonnull_ts)}s) | "
+                            f"lookback={lookback_s}s | "
+                            f"url=?interval=1m&range=2d&includePrePost=true")
+
+        if price and label:
+            log.info(f"[{symbol}] Yahoo price: {label} = ${price:.4f}")
+            return float(price), label
+        return None, None
+    except Exception as e:
+        log.warning(f"[{symbol}] Yahoo v8 chart failed: {e}")
+        return None, None
+
+
+def get_live_price(symbol):
+    """
+    Get the best available real-time price for a symbol, session-aware.
+
+    Twelve Data free tier FREEZES at the 4:00 PM close price — it does NOT
+    update during pre-market or after-hours. Using it in AH would give the
+    prior close, causing false sanity-check blocks on AH movers.
+
+    Strategy:
+      - RTH (9:30 AM - 4:00 PM ET): Twelve Data first (real-time) → Yahoo fallback
+      - AH  (4:00 PM - 8:00 PM ET): Yahoo postMarketPrice only
+      - Pre (4:00 AM - 9:30 AM ET): Yahoo preMarketPrice only
+
+    Returns (price, source_label) or (None, None) if all sources fail.
+    """
+    import datetime as _dt
+    now_et = _dt.datetime.now(_dt.timezone.utc).astimezone(
+        _dt.timezone(_dt.timedelta(hours=-4)))  # ET (UTC-4 in summer, UTC-5 in winter)
+    t = now_et.time()
+
+    rth_start = _dt.time(9, 30)
+    rth_end   = _dt.time(16, 0)
+
+    if rth_start <= t < rth_end:
+        # RTH: Twelve Data is reliable, try it first
+        price, label = _get_twelvedata_price(symbol)
+        if price:
+            return price, label
+        log.info(f"[{symbol}] Twelve Data unavailable — trying Yahoo fallback")
+        return _get_yahoo_price(symbol)
+    else:
+        # Pre-market or AH: Twelve Data is stale — go straight to Yahoo
+        log.info(f"[{symbol}] Outside RTH ({t.strftime('%H:%M')} ET) — using Yahoo session price directly")
+        return _get_yahoo_price(symbol)
+
+
+# Keep get_yahoo_price as an alias so cover monitor and cancel_and_cleanup
+# still work without changes — they call get_yahoo_price for aggressive cover pricing
+def get_yahoo_price(symbol):
+    return get_live_price(symbol)
+
+
+
+def locate_and_short(symbol, qc_quantity, entry_price):
+    log.info(f"[{symbol}] ── LOCATE THREAD STARTED ──────────────────────")
+    log.info(f"[{symbol}] QC requested: qty={qc_quantity} entry_price=${entry_price}")
+
+    # (ticker alias already applied at webhook entry point)
+
+    #── Step 0: Price sanity check (validation only — QC price is trusted) ──────
+    # Twelve Data / Yahoo are used ONLY to catch wildly wrong QC prices
+    # (e.g. stale warmup bar prices, bad ticks). They are NOT used to set the
+    # entry price — both sources have 3-15 min delays on free tiers which would
+    # give a worse price than QC's own live feed.
+    # QC receives real-time data in live mode — it is the most accurate source.
+    # PRICE_SANITY_PCT (15%) is deliberately wide to catch only genuine errors (e.g. 236% bad ticks),
+    log.info(f"[{symbol}] Step 0: Price sanity check (QC=${entry_price:.4f})")
+    live_price, live_session = get_live_price(symbol)
+    if live_price is not None:
+        deviation = abs(entry_price - live_price) / live_price
+        log.info(f"[{symbol}] Price check: {live_session}=${live_price:.4f} | QC=${entry_price:.4f} | "
+                 f"deviation={deviation*100:.2f}% (limit={PRICE_SANITY_PCT*100:.0f}%)")
+
+        if live_session == "yahoo_v8(lastClose)":
+            # lastClose is yesterday's RTH close — gap stocks will always deviate from it.
+            # A deviation here means the stock moved overnight, which is exactly what we
+            # are trading. Skip the sanity check entirely when lastClose is the only reference.
+            log.info(f"[{symbol}] Price sanity SKIPPED — {live_session} is yesterday's close, "
+                     f"not a valid reference for pre-market gap stocks. "
+                     f"Proceeding with QC price ${entry_price:.4f}")
+        elif deviation > PRICE_SANITY_PCT:
+            block(symbol, f"price sanity FAILED: QC=${entry_price} vs {live_session}=${live_price:.4f} "
+                          f"({deviation*100:.1f}% > {PRICE_SANITY_PCT*100:.0f}% limit — likely bad/stale tick)")
+            return
+        else:
+            log.info(f"[{symbol}] Price sanity OK ✓ — using QC price ${entry_price:.4f} "
+                     f"({live_session} ${live_price:.4f} is reference only, not used for order)")
+    else:
+        log.warning(f"[{symbol}] All price sources exhausted — proceeding with QC price (unvalidated)")
+
+        # ── Step 1: Check buying power + margin ───────────────────────────────────
+    log.info(f"[{symbol}] Step 1: Checking buying power and margin")
+    account = get_account_details()
+    if account is None:
+        block(symbol, "failed to retrieve account details")
+        return
+
+    available_cash   = float(account.get("buyingPower",     account.get("availableCash", 0)))
+    margin_available = float(account.get("marginAvailable", available_cash))
+    log.info(f"[{symbol}] buyingPower=${available_cash:,.2f} | marginAvailable=${margin_available:,.2f}")
+
+    usable_capital = min(available_cash, margin_available)
+
+    # TZ margin requirements for short selling (session-aware):
+    # https://tradezero.com/support/questions/what-are-your-margin-requirements-tradezero-international
+    #
+    # Session       < $2.50          $2.50–$5.00      >= $5.00
+    # 4am–4pm       $2.50/share      16.67% (6×)      16.67% (6×)
+    # 4pm–8pm       $5.00/share      $5.00/share      50%   (2×)
+    #
+    from datetime import datetime as _datetime, time as _time
+    now_et = _datetime.now(ZoneInfo("America/New_York"))
+    et_time = now_et.time()
+    rth_open  = _time(4,  0)
+    rth_close = _time(16, 0)
+    ah_close  = _time(20, 0)
+    in_premarket_or_rth = rth_open <= et_time < rth_close
+    in_ah               = rth_close <= et_time < ah_close
+
+    if in_premarket_or_rth:
+        if entry_price < 2.50:
+            margin_per_share = 2.50
+        else:
+            # 6× leverage → margin = price / 6
+            margin_per_share = entry_price / 6.0
+    elif in_ah:
+        if entry_price < 5.0:
+            margin_per_share = 5.0
+        else:
+            # 2× leverage → margin = price / 2
+            margin_per_share = entry_price / 2.0
+    else:
+        # Outside trading hours — use conservative AH rate
+        margin_per_share = max(5.0, entry_price / 2.0)
+
+    max_affordable = int(usable_capital / margin_per_share)
+    log.info(f"[{symbol}] session={'pre/RTH' if in_premarket_or_rth else 'AH' if in_ah else 'closed'} | "
+             f"margin_per_share=${margin_per_share:.4f} | "
+             f"max_affordable={max_affordable} "
+             f"(usable=${usable_capital:,.2f} / margin=${margin_per_share:.4f}/share)")
+
+    # ── Step 2: Can we afford minimum? ────────────────────────────────────────
+    if max_affordable < MIN_LOCATE_QUANTITY:
+        block(symbol, f"cannot afford minimum {MIN_LOCATE_QUANTITY} shares — "
+                      f"max_affordable={max_affordable} at ${entry_price}")
+        return
+
+    # ── Step 3: Request quantity ───────────────────────────────────────────────
+    # Floor to nearest 100 (never round up — must not exceed affordable)
+    # e.g. 73→100 (min floor), 149→100, 150→100, 251→200
+    raw_quantity = min(qc_quantity, max_affordable)
+    request_quantity = max(MIN_LOCATE_QUANTITY, int(raw_quantity / 100) * 100)
+    # Safety: after flooring to 100s, ensure we can still afford it
+    if request_quantity > max_affordable:
+        request_quantity = int(max_affordable / 100) * 100
+    if request_quantity < MIN_LOCATE_QUANTITY:
+        block(symbol, f"cannot afford minimum {MIN_LOCATE_QUANTITY} shares after rounding — "
+                      f"max_affordable={max_affordable} at ${entry_price}")
+        return
+    log.info(f"[{symbol}] request_quantity={request_quantity} "
+             f"(floored to 100s | qc={qc_quantity}, raw={raw_quantity}, max_affordable={max_affordable})")
+
+    # ── Step 3b: Check if valid locate already exists for today ─────────────
+    log.info(f"[{symbol}] Step 3b: Checking for existing locate today")
+    has_locate, located_qty = check_existing_locate(symbol, request_quantity)
+    if has_locate:
+        log.info(f"[{symbol}] Skipping locate request — using existing locate "
+                 f"({located_qty} shares already accepted today)")
+        # Use located_qty directly — locate was already paid for at that quantity.
+        # Do NOT cap by request_quantity: BP may have ticked down slightly since the
+        # locate was obtained (locate cost itself reduces BP), which would cause the
+        # order to be placed for fewer shares than we hold locates for.
+        final_quantity = located_qty
+        log.info(f"[{symbol}] Step 11: Placing short | qty={final_quantity} | "
+                 f"limit=${entry_price} (QC pre-buffered)")
+        try:
+            limit_price = entry_price  # QC already applied its buffer
+            result = place_order_with_stepdown(symbol, final_quantity, limit_price, "SHORT_ORDER")
+            placed_qty = result.get("orderQuantity", final_quantity)
+            set_state(symbol, state="ACTIVE", client_order_id=result.get("clientOrderId"))
+            log.info(f"[{symbol}] STATE → ACTIVE")
+            log.info(f"[{symbol}] SHORT PLACED (existing locate) | qty={placed_qty} | "
+                     f"limit=${limit_price} | clientOrderId={result.get('clientOrderId')} | "
+                     f"status={result.get('orderStatus')}")
+            threading.Thread(
+                target=monitor_short_fill,
+                args=(symbol, result.get("clientOrderId"), SHORT_FILL_TIMEOUT),
+                daemon=True
+            ).start()
+        except Exception as e:
+            block(symbol, f"order placement failed after all stepdown attempts: {e}")
+        return
+
+    # ── Step 4: Request locate quote ──────────────────────────────────────────
+    quote_req_id = f"Q{int(time.time() * 1000)}"
+    set_state(symbol, quote_req_id=quote_req_id)
+    log.info(f"[{symbol}] Step 4: Requesting locate | quoteReqID={quote_req_id}")
+    r = request_locate_quote(symbol, request_quantity, quote_req_id)
+
+    if r.status_code not in (200, 201, 202):
+        body = r.text
+        if "insufficient" in body.lower() or "inventory" in body.lower():
+            block(symbol, f"locate request failed — insufficient inventory: {body[:200]}")
+        else:
+            block(symbol, f"locate request failed: {r.status_code} | {body[:200]}")
+        return
+
+    # ── Step 5: Poll locate status ────────────────────────────────────────────
+    log.info(f"[{symbol}] Step 5: Polling locate status (max {LOCATE_POLL_TIMEOUT}s)")
+
+    # Abort if state changed while we were requesting (e.g. CANCEL came in)
+    if get_state(symbol).get("state") != "LOCATING":
+        log.warning(f"[{symbol}] State changed during locate request — aborting")
+        return
+
+    locate = poll_locate_status(symbol, quote_req_id)
+
+    # Abort if state changed during polling
+    if get_state(symbol).get("state") != "LOCATING":
+        log.warning(f"[{symbol}] State changed during locate poll — aborting")
+        return
+
+    if locate is None:
+        block(symbol, f"locate timed out after {LOCATE_POLL_TIMEOUT}s")
+        return
+
+    status = locate.get("locateStatus")
+
+    if status == 56:
+        block(symbol, f"locate rejected by TZ | text: {locate.get('text', '')}")
+        return
+    if status == 67:
+        block(symbol, "locate quote expired")
+        return
+    if status == 52:
+        block(symbol, "locate cancelled")
+        return
+    if status != 65:
+        block(symbol, f"unexpected locate status: {status}")
+        return
+
+    # Status 65 — Offered
+    locate_price     = float(locate.get("locatePrice", 0))
+    offered_quantity = int(locate.get("locateShares", 0))
+    locate_type      = locate.get("locateType", "")
+    locate_error     = locate.get("locateError", 0)
+    locate_text      = locate.get("text", "")
+
+    log.info(f"[{symbol}] Locate OFFERED: {offered_quantity} shares @ "
+             f"${locate_price}/share | type={locate_type} | "
+             f"error={locate_error} | text={locate_text}")
+
+    if locate_error == 1:
+        block(symbol, f"locate offered with error flag | text: {locate_text}")
+        return
+
+    if "insufficient" in locate_text.lower() or "inventory" in locate_text.lower():
+        block(symbol, f"insufficient inventory in locate response: {locate_text}")
+        return
+
+    # ── Step 7: Final quantity ─────────────────────────────────────────────────
+    final_quantity = min(request_quantity, offered_quantity) if offered_quantity > 0 else request_quantity
+    log.info(f"[{symbol}] final_quantity={final_quantity} "
+             f"(min of requested={request_quantity}, offered={offered_quantity})")
+
+    # ── Step 8: Minimum quantity check ────────────────────────────────────────
+    if final_quantity < MIN_LOCATE_QUANTITY:
+        block(symbol, f"final quantity {final_quantity} below minimum {MIN_LOCATE_QUANTITY}")
+        return
+
+    # ── Step 9: Locate cost check ─────────────────────────────────────────────
+    if entry_price > 0 and locate_price > 0:
+        locate_cost_pct   = locate_price / entry_price
+        total_locate_cost = locate_price * final_quantity
+        log.info(f"[{symbol}] Locate cost: ${locate_price}/share x {final_quantity} = "
+                 f"${total_locate_cost:.2f} total | "
+                 f"{locate_cost_pct*100:.3f}% of entry ${entry_price} | "
+                 f"threshold {MAX_LOCATE_COST_PCT*100:.1f}%")
+        if locate_cost_pct > MAX_LOCATE_COST_PCT:
+            block(symbol, f"locate too expensive: {locate_cost_pct*100:.3f}% > "
+                          f"{MAX_LOCATE_COST_PCT*100:.1f}% threshold")
+            return
+    else:
+        log.warning(f"[{symbol}] Cannot calculate locate cost "
+                    f"(locate_price={locate_price} entry_price={entry_price}) — proceeding")
+
+    # ── Step 10: Accept locate ────────────────────────────────────────────────
+    # Use the quoteReqID from the returned locate — may be .SU variant
+    accept_id = locate.get("quoteReqID", quote_req_id)
+    if accept_id != quote_req_id:
+        log.info(f"[{symbol}] Step 10: Accepting SU locate quoteReqID={accept_id} "
+                 f"(primary {quote_req_id} was unavailable)")
+    else:
+        log.info(f"[{symbol}] Step 10: Accepting locate quoteReqID={accept_id}")
+    r_accept = accept_locate(accept_id)
+    if r_accept.status_code not in (200, 201, 202):
+        block(symbol, f"locate accept failed: {r_accept.status_code} | {r_accept.text[:200]}")
+        return
+    log.info(f"[{symbol}] Locate accepted successfully")
+
+    # ── Poll inventory until locate is registered (fixes R43) ────────────
+    # TZ sends "locateAcceptSent:true" before fully processing the accept.
+    # Placing the order immediately causes R43 "not enough located shares".
+    # Poll the inventory endpoint until the shares appear, hard timeout 15s.
+    log.info(f"[{symbol}] Step 10b: Polling inventory to confirm locate registered...")
+    inventory_confirmed = False
+    poll_deadline = time.time() + 15   # max 15s wait
+    poll_attempt  = 0
+    while time.time() < poll_deadline:
+        poll_attempt += 1
+        time.sleep(1)
+        r_inv = tz_get(f"/v1/api/accounts/{ACCOUNT_ID}/locates/inventory", "LOCATE_CONFIRM")
+        if r_inv.status_code == 200:
+            inventory = r_inv.json().get("locateInventory", [])
+            for item in inventory:
+                if item.get("symbol", "").upper() == symbol.upper():
+                    available = int(item.get("available", 0))
+                    if available >= final_quantity:
+                        log.info(f"[{symbol}] Inventory confirmed: {available} shares available "
+                                 f"(attempt {poll_attempt})")
+                        inventory_confirmed = True
+                        break
+        if inventory_confirmed:
+            break
+        log.info(f"[{symbol}] Locate not yet in inventory — retrying (attempt {poll_attempt})")
+
+    if not inventory_confirmed:
+        block(symbol, f"locate inventory not confirmed after 15s — R43 risk too high, aborting")
+        return
+
+    if get_state(symbol).get("state") != "LOCATING":
+        log.warning(f"[{symbol}] State changed after accept — aborting order")
+        return
+
+    # ── Step 11: Place short limit order ──────────────────────────────────────
+    limit_price = entry_price  # QC already applied its buffer
+    log.info(f"[{symbol}] Step 11: Placing short | qty={final_quantity} | "
+             f"entry/limit=${limit_price} (QC pre-buffered)")
+    try:
+        result = place_order_with_stepdown(symbol, final_quantity, limit_price, "SHORT_ORDER")
+        placed_qty = result.get("orderQuantity", final_quantity)
+        set_state(
+            symbol,
+            state="ACTIVE",
+            entry_price=entry_price,
+            quantity=placed_qty,
+            client_order_id=result.get("clientOrderId"),
+        )
+        log.info(f"[{symbol}] SHORT PLACED | qty={placed_qty} | "
+                 f"limit=${limit_price} | clientOrderId={result.get('clientOrderId')} | "
+                 f"status={result.get('orderStatus')}")
+        threading.Thread(
+            target=monitor_short_fill,
+            args=(symbol, result.get("clientOrderId"), SHORT_FILL_TIMEOUT),
+            daemon=True
+        ).start()
+    except Exception as e:
+        block(symbol, f"order placement failed after all stepdown attempts: {e}")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CANCEL + CLEANUP HELPER
+# ══════════════════════════════════════════════════════════════════════════════
+
+def monitor_short_fill(symbol, client_order_id, timeout_minutes):
+    """
+    After placing a short, wait up to timeout_minutes for it to fill.
+    If it doesn't fill, cancel it and block the symbol.
+    Runs in a background thread.
+    """
+    import time as _time
+    deadline = _time.time() + timeout_minutes * 60
+    poll_interval = 15  # seconds
+
+    log.info(f"[{symbol}] SHORT MONITOR started | order={client_order_id} | timeout={timeout_minutes}min")
+
+    while _time.time() < deadline:
+        _time.sleep(poll_interval)
+
+        # If state changed, handle carefully:
+        # FLAT/COVER handled it → safe to exit
+        # BLOCKED → order may still be live on TZ — cancel it before exiting
+        state = get_state(symbol).get("state")
+        if state != "ACTIVE":
+            if state == "BLOCKED":
+                log.warning(f"[{symbol}] SHORT MONITOR: state=BLOCKED — cancelling orphaned order {client_order_id}")
+                try:
+                    cancelled = cancel_all_open_orders(symbol)
+                    log.info(f"[{symbol}] SHORT MONITOR: cancelled {cancelled} open order(s) after BLOCKED state")
+                    # Check if the order actually filled before we could cancel
+                    position = get_position(symbol)
+                    if position and float(position.get("shares", 0)) < 0:
+                        log.warning(f"[{symbol}] SHORT MONITOR: order filled BEFORE cancel — short position exists! "
+                                    f"Manual action required or wait for COVER webhook.")
+                except Exception as e:
+                    log.error(f"[{symbol}] SHORT MONITOR: error cancelling order after BLOCKED: {e}")
+            else:
+                log.info(f"[{symbol}] SHORT MONITOR: state={state} — stopping monitor")
             return
 
-        sym_data = self.symbol_data[symbol]
-        rank     = self.gainer_rankings.get(symbol, 'N/A')
+        # Check order status
+        try:
+            r = tz_get(f"/v1/api/accounts/{ACCOUNT_ID}/orders", "SHORT_MONITOR_ORDERS")
+            orders = r.json() if r.ok else []
+            if not isinstance(orders, list):
+                orders = orders.get("orders", [])
+            order = next((o for o in orders if o.get("clientOrderId") == client_order_id), None)
+            if order:
+                status = order.get("orderStatus", "")
+                executed = int(order.get("executed", 0))
+                log.info(f"[{symbol}] SHORT MONITOR: status={status} executed={executed}")
+                if status in ("Filled",) or executed > 0:
+                    log.info(f"[{symbol}] SHORT MONITOR: order filled — monitor done")
+                    return
+                if status in ("Canceled", "Rejected"):
+                    reject_text = order.get("text") or order.get("rejectReason") or "no reason given"
+                    log.warning(f"[{symbol}] SHORT MONITOR: order {status} | reason: {reject_text}")
+                    block(symbol, f"short order {status}: {reject_text}")
+                    return
+        except Exception as e:
+            log.warning(f"[{symbol}] SHORT MONITOR: poll error — {e}")
 
-        gain_from_open = 0.0
-        if sym_data.day_open_price and sym_data.day_open_price > 0:
-            gain_from_open = (
-                (price - sym_data.day_open_price) / sym_data.day_open_price * 100
-            )
+    # Timeout reached — cancel and block
+    log.warning(f"[{symbol}] SHORT MONITOR: timeout after {timeout_minutes}min — cancelling and blocking")
+    cancel_and_cleanup(symbol, f"short entry did not fill within {timeout_minutes} minutes")
+
+
+def monitor_cover_fill(symbol, client_order_id, timeout_minutes):
+    """
+    After placing a cover, wait up to timeout_minutes for it to fill.
+    If it doesn't fill, cancel it and place an aggressive market-price cover.
+    Runs in a background thread.
+    """
+    import time as _time
+    deadline = _time.time() + timeout_minutes * 60
+    poll_interval = 15  # seconds
+
+    log.info(f"[{symbol}] COVER MONITOR started | order={client_order_id} | timeout={timeout_minutes}min")
+
+    while _time.time() < deadline:
+        _time.sleep(poll_interval)
+
+        state = get_state(symbol).get("state")
+        if state == "FLAT":
+            log.info(f"[{symbol}] COVER MONITOR: already FLAT — done")
+            return
 
         try:
-            float_shares   = self.Securities[symbol].Fundamentals.CompanyProfile.SharesOutstanding
-            float_millions = float_shares / 1_000_000
-        except Exception:
-            float_millions = 0
+            r = tz_get(f"/v1/api/accounts/{ACCOUNT_ID}/orders", "COVER_MONITOR_ORDERS")
+            orders = r.json() if r.ok else []
+            if not isinstance(orders, list):
+                orders = orders.get("orders", [])
+            order = next((o for o in orders if o.get("clientOrderId") == client_order_id), None)
+            if order:
+                status = order.get("orderStatus", "")
+                executed = int(order.get("executed", 0))
+                log.info(f"[{symbol}] COVER MONITOR: status={status} executed={executed}")
+                if status in ("Filled",) or executed > 0:
+                    log.info(f"[{symbol}] COVER MONITOR: cover filled — done")
+                    set_state(symbol, state="FLAT", reason="cover filled (monitor confirmed)")
+                    return
+                if status in ("Canceled", "Rejected"):
+                    log.warning(f"[{symbol}] COVER MONITOR: cover {status} — will retry aggressively")
+                    break
+        except Exception as e:
+            log.warning(f"[{symbol}] COVER MONITOR: poll error — {e}")
 
-        rsi_value          = sym_data.rsi.Current.Value if sym_data.rsi.IsReady else 0
-        vwap_value         = sym_data.vwap.Current.Value if sym_data.vwap.IsReady else 0
-        distance_from_vwap = (
-            (price - vwap_value) / vwap_value * 100 if vwap_value > 0 else 0
-        )
+    # Timeout or cancellation — cancel stale order and retry aggressively
+    log.warning(f"[{symbol}] COVER MONITOR: cover did not fill — cancelling and retrying aggressively")
+    cancel_all_open_orders(symbol)
 
-        # ── DYNAMIC POSITION SIZING ──────────────────────────
-        # ComputeDynamicSizePct() combines:
-        #   1. Rolling Kelly (200-trade window)
-        #   2. Kalman alpha signal (smoothed regime estimate)
-        #   3. Drawdown gate
-        # and clamps the result to [min_position_pct, max_position_pct].
-        sizing_pct = self.ComputeDynamicSizePct()
+    # Check still short
+    position = get_position(symbol)
+    if not position or float(position.get("shares", 0)) >= 0:
+        log.info(f"[{symbol}] COVER MONITOR: no short position remaining — marking FLAT")
+        set_state(symbol, state="FLAT", reason="cover monitor: no position found on retry")
+        return
 
-        if sizing_pct == 0.0:
-            # Drawdown gate has stopped all trading.
-            self.Debug(
-                f"ENTRY BLOCKED by drawdown gate: {symbol} | "
-                f"{self.GetSizingDebugStr()}"
-            )
-            return
-
-        shares = int(self.Portfolio.TotalPortfolioValue * sizing_pct // price)
-
-        if shares <= 0:
-            self.Debug(
-                f"ENTRY SKIPPED — computed 0 shares: {symbol} | "
-                f"sizing_pct={sizing_pct*100:.2f}% equity=${self.Portfolio.TotalPortfolioValue:.0f} "
-                f"price=${price:.4f}"
-            )
-            return
-
-        # Charge locate fee (once per symbol per day)
-        if not self.Portfolio[symbol].Invested:
-            self.locate_fee_model.algorithm = self
-            locate_fee = self.locate_fee_model.CalculateLocateFee(symbol, price, shares)
-            if locate_fee > 0:
-                self.Portfolio.CashBook["USD"].AddAmount(-locate_fee)
-                self.total_locate_fees_paid += locate_fee
-                self.daily_fees_locate      += locate_fee
-
-        limit_price = round(price * 0.99, 2)
-        self.LimitOrder(symbol, -shares, limit_price)
-
-        self.position_entry_times[symbol]    = self.Time
-        self.position_entry_prices[symbol]   = price
-        self.last_entry_prices[symbol]       = price
-        # Stash for RecordTradeResult in OnOrderEvent
-        self._pending_entry_prices[symbol]   = price
-
-        ticker = str(symbol).split(" ")[0]
-        self._webhook_cycle[ticker]       = self._webhook_cycle.get(ticker, 0) + 1
-        self._webhook_short_fired[ticker] = True
-        self._webhook_cover_fired[ticker] = False
-        self._fire_webhook("SHORT", symbol, shares, price)
-
-        log_message = (
-            f"RSI SHORT {symbol}: {shares} sh @ ${limit_price} | "
-            f"Rank #{rank} | Gain: {gain_from_open:.1f}% | Float: {float_millions:.1f}M | "
-            f"RSI: {rsi_value:.1f} | VWAP: ${vwap_value:.2f} ({distance_from_vwap:+.1f}%) | "
-            f"SIZE: {sizing_pct*100:.2f}% [{self.GetSizingDebugStr()}]"
-        )
-        self.daily_trades_log.append(log_message)
-        self.Debug(log_message)
-
-    # ============================================================
-    # EXIT LOGIC
-    # ============================================================
-
-    def CheckExitConditions(self, symbol, bar):
-        if not self.Portfolio[symbol].Invested:
-            return
-        if symbol in self.closing_in_progress:
-            return
-        if self.Transactions.GetOpenOrders(symbol):
-            return
-
-        current_price = bar.Close
-        entry_price   = self.position_entry_prices.get(symbol)
-        if entry_price is None or entry_price <= 0:
-            return
-
-        pnl_pct = (entry_price - current_price) / entry_price
-
-        if pnl_pct >= self.profit_target_percent:
-            self.ClosePosition(symbol, f"PROFIT TARGET ({pnl_pct*100:.1f}%)", current_price)
-            return
-
-        if pnl_pct <= -self.hard_stop_percent:
-            self.ClosePosition(symbol, f"HARD STOP ({pnl_pct*100:.1f}%)", current_price)
-            return
-
-        sym_data = self.symbol_data.get(symbol)
-        if sym_data and sym_data.rsi.IsReady:
-            rsi_value = sym_data.rsi.Current.Value
-            if rsi_value < self.rsi_oversold_level:
-                self.ClosePosition(
-                    symbol,
-                    f"RSI OVERSOLD ({rsi_value:.1f} < {self.rsi_oversold_level})",
-                    current_price
-                )
-                return
-
-    def ClosePosition(self, symbol, reason, current_price):
-        if not self.Portfolio[symbol].Invested:
-            return
-        if symbol in self.closing_in_progress:
-            return
-
-        quantity = self.Portfolio[symbol].Quantity
-        if quantity == 0:
-            return
-
-        self.Transactions.CancelOpenOrders(symbol)
-
-        entry_price = self.position_entry_prices.get(symbol, 0)
-        limit_price = round(current_price * 1.03, 2)
-
-        self.closing_in_progress.add(symbol)
-        self.LimitOrder(symbol, abs(quantity), limit_price)
-
-        ticker = str(symbol).split(" ")[0]
-        if self._webhook_short_fired.get(ticker) and not self._webhook_cover_fired.get(ticker):
-            self._webhook_cover_fired[ticker] = True
-            self._fire_webhook("COVER", symbol, abs(quantity), current_price)
-
-        pnl_value   = (entry_price - current_price) * abs(quantity) if entry_price > 0 else 0
-        pnl_percent = ((entry_price - current_price) / entry_price) * 100 if entry_price > 0 else 0
-        trade_result = 'win' if pnl_value >= 0 else 'loss'
-
-        self.daily_traded_symbols[symbol] = trade_result
-        self.position_entry_times.pop(symbol, None)
-        self.position_entry_prices.pop(symbol, None)
-
-        self.daily_trades_log.append(
-            f"EXIT {symbol} — {reason} | "
-            f"P&L: ${pnl_value:.0f} ({pnl_percent:.1f}%) [{trade_result.upper()}]"
-        )
-        self.Debug(
-            f"EXIT {symbol} — {reason} | P&L: ${pnl_value:.0f} ({pnl_percent:.1f}%)"
-        )
-
-    def NuclearLiquidation(self):
-        if not self.Portfolio.Invested:
-            return
-        for symbol in list(self.Portfolio.Keys):
-            if self.Portfolio[symbol].Invested:
-                self.Transactions.CancelOpenOrders(symbol)
-                qty   = self.Portfolio[symbol].Quantity
-                price = self.GetValidPrice(symbol)
-                self.MarketOrder(symbol, abs(qty))
-
-                ticker = str(symbol).split(" ")[0]
-                if self._webhook_short_fired.get(ticker) and not self._webhook_cover_fired.get(ticker):
-                    self._webhook_cover_fired[ticker] = True
-                    self._fire_webhook("COVER", symbol, abs(qty), price)
-
-                self.closing_in_progress.discard(symbol)
-                self.position_entry_times.pop(symbol, None)
-                self.position_entry_prices.pop(symbol, None)
-                self.daily_trades_log.append(f"EOD LIQUIDATION {symbol}")
-
-    # ============================================================
-    # ORDER EVENT HANDLER
-    # ============================================================
-
-    def OnOrderEvent(self, orderEvent):
-        if orderEvent.Status not in (
-            OrderStatus.Filled,
-            OrderStatus.Canceled,
-            OrderStatus.Invalid
-        ):
-            return
-
-        order  = self.Transactions.GetOrderById(orderEvent.OrderId)
-        symbol = orderEvent.Symbol
-
-        if orderEvent.Status in (OrderStatus.Canceled, OrderStatus.Invalid):
-            if order.Quantity > 0 and symbol in self.closing_in_progress:
-                self.Debug(
-                    f"CLOSE ORDER FAILED ({orderEvent.Status}) for {symbol} "
-                    f"— will retry next bar"
-                )
-                self.closing_in_progress.discard(symbol)
-                ticker = str(symbol).split(" ")[0]
-                self._webhook_cover_fired[ticker] = False
-                if symbol not in self.position_entry_prices and self.Portfolio[symbol].Invested:
-                    entry = self.last_entry_prices.get(symbol, self.Securities[symbol].Price)
-                    self.position_entry_prices[symbol] = entry
-                    self.position_entry_times[symbol]  = self.Time
-            return
-
-        # Filled
-        if order.Quantity > 0:
-            # Guard against accidental long
-            if symbol in self.Portfolio and self.Portfolio[symbol].Quantity > 0:
-                self.Debug(
-                    f"ACCIDENTAL LONG detected for {symbol} "
-                    f"qty={self.Portfolio[symbol].Quantity} — liquidating immediately"
-                )
-                self.Transactions.CancelOpenOrders(symbol)
-                accidental_qty = self.Portfolio[symbol].Quantity
-                exit_price     = round(self.Securities[symbol].Price * 0.97, 2)
-                self.LimitOrder(symbol, -accidental_qty, exit_price)
-                self.closing_in_progress.discard(symbol)
-                return
-
-            # ── Normal buy-to-cover fill ─────────────────────
-            self.closing_in_progress.discard(symbol)
-
-            ticker = str(symbol).split(" ")[0]
-            self._reset_webhook_flags(ticker)
-
-            self.daily_realized_pnl += self.Portfolio[symbol].LastTradeProfit
-            self.ticker_trade_counts[symbol] = self.ticker_trade_counts.get(symbol, 0) + 1
-
-            # Record trade into Kelly history buffer.
-            # fill_price comes from the order's AverageFillPrice.
-            fill_price = orderEvent.FillPrice
-            self.RecordTradeResult(symbol, fill_price, orderEvent.FillQuantity)
-
-    # ============================================================
-    # MARKET STATUS LOG
-    # ============================================================
-
-    def LogMarketStatus(self, force=False):
-        in_entry = self.IsInEntryHours()
-        if not force and not in_entry and not self.Portfolio.Invested:
-            return
-
-        gainers    = []
-        near_miss  = []
-        all_gainers = []
-        no_open    = 0
-
-        for symbol, sd in self.symbol_data.items():
-            if sd.day_open_price is None or sd.day_open_price <= 0:
-                no_open += 1
-                continue
-            try:
-                price = self.Securities[symbol].Price
-                if price <= 0:
-                    continue
-                gain_pct  = (price - sd.day_open_price) / sd.day_open_price * 100
-                rsi_ready = sd.rsi.IsReady
-                rsi_val   = sd.rsi.Current.Value if rsi_ready else None
-                entry = {
-                    'sym': str(symbol).split(" ")[0],
-                    'price': price,
-                    'gain': gain_pct,
-                    'rsi': rsi_val,
-                    'ready': rsi_ready,
-                }
-                all_gainers.append(entry)
-                if gain_pct >= self.min_gain_percent * 100:
-                    gainers.append(entry)
-                elif gain_pct >= self.min_gain_percent * 100 * 0.67:
-                    near_miss.append(entry)
-            except Exception:
-                continue
-
-        gainers.sort(key=lambda x: x['gain'], reverse=True)
-        near_miss.sort(key=lambda x: x['gain'], reverse=True)
-        all_gainers.sort(key=lambda x: x['gain'], reverse=True)
-
-        status = (
-            "ACTIVE" if self.Portfolio.Invested
-            else ("WATCHING" if in_entry else "WAITING")
-        )
-        self.Debug(f"{'='*60}")
-        self.Debug(
-            f"STATUS [{self.Time.strftime('%H:%M')}] | {status} | "
-            f"Entry: {'OPEN' if in_entry else 'CLOSED'} | "
-            f"Equity: ${self.Portfolio.TotalPortfolioValue:.2f} | "
-            f"Universe: {len(self.symbol_data)}"
-        )
-        self.Debug(f"  SIZING | {self.GetSizingDebugStr()}")
-
-        if self.Portfolio.Invested:
-            for sym in self.Portfolio.Keys:
-                if self.Portfolio[sym].Invested:
-                    p       = self.Portfolio[sym]
-                    pnl     = p.UnrealizedProfitPercent * 100
-                    sd      = self.symbol_data.get(sym)
-                    rsi_str = (
-                        f"RSI={sd.rsi.Current.Value:.1f}"
-                        if sd and sd.rsi.IsReady else "RSI=n/a"
-                    )
-                    self.Debug(
-                        f"  POSITION: {str(sym).split()[0]} | "
-                        f"{p.Quantity}sh @ ${p.AveragePrice:.2f} | "
-                        f"Unreal: {pnl:+.1f}% | {rsi_str}"
-                    )
-
-        if gainers:
-            self.Debug(
-                f"  TOP GAINERS ({len(gainers)} at >={self.min_gain_percent*100:.0f}% — "
-                f"top {self.max_gainer_rank} eligible):"
-            )
-            for i, g in enumerate(gainers[:10]):
-                rsi_str  = f"RSI={g['rsi']:.1f}" if g['rsi'] is not None else "RSI=warming"
-                eligible = "✓" if i < self.max_gainer_rank else " "
-                self.Debug(
-                    f"  {eligible} #{i+1} {g['sym']:8s} +{g['gain']:.1f}% "
-                    f"@ ${g['price']:.2f} | {rsi_str}"
-                )
+    # Get aggressive price from Yahoo (current market), fall back to priceClose
+    yahoo_price, yahoo_session = get_yahoo_price(symbol)
+    if yahoo_price:
+        aggressive_price = round(yahoo_price * (1 + COVER_RETRY_BUFFER), 2)
+        log.info(f"[{symbol}] COVER MONITOR: aggressive retry at ${aggressive_price} "
+                 f"(Yahoo={yahoo_price} session={yahoo_session} + {COVER_RETRY_BUFFER*100:.1f}%)")
+    else:
+        # Yahoo unavailable — try priceClose from position as last resort
+        priceClose = float(position.get("priceClose") or 0)
+        if priceClose > 0:
+            aggressive_price = round(priceClose * (1 + COVER_RETRY_BUFFER), 2)
+            log.warning(f"[{symbol}] COVER MONITOR: Yahoo unavailable — using priceClose fallback ${aggressive_price}")
         else:
-            self.Debug(
-                f"  No stocks >={self.min_gain_percent*100:.0f}% — best 3:"
-            )
-            for i, g in enumerate(all_gainers[:3]):
-                rsi_str = f"RSI={g['rsi']:.1f}" if g['rsi'] is not None else "RSI=warming"
-                self.Debug(
-                    f"    #{i+1} {g['sym']:8s} +{g['gain']:.1f}% "
-                    f"@ ${g['price']:.2f} | {rsi_str}"
-                )
+            log.error(f"[{symbol}] COVER MONITOR: no Yahoo and no priceClose — MANUAL ACTION REQUIRED")
+            block(symbol, "aggressive cover failed: no price source available — MANUAL ACTION REQUIRED")
+            return
 
-        if near_miss:
-            self.Debug(f"  APPROACHING ({len(near_miss)} at 67–100% of threshold):")
-            for g in near_miss[:3]:
-                rsi_str = f"RSI={g['rsi']:.1f}" if g['rsi'] is not None else "RSI=warming"
-                self.Debug(
-                    f"    {g['sym']:8s} +{g['gain']:.1f}% "
-                    f"@ ${g['price']:.2f} | {rsi_str}"
-                )
+    cover_qty = abs(int(float(position.get("shares", 0))))
+    try:
+        result = place_order("Buy", symbol, cover_qty, aggressive_price, "COVER_AGGRESSIVE")
+        log.info(f"[{symbol}] COVER MONITOR: aggressive cover placed | "
+                 f"clientOrderId={result.get('clientOrderId')} status={result.get('orderStatus')}")
+        set_state(symbol, state="FLAT", reason="aggressive cover placed")
+    except Exception as e:
+        log.error(f"[{symbol}] COVER MONITOR: aggressive cover FAILED: {e} — MANUAL ACTION REQUIRED")
+        block(symbol, "aggressive cover failed — MANUAL ACTION REQUIRED")
 
-        if no_open > 0:
-            self.Debug(f"  {no_open}/{len(self.symbol_data)} symbols missing open price")
+
+def cancel_and_cleanup(symbol, reason):
+    log.info(f"[{symbol}] CANCEL+CLEANUP: {reason}")
+
+    cancelled = cancel_all_open_orders(symbol)
+    log.info(f"[{symbol}] Cancelled {cancelled} open order(s)")
+
+    position = get_position(symbol)
+    if position:
+        shares = float(position.get("shares", 0))
+        if shares < 0:
+            cover_qty   = abs(int(shares))
+            # priceClose = current market price (used for unrealised P&L)
+            # priceAvg   = entry price — NOT useful for cover pricing
+            last_price = float(position.get("priceClose") or 0)
+            if last_price <= 0:
+                # priceClose unavailable (e.g. AH with no last trade) — try Yahoo
+                yahoo_price, yahoo_session = get_yahoo_price(symbol)
+                if yahoo_price:
+                    last_price = yahoo_price
+                    log.info(f"[{symbol}] priceClose=0, using Yahoo ${last_price} ({yahoo_session})")
+                else:
+                    log.error(f"[{symbol}] Cannot determine cover price — MANUAL ACTION REQUIRED")
+                    block(symbol, "cleanup: no priceClose and Yahoo unavailable — MANUAL ACTION REQUIRED")
+                    return
+            cover_limit = round(last_price * 1.005, 2)  # server retry: 0.5% above live price
+            log.info(f"[{symbol}] Found short position: {cover_qty} shares | "
+                     f"priceClose=${last_price} | covering at ${cover_limit}")
+            try:
+                result = place_order("Buy", symbol, cover_qty, cover_limit, "COVER_ON_CANCEL")
+                log.info(f"[{symbol}] Cover placed: {result.get('clientOrderId')} "
+                         f"status={result.get('orderStatus')}")
+            except Exception as e:
+                log.error(f"[{symbol}] Cover order FAILED: {e} — MANUAL ACTION MAY BE REQUIRED")
+        elif shares > 0:
+            log.warning(f"[{symbol}] Found LONG position ({shares} shares) — not touching it")
         else:
-            self.Debug(f"  All {len(self.symbol_data)} symbols have open price ✓")
-        self.Debug(f"{'='*60}")
+            log.info(f"[{symbol}] Position shares=0 — nothing to cover")
+    else:
+        log.info(f"[{symbol}] No position found — nothing to cover")
 
-    # ============================================================
-    # HELPER METHODS
-    # ============================================================
+    block(symbol, reason)
 
-    def IsInEntryHours(self, time_to_check=None):
-        current_time = (time_to_check or self.Time).time()
-        return self.entry_start_time <= current_time < self.entry_end_time
 
-    def GetOrComputeTopGainers(self, data):
-        if self.last_top_time == self.Time:
-            self.gainer_rankings = self.cached_gainer_rankings
-            return self.cached_top_gainers
+# ══════════════════════════════════════════════════════════════════════════════
+# FLASK APP
+# ══════════════════════════════════════════════════════════════════════════════
+app = Flask(__name__)
 
-        gainers = []
-        for symbol in data.keys():
-            sym_data = self.symbol_data.get(symbol)
-            if sym_data is None:
-                continue
+
+@app.route("/", methods=["GET"])
+def root():
+    return jsonify({"status": "ok", "server": "tz-eod-short-webhook"}), 200
+
+
+_last_health_log = 0  # epoch seconds of last health log
+
+# Cache TZ API status so health endpoint never blocks on external calls
+_tz_cache = {"ok": True, "detail": "startup", "routes": "", "account_bp": None}
+_tz_cache_lock = threading.Lock()
+_last_tz_check = 0
+
+def _refresh_tz_cache():
+    """Background thread: refresh TZ API status every 60s."""
+    global _last_tz_check
+    while True:
+        time.sleep(60)
+        try:
+            r = requests.get(f"{BASE_URL}/v1/api/accounts", headers=tz_headers(), timeout=8)
+            ok = r.status_code == 200
+            detail = f"http_{r.status_code}: {r.text[:200]}"
+            # Also grab account bp
+            r2 = requests.get(f"{BASE_URL}/v1/api/account/{ACCOUNT_ID}", headers=tz_headers(), timeout=8)
+            bp = r2.json().get("bp") if r2.ok else None
+            # Routes (less critical, longer cache ok)
             try:
-                current_price = data[symbol].Close
+                r3 = requests.get(f"{BASE_URL}/v1/api/accounts/{ACCOUNT_ID}/routes", headers=tz_headers(), timeout=5)
+                routes = r3.text[:300]
             except Exception:
-                continue
-            if current_price < 2.0:
-                continue
-            if sym_data.day_open_price is None or sym_data.day_open_price <= 0:
-                continue
-            try:
-                gain_percent = (
-                    (current_price - sym_data.day_open_price) / sym_data.day_open_price
-                )
-            except Exception:
-                continue
-            if gain_percent >= self.min_gain_percent:
-                gainers.append({'symbol': symbol, 'gain_percent': gain_percent})
+                routes = _tz_cache.get("routes", "")
+            with _tz_cache_lock:
+                _tz_cache.update({"ok": ok, "detail": detail, "routes": routes, "account_bp": bp})
+            _last_tz_check = time.time()
+        except Exception as e:
+            with _tz_cache_lock:
+                _tz_cache["ok"] = False
+                _tz_cache["detail"] = f"error: {e}"
 
-        gainers.sort(key=lambda x: x['gain_percent'], reverse=True)
-        self.cached_gainer_rankings = {
-            g['symbol']: i + 1 for i, g in enumerate(gainers)
-        }
-        self.gainer_rankings   = self.cached_gainer_rankings
-        self.cached_top_gainers = [
-            g['symbol']
-            for g in gainers[self.min_gainer_rank - 1 : self.max_gainer_rank]
-        ]
-        self.last_top_time = self.Time
-        return self.cached_top_gainers
-
-    def GetValidPrice(self, symbol):
-        price = self.Securities[symbol].Price
-        if price > 0:
-            return price
-        avg = self.Portfolio[symbol].AveragePrice
-        return avg if avg > 0 else 1.00
-
-    def CancelOrdersForSymbol(self, symbol):
-        for order in self.Transactions.GetOpenOrders(symbol):
-            self.Transactions.CancelOrder(order.Id)
-
-    # ============================================================
-    # DAILY RESET
-    # ============================================================
-
-    def DailyReset(self):
-        daily_commission = self.Portfolio.TotalFees - self.daily_starting_total_fees
-        equity           = self.Portfolio.TotalPortfolioValue
-
-        # ── Kalman update (once per day, end-of-day) ─────────
-        # Only update after warmup — warmup has no trades so
-        # rolling Kelly returns global_kelly (obs=1.0) which
-        # would just confirm the prior with no new information.
-        # More importantly, IsWarmingUp guards against the
-        # scheduled DailyReset firing during the warmup period.
-        #
-        # Observation = rolling Kelly ratio (rk / global_kelly).
-        # This is dimensionless and centred on 1.0, matching
-        # the Kalman state (kalman_x, also a multiplier).
-        # DO NOT use daily_return_frac here — daily returns
-        # (~0.5-2%) are on a completely different scale to the
-        # Kelly ratio (~1.0), which causes the filter to
-        # immediately collapse the state to near zero.
-        if not self.IsWarmingUp:
-            rk_obs = self.ComputeRollingKelly() / max(self.global_kelly, 1e-9)
-            self.KalmanUpdate(rk_obs)
-
-        # ── Update peak equity for DD gate ───────────────────
-        if self.peak_equity is None or equity > self.peak_equity:
-            self.peak_equity = equity
-
-        # ── Log daily summary ─────────────────────────────────
-        self.Debug(f"\n{'='*55}")
-        self.Debug(
-            f"DAILY SUMMARY | Equity: ${equity:.2f} | "
-            f"Realized P&L: ${self.daily_realized_pnl:.2f} | "
-            f"Locate Fees: ${self.daily_fees_locate:.2f} | "
-            f"Commission: ${daily_commission:.2f}"
-        )
-        self.Debug(f"  KALMAN STATE | {self.GetSizingDebugStr()}")
-        for entry in (self.daily_trades_log or ["  No trades today."]):
-            self.Debug(f"  {entry}")
-        self.Debug(f"{'='*55}\n")
-
-        # ── Reset daily state ────────────────────────────────
-        self.gainer_rankings           = {}
-        self.daily_starting_equity     = equity
-        self.daily_starting_total_fees = self.Portfolio.TotalFees
-        self.daily_loss_limit_hit      = False
-        self.daily_traded_symbols      = {}
-        self.daily_realized_pnl        = 0
-        self.ticker_trade_counts       = {}
-        self.daily_trades_log          = []
-        self.daily_fees_locate         = 0.0
-        self.closing_in_progress       = set()
-
-        self._webhook_short_fired.clear()
-        self._webhook_cover_fired.clear()
-
-        symbols_to_keep = [s for s in self.Portfolio.Keys if self.Portfolio[s].Invested]
-        for symbol in list(self.position_entry_times.keys()):
-            if symbol not in symbols_to_keep:
-                del self.position_entry_times[symbol]
-        for symbol in list(self.position_entry_prices.keys()):
-            if symbol not in symbols_to_keep:
-                del self.position_entry_prices[symbol]
-
-        for order in self.Transactions.GetOpenOrders():
-            if order.Quantity < 0:
-                self.Transactions.CancelOrder(order.Id)
-
-        if symbols_to_keep:
-            self.Debug(f"WARNING: {len(symbols_to_keep)} positions still held overnight")
-
-        self.locate_fee_model.ResetDaily(self.Time.date())
-        for sd in self.symbol_data.values():
-            sd.reset_daily_data()
-
-    def OnEndOfAlgorithm(self):
-        if self.daily_trades_log:
-            self.Debug(f"\nFINAL DAY TRADES:")
-            for entry in self.daily_trades_log:
-                self.Debug(f"  {entry}")
-        self.Debug(f"\nFINAL SUMMARY:")
-        self.Debug(f"  Total Locate Fees:  ${self.total_locate_fees_paid:.2f}")
-        self.Debug(f"  Total Commission:   ${self.Portfolio.TotalFees:.2f}")
-        self.Debug(f"  Final Equity:       ${self.Portfolio.TotalPortfolioValue:.2f}")
-        self.Debug(f"  Peak Equity:        ${self.peak_equity:.2f}")
-        self.Debug(f"  Final Kalman State: {self.GetSizingDebugStr()}")
-        self.Debug(f"  Trade History Size: {len(self.trade_history)} entries")
+threading.Thread(target=_refresh_tz_cache, daemon=True).start()
 
 
-# ========================================
-# SYMBOL DATA  (RSI + VWAP TRACKING)
-# ========================================
-class SymbolData:
-    def __init__(self, algorithm, symbol):
-        self.algorithm = algorithm
-        self.symbol    = symbol
+@app.route("/health", methods=["GET", "HEAD"])
+def health():
+    with state_lock:
+        states = {k: v.get("state") for k, v in symbol_state.items()}
+    with _tz_cache_lock:
+        cache = dict(_tz_cache)
 
-        self.rsi  = RelativeStrengthIndex(
-            algorithm.rsi_period,
-            MovingAverageType.Wilders
-        )
-        self.vwap = IntradayVwap(f"VWAP_{symbol}")
+    status = {
+        "server":        "ok",
+        "tz_api":        "ok" if cache["ok"] else "unreachable",
+        "tz_detail":     cache["detail"],
+        "account":       ACCOUNT_ID,
+        "key_preview":   API_KEY[:8] + "..." if API_KEY else "NOT SET",
+        "symbol_states": states,
+        "routes":        cache["routes"],
+        "ticker_aliases": TICKER_ALIASES,
+        "polygon_key":   POLYGON_API_KEY[:8] + "..." if POLYGON_API_KEY else "NOT SET",
+        "twelvedata_key": TWELVEDATA_API_KEY[:8] + "..." if TWELVEDATA_API_KEY else "NOT SET",
+        "config": {
+            "max_locate_cost_pct": MAX_LOCATE_COST_PCT,
+            "min_locate_quantity": MIN_LOCATE_QUANTITY,
+            "locate_poll_timeout": LOCATE_POLL_TIMEOUT,
+            "price_handling": "QC pre-buffered — server uses received price directly",
+        },
+    }
+    global _last_health_log
+    import time as _t
+    now_ts = _t.time()
+    if now_ts - _last_health_log >= 300:
+        log.info(f"HEALTH: {status}")
+        _last_health_log = now_ts
+    return jsonify(status), 200
 
-        self.day_open_price      = None
-        self.last_rsi_value      = None
-        self.last_rsi_cross_time = None
 
-    def reset_daily_data(self):
-        self.day_open_price      = None
-        self.last_rsi_value      = None
-        self.last_rsi_cross_time = None
+@app.route("/state", methods=["GET"])
+def state_endpoint():
+    with state_lock:
+        return jsonify(dict(symbol_state)), 200
+
+
+@app.route("/reset/<symbol>", methods=["POST"])
+def reset_symbol(symbol):
+    """Emergency manual reset of a symbol to FLAT."""
+    symbol = symbol.upper()
+    with state_lock:
+        symbol_state[symbol] = {"state": "FLAT"}
+    log.info(f"[{symbol}] MANUAL RESET to FLAT")
+    return jsonify({"status": "ok", "symbol": symbol, "state": "FLAT"}), 200
+
+
+@app.route("/webhook", methods=["POST"])
+def webhook():
+    log.info("=" * 60)
+    log.info("WEBHOOK RECEIVED")
+    log.info(f"  headers: {dict(request.headers)}")
+    log.info(f"  raw body: {request.data.decode('utf-8', errors='replace')[:1000]}")
+
+    try:
+        body = request.get_json(force=True)
+        if isinstance(body, str):
+            body = json.loads(body)
+    except Exception as e:
+        log.error(f"  Parse error: {e}")
+        return jsonify({"error": "invalid JSON"}), 400
+
+    log.info(f"  parsed: {json.dumps(body)}")
+
+    action      = str(body.get("action", "")).upper()
+    qc_symbol   = str(body.get("symbol", "")).upper().strip().split()[0]  # strip QC SID e.g. "DLXY YTYSIFTLVN8L" → "DLXY"
+    quantity    = int(body.get("quantity", 0))
+    price       = float(body.get("price", 0))
+    cycle       = int(body.get("cycle", 1))  # trade cycle counter — used to lift BLOCKED on re-entry
+
+    if not qc_symbol:
+        return jsonify({"error": "missing symbol"}), 400
+
+    # ── Resolve ticker: static alias map → Polygon live lookup ─────────────
+    symbol = resolve_symbol(qc_symbol)
+    if symbol != qc_symbol:
+        log.info(f"[{qc_symbol}→{symbol}] Ticker resolved")
+
+    s             = get_state(symbol)
+    current_state = s.get("state", "FLAT")
+
+    log.info(f"[{symbol}] action={action} | state={current_state} | "
+             f"qty={quantity} | price=${price}")
+
+    # ── SHORT ─────────────────────────────────────────────────────────────────
+    if action == "SHORT":
+        if current_state == "BLOCKED":
+            last_cycle = s.get("cycle", 0)
+            if cycle > last_cycle:
+                log.info(f"[{symbol}] BLOCKED lifted — new cycle {cycle} > last cycle {last_cycle} (QC started new trade)")
+                set_state(symbol, state="FLAT")  # reset so it falls through to LOCATING below
+                current_state = "FLAT"
+            else:
+                log.info(f"[{symbol}] SHORT ignored — blocked today (cycle={cycle}, last={last_cycle}): {s.get('reason', '')}")
+                return jsonify({"status": "ignored", "reason": "blocked", "cycle": cycle, "last_cycle": last_cycle}), 200
+
+        if current_state == "LOCATING":
+            log.warning(f"[{symbol}] SHORT ignored — locate already in progress")
+            return jsonify({"status": "ignored", "reason": "locate in progress"}), 200
+
+        if current_state == "ACTIVE":
+            log.warning(f"[{symbol}] SHORT rejected — already have active position")
+            block(symbol, "duplicate SHORT received while ACTIVE")
+            return jsonify({"status": "rejected", "reason": "already active"}), 200
+
+        if quantity <= 0 or price <= 0:
+            return jsonify({"error": "quantity and price required for SHORT"}), 400
+
+        set_state(symbol, state="LOCATING", entry_price=price, quantity=quantity, cycle=cycle)
+        threading.Thread(target=locate_and_short, args=(symbol, quantity, price), daemon=True).start()
+        log.info(f"[{symbol}] Locate thread launched — returning 200 immediately")
+        return jsonify({"status": "ok", "action": "SHORT", "symbol": symbol, "state": "LOCATING"}), 200
+
+    # ── COVER ─────────────────────────────────────────────────────────────────
+    elif action == "COVER":
+        if current_state == "BLOCKED":
+            log.info(f"[{symbol}] COVER ignored — blocked today: {s.get('reason', '')}")
+            return jsonify({"status": "ignored", "reason": "blocked"}), 200
+
+        if current_state == "FLAT":
+            log.warning(f"[{symbol}] COVER rejected — no position to cover (FLAT)")
+            block(symbol, "COVER received with no active position")
+            return jsonify({"status": "rejected", "reason": "no position"}), 200
+
+        if current_state == "LOCATING":
+            log.warning(f"[{symbol}] COVER received during locate — cancelling and cleaning up")
+            threading.Thread(
+                target=cancel_and_cleanup,
+                args=(symbol, "COVER received while still locating"),
+                daemon=True
+            ).start()
+            return jsonify({"status": "ok", "action": "cleanup_on_cover_during_locate"}), 200
+
+        # ACTIVE — look up actual position size from TZ
+        log.info(f"[{symbol}] COVER: looking up actual position size from TZ")
+        position = get_position(symbol)
+
+        if position is None:
+            log.warning(f"[{symbol}] COVER: no TZ position found — entry may not have filled")
+            block(symbol, "COVER received but no TZ position found")
+            return jsonify({"status": "ok", "note": "no position found — blocked"}), 200
+
+        shares = float(position.get("shares", 0))
+        if shares >= 0:
+            log.warning(f"[{symbol}] COVER: position shares={shares} — not a short | blocking")
+            block(symbol, f"COVER received but position is not short (shares={shares})")
+            return jsonify({"status": "ok", "note": "not a short position"}), 200
+
+        cover_qty   = abs(int(shares))
+        # Use QC's signal price — QC knows the current market price, server does not
+        # Add a small buffer above to ensure fill (buying to cover, so we go higher)
+        cover_limit = float(price)  # QC already applied its buffer
+
+        log.info(f"[{symbol}] Covering {cover_qty} shares | "
+                 f"qc_price=${price} | limit=${cover_limit} (QC pre-buffered)")
+
+        try:
+            result = place_order("Buy", symbol, cover_qty, cover_limit, "COVER_ORDER")
+            set_state(symbol, state="FLAT", reason="covered")
+            log.info(f"[{symbol}] COVER PLACED | qty={cover_qty} | limit=${cover_limit} | "
+                     f"clientOrderId={result.get('clientOrderId')} | "
+                     f"status={result.get('orderStatus')}")
+            threading.Thread(
+                target=monitor_cover_fill,
+                args=(symbol, result.get("clientOrderId"), COVER_FILL_TIMEOUT),
+                daemon=True
+            ).start()
+            return jsonify({
+                "status":        "ok",
+                "action":        "COVER",
+                "symbol":        symbol,
+                "quantity":      cover_qty,
+                "limit_price":   cover_limit,
+                "clientOrderId": result.get("clientOrderId"),
+                "orderStatus":   result.get("orderStatus"),
+            }), 200
+        except Exception as e:
+            log.error(f"[{symbol}] Cover order failed: {e}")
+            return jsonify({"error": str(e)}), 500
+
+    # ── CANCEL ────────────────────────────────────────────────────────────────
+    elif action == "CANCEL":
+        log.info(f"[{symbol}] CANCEL received — cancelling orders and closing any position")
+        threading.Thread(
+            target=cancel_and_cleanup,
+            args=(symbol, "CANCEL signal received from QC"),
+            daemon=True
+        ).start()
+        return jsonify({"status": "ok", "action": "CANCEL", "symbol": symbol}), 200
+
+    else:
+        log.warning(f"[{symbol}] Unknown action: {action}")
+        return jsonify({"error": f"unknown action: {action}"}), 400
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ENTRYPOINT
+# ══════════════════════════════════════════════════════════════════════════════
+if __name__ == "__main__":
+    if not API_KEY or not API_SECRET:
+        log.warning("TZ_API_KEY or TZ_API_SECRET not set — orders will fail")
+
+    port = int(os.environ.get("PORT", 5000))
+
+    log.info("")
+    log.info("╔══════════════════════════════════════════════════════════╗")
+    log.info("║  TradeZero EOD Short Webhook Server                      ║")
+    log.info("║                                                          ║")
+    log.info("║  POST /webhook          ← SHORT / COVER / CANCEL        ║")
+    log.info("║  GET  /health           ← server + TZ API status        ║")
+    log.info("║  GET  /state            ← view all symbol states        ║")
+    log.info("║  POST /reset/<symbol>   ← manually reset symbol to FLAT ║")
+    log.info("╚══════════════════════════════════════════════════════════╝")
+    log.info(f"  Account:           {ACCOUNT_ID}")
+    log.info(f"  Ticker aliases:    {TICKER_ALIASES}")
+    log.info(f"  Polygon key:       {POLYGON_API_KEY[:8] + '...' if POLYGON_API_KEY else 'NOT SET — rename auto-detection disabled'}")
+    log.info(f"  Twelve Data key:   {TWELVEDATA_API_KEY[:8] + '...' if TWELVEDATA_API_KEY else 'NOT SET — price check falls back to Yahoo'}")
+    log.info(f"  Max locate cost:   {MAX_LOCATE_COST_PCT*100:.1f}%")
+    log.info(f"  Min locate qty:    {MIN_LOCATE_QUANTITY}")
+    log.info(f"  Locate timeout:    {LOCATE_POLL_TIMEOUT}s")
+    log.info(f"  Price handling: QC pre-buffered — server uses received price directly")
+    log.info(f"  Listening on port: {port}")
+    log.info("")
+    app.run(host="0.0.0.0", port=port, debug=False)
