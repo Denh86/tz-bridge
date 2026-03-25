@@ -44,8 +44,7 @@ LOCATE_ACCEPT_SLEEP  = 3       # seconds to wait after locate accept before plac
                                # TZ sends "locateAcceptSent:true" before fully registering
                                # the locate — placing the order too fast causes R43 rejection
 # QC strategies send already-buffered limit prices in webhooks — server uses them directly
-SHORT_FILL_TIMEOUT   = 1       # minutes to wait for short entry to fill before cancelling
-                               # genuine signals fill in seconds — 1 min is generous
+SHORT_FILL_TIMEOUT   = 5       # minutes to wait for short entry to fill before cancelling
 COVER_FILL_TIMEOUT   = 3       # minutes to wait for cover to fill before retrying aggressively
 COVER_RETRY_BUFFER   = 0.005   # 0.5% above live price for aggressive cover retry
 
