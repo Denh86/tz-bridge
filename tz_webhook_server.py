@@ -1207,9 +1207,8 @@ def locate_and_short_sim(symbol, qc_quantity, entry_price):
 
             elif locate.get("locateStatus") == 56:
                 reason = locate.get("text", "no reason given")
-                log.warning(f"[SIM:{symbol}] Phantom locate REJECTED by TZ: {reason} — blocking (realistic)")
-                sim_block(symbol, f"phantom locate rejected by TZ: {reason}")
-                return
+                log.warning(f"[SIM:{symbol}] Phantom locate REJECTED by TZ: {reason} — "
+                            f"logging only, proceeding with sim order (cost data: $0.00)")
 
             elif locate.get("locateStatus") in (67, 52):
                 log.warning(f"[SIM:{symbol}] Phantom locate expired/cancelled — "
