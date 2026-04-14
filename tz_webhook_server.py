@@ -619,6 +619,7 @@ PRICE_SANITY_PCT = 0.15
 TICKER_ALIASES = {
     "FPGP": "ALTO",
     "AGE":  "SER",
+    "HAPP": "PAVS",
 }
 
 POLYGON_API_KEY = (os.getenv("POLYGON_API_KEY") or "").strip()
