@@ -51,7 +51,7 @@ from locate_logger import log_locate, log_rename
 # ══════════════════════════════════════════════════════════════════════════════
 BASE_URL             = "https://webapi.tradezero.com"
 ACCOUNT_ID           = "DHA41998"
-MAX_LOCATE_COST_PCT  = 0.05    # 5%  — reject if locatePrice / entryPrice > this
+MAX_LOCATE_COST_PCT  = 0.1    # 5%  — reject if locatePrice / entryPrice > this
 MIN_LOCATE_QUANTITY  = 100     # TZ minimum locate size
 MIN_SHORT_QUANTITY   = 1       # TZ minimum short order size (any size accepted)
 LOCATE_POLL_INTERVAL = 2       # seconds between locate status polls
@@ -73,7 +73,7 @@ COVER_RETRY_BUFFER   = 0.005   # 0.5% above live price for aggressive cover retr
 # QC strategies will eventually send an `sl_pct` field in the SHORT webhook;
 # until then, all strategies use a 10% stop. The bridge falls back to
 # DEFAULT_SL_PCT when no sl_pct is provided in the payload.
-DEFAULT_SL_PCT  = 0.10    # 10% adverse move on short positions (price up)
+DEFAULT_SL_PCT  = 0.20    # 10% adverse move on short positions (price up)
 SL_LIMIT_SLACK  = 0.02    # 2% slack on StopLimit ETH orders so they actually fill
 # Stop type by session: RTH uses Stop (market on trigger), ETH uses StopLimit
 # because TZ doesn't accept market orders outside RTH.
