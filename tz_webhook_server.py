@@ -44,6 +44,20 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+# ─── TEMPORARY SMOKE TEST ─── remove after first successful write
+from locate_logger import log_locate
+log_locate(
+    symbol="SMOKETEST",
+    entry_price=1.00,
+    shares_offered=100,
+    locate_cost_per_share=0.01,
+    route="PRIMARY",
+    outcome="ACCEPTED_TRADED",
+    trade_outcome="UNKNOWN_PENDING",
+    notes="smoke test on server startup",
+)
+# ─── END TEMPORARY SMOKE TEST ───
+
 # ══════════════════════════════════════════════════════════════════════════════
 # CONFIG — adjust these without touching any other code
 # ══════════════════════════════════════════════════════════════════════════════
