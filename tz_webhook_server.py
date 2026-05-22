@@ -554,7 +554,7 @@ def place_stop_order(account_id, headers_fn, symbol, quantity, trigger_price,
         "orderQuantity": int(quantity),
         "side":          "Buy",
         "securityType":  "Stock",
-        "priceStop":     round(trigger_price, 2),
+        "stopPrice":     round(trigger_price, 2),
         "timeInForce":   "Day_Plus",
         "route":         route,
     }
@@ -638,6 +638,64 @@ def cancel_real_stop(symbol, stop_client_order_id):
 
 def cancel_sim_stop(symbol, stop_client_order_id):
     return cancel_stop_order(SIM_ACCOUNT_ID, sim_headers, symbol, stop_client_order_id, "SIM_STOP_CANCEL")
+
+
+def verify_stop_alive(account_id, headers_fn, symbol, stop_client_order_id,
+                      is_sim=False, delay_seconds=10):
+    """Wait briefly, then check whether the stop order is still alive on TZ.
+
+    TZ accepts stop orders synchronously as 'PendingNew' but may reject them
+    asynchronously a few seconds later (e.g. for malformed fields, BP issues,
+    or symbol restrictions). This function runs in a daemon thread, sleeps
+    briefly, then polls the order. If the order has been Rejected or Canceled,
+    it clears the sl_client_order_id from state so the position is flagged
+    as unprotected, and logs loudly.
+
+    Does NOT attempt to re-place the order — if a stop was rejected, the
+    cause is likely persistent (bad field, BP, etc.) and silent retry would
+    just keep failing.
+    """
+    prefix = f"[SIM:{symbol}]" if is_sim else f"[{symbol}]"
+    try:
+        time.sleep(delay_seconds)
+        r = requests.get(
+            f"{BASE_URL}/v1/api/accounts/{account_id}/orders",
+            headers=headers_fn(), timeout=10
+        )
+        if not r.ok:
+            log.warning(f"{prefix} STOP VERIFY: orders fetch failed: {r.status_code}")
+            return
+        orders = r.json()
+        if not isinstance(orders, list):
+            orders = orders.get("orders", [])
+        order = next((o for o in orders if o.get("clientOrderId") == stop_client_order_id), None)
+        if not order:
+            log.warning(f"{prefix} STOP VERIFY: stop {stop_client_order_id} NOT FOUND on TZ — "
+                        f"may have been rejected and dropped | position is UNPROTECTED")
+            if is_sim:
+                sim_set_state(symbol, sl_client_order_id=None)
+            else:
+                set_state(symbol, sl_client_order_id=None)
+            return
+
+        status = order.get("orderStatus", "")
+        reason = order.get("text") or order.get("rejectReason") or ""
+        stop_px = order.get("priceStop")
+        limit_px = order.get("limitPrice")
+        log.info(f"{prefix} STOP VERIFY: status={status} stopPrice={stop_px} limitPrice={limit_px} text={reason[:80]}")
+        if status in ("Rejected", "Canceled"):
+            log.error(f"{prefix} STOP VERIFY: stop {stop_client_order_id} is {status} | "
+                      f"reason: {reason} | position is UNPROTECTED — QC-side SL only")
+            if is_sim:
+                sim_set_state(symbol, sl_client_order_id=None)
+            else:
+                set_state(symbol, sl_client_order_id=None)
+        elif status in ("PendingNew", "New", "Submitted"):
+            log.info(f"{prefix} STOP VERIFY: stop is live and armed ✓")
+        else:
+            log.warning(f"{prefix} STOP VERIFY: unexpected status={status} — leaving state as-is")
+    except Exception as e:
+        log.error(f"{prefix} STOP VERIFY exception: {e}")
 
 
 
@@ -1716,6 +1774,14 @@ def monitor_short_fill(symbol, client_order_id, timeout_minutes):
                             if stop_id:
                                 set_state(symbol, sl_client_order_id=stop_id)
                                 log.info(f"[{symbol}] BROKER SL armed | stop_order={stop_id}")
+                                # TZ sometimes accepts a stop synchronously but rejects it
+                                # ~5s later (e.g. malformed fields). Verify in background.
+                                threading.Thread(
+                                    target=verify_stop_alive,
+                                    args=(ACCOUNT_ID, tz_headers, symbol, stop_id),
+                                    kwargs={"is_sim": False, "delay_seconds": 10},
+                                    daemon=True,
+                                ).start()
                             else:
                                 log.warning(f"[{symbol}] BROKER SL FAILED to place — "
                                             f"trade relies on QC-side SL only")
@@ -1948,6 +2014,13 @@ def sim_monitor_short_fill(symbol, client_order_id, timeout_minutes):
                             if stop_id:
                                 sim_set_state(symbol, sl_client_order_id=stop_id)
                                 log.info(f"[SIM:{symbol}] BROKER SL armed | stop_order={stop_id}")
+                                # Verify the stop survived TZ's async validation
+                                threading.Thread(
+                                    target=verify_stop_alive,
+                                    args=(SIM_ACCOUNT_ID, sim_headers, symbol, stop_id),
+                                    kwargs={"is_sim": True, "delay_seconds": 10},
+                                    daemon=True,
+                                ).start()
                             else:
                                 log.warning(f"[SIM:{symbol}] BROKER SL FAILED to place — "
                                             f"sim trade relies on QC-side SL only")
