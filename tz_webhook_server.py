@@ -44,7 +44,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-from locate_logger import log_locate
+from locate_logger import log_locate, log_rename
 
 # ══════════════════════════════════════════════════════════════════════════════
 # CONFIG — adjust these without touching any other code
@@ -63,6 +63,20 @@ LOCATE_ACCEPT_SLEEP  = 3       # seconds to wait after locate accept before plac
 SHORT_FILL_TIMEOUT   = 5       # minutes to wait for short entry to fill before cancelling
 COVER_FILL_TIMEOUT   = 3       # minutes to wait for cover to fill before retrying aggressively
 COVER_RETRY_BUFFER   = 0.005   # 0.5% above live price for aggressive cover retry
+
+# ── BROKER STOP-LOSS (server-side protection against QC dead zones) ─────────
+# QC strategies emit 1-minute bars, so price can move 5-15% between bars on
+# halt resumption or fast gap moves. To protect live capital, the bridge fires
+# a TZ-side stop order immediately after each short fill. When QC's TP/SL/EOD
+# cover signal arrives, the stop is cancelled before the cover is placed.
+#
+# QC strategies will eventually send an `sl_pct` field in the SHORT webhook;
+# until then, all strategies use a 10% stop. The bridge falls back to
+# DEFAULT_SL_PCT when no sl_pct is provided in the payload.
+DEFAULT_SL_PCT  = 0.10    # 10% adverse move on short positions (price up)
+SL_LIMIT_SLACK  = 0.02    # 2% slack on StopLimit ETH orders so they actually fill
+# Stop type by session: RTH uses Stop (market on trigger), ETH uses StopLimit
+# because TZ doesn't accept market orders outside RTH.
 
 # ══════════════════════════════════════════════════════════════════════════════
 # CREDENTIALS — REAL ACCOUNT
@@ -501,6 +515,133 @@ def sim_place_order_with_stepdown(symbol, initial_quantity, limit_price, label="
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# BROKER STOP-LOSS HELPERS  (real + sim — server-side capital protection)
+# ══════════════════════════════════════════════════════════════════════════════
+def _is_rth_now():
+    """Return True if current ET time is in regular trading hours (9:30-16:00)."""
+    from datetime import datetime as _dt, time as _t
+    now_et = _dt.now(ZoneInfo("America/New_York")).time()
+    return _t(9, 30) <= now_et < _t(16, 0)
+
+
+def _compute_sl_prices(entry_fill, sl_pct):
+    """Given an entry fill price and stop-loss percent (e.g. 0.10), return
+    (trigger_price, limit_price) for a short stop order.
+
+    For shorts, the SL fires when price goes UP — so trigger = entry × (1+sl_pct).
+    The limit (for StopLimit in ETH) is set slightly above the trigger so the
+    order actually fills in a fast-moving market.
+    """
+    trigger = round(entry_fill * (1.0 + sl_pct), 2)
+    limit   = round(trigger * (1.0 + SL_LIMIT_SLACK), 2)
+    return trigger, limit
+
+
+def place_stop_order(account_id, headers_fn, symbol, quantity, trigger_price,
+                     limit_price=None, label="STOP_ORDER", route="SMART"):
+    """Place a Buy Stop or StopLimit order to cover a short on adverse move.
+    
+    - If limit_price is None: places a Stop (market on trigger), only valid in RTH.
+    - If limit_price is set: places a StopLimit (limit on trigger), valid in ETH and RTH.
+    
+    Returns the order response dict, or None on failure. Failures here are LOGGED
+    but do not propagate — losing SL protection should not kill the active trade.
+    """
+    client_id = f"SL_{uuid.uuid4().hex[:8].upper()}"
+    payload = {
+        "clientOrderId": client_id,
+        "symbol":        symbol,
+        "orderQuantity": int(quantity),
+        "side":          "Buy",
+        "securityType":  "Stock",
+        "priceStop":     round(trigger_price, 2),
+        "timeInForce":   "Day_Plus",
+        "route":         route,
+    }
+    if limit_price is not None:
+        payload["orderType"]  = "StopLimit"
+        payload["limitPrice"] = round(limit_price, 2)
+    else:
+        payload["orderType"]  = "Stop"
+
+    url = f"{BASE_URL}/v1/api/accounts/{account_id}/order"
+    log.info(f"  → {label} POST {url}")
+    log.info(f"    body: {json.dumps(payload)}")
+    try:
+        r = requests.post(url, headers=headers_fn(), json=payload, timeout=15)
+        log.info(f"  ← {label} status: {r.status_code}  body: {r.text[:400]}")
+        if not r.ok:
+            log.error(f"  [{symbol}] Stop order FAILED {r.status_code} — body: {r.text[:300]}")
+            return None
+        data = r.json()
+        log.info(f"  [{symbol}] Stop order placed: clientOrderId={data.get('clientOrderId')} "
+                 f"status={data.get('orderStatus')} type={payload['orderType']} "
+                 f"trigger=${payload['priceStop']}"
+                 + (f" limit=${payload.get('limitPrice')}" if 'limitPrice' in payload else ""))
+        return data
+    except Exception as e:
+        log.error(f"  [{symbol}] Stop order EXCEPTION: {e}")
+        return None
+
+
+def cancel_stop_order(account_id, headers_fn, symbol, stop_client_order_id, label="STOP_CANCEL"):
+    """Cancel a previously-placed stop order. Returns True on success.
+    Failures are LOGGED but do not propagate — the cover will still be placed.
+    """
+    if not stop_client_order_id:
+        return True  # no stop to cancel
+    url = f"{BASE_URL}/v1/api/accounts/{account_id}/orders/{stop_client_order_id}"
+    log.info(f"  → {label} DELETE {url}")
+    try:
+        r = requests.delete(url, headers=headers_fn(), timeout=10)
+        log.info(f"  ← {label} status: {r.status_code}  body: {r.text[:200]}")
+        if r.status_code in (200, 204):
+            log.info(f"  [{symbol}] Stop order {stop_client_order_id} cancelled")
+            return True
+        log.warning(f"  [{symbol}] Stop cancel returned {r.status_code} — "
+                    f"order may have already filled or been cancelled")
+        return False
+    except Exception as e:
+        log.error(f"  [{symbol}] Stop cancel EXCEPTION: {e}")
+        return False
+
+
+def place_real_stop(symbol, quantity, entry_fill, sl_pct):
+    """Place a stop order on the REAL account. Returns clientOrderId or None."""
+    trigger, limit = _compute_sl_prices(entry_fill, sl_pct)
+    use_limit = None if _is_rth_now() else limit
+    session   = "RTH (Stop)" if use_limit is None else "ETH (StopLimit)"
+    log.info(f"[{symbol}] Placing REAL stop | session={session} | qty={quantity} | "
+             f"entry_fill=${entry_fill:.4f} | sl_pct={sl_pct*100:.1f}% | "
+             f"trigger=${trigger}" + (f" limit=${limit}" if use_limit else ""))
+    result = place_stop_order(ACCOUNT_ID, tz_headers, symbol, quantity, trigger,
+                              limit_price=use_limit, label="REAL_STOP")
+    return result.get("clientOrderId") if result else None
+
+
+def place_sim_stop(symbol, quantity, entry_fill, sl_pct):
+    """Place a stop order on the SIM account. Returns clientOrderId or None."""
+    trigger, limit = _compute_sl_prices(entry_fill, sl_pct)
+    use_limit = None if _is_rth_now() else limit
+    session   = "RTH (Stop)" if use_limit is None else "ETH (StopLimit)"
+    log.info(f"[SIM:{symbol}] Placing SIM stop | session={session} | qty={quantity} | "
+             f"entry_fill=${entry_fill:.4f} | sl_pct={sl_pct*100:.1f}% | "
+             f"trigger=${trigger}" + (f" limit=${limit}" if use_limit else ""))
+    result = place_stop_order(SIM_ACCOUNT_ID, sim_headers, symbol, quantity, trigger,
+                              limit_price=use_limit, label="SIM_STOP")
+    return result.get("clientOrderId") if result else None
+
+
+def cancel_real_stop(symbol, stop_client_order_id):
+    return cancel_stop_order(ACCOUNT_ID, tz_headers, symbol, stop_client_order_id, "REAL_STOP_CANCEL")
+
+
+def cancel_sim_stop(symbol, stop_client_order_id):
+    return cancel_stop_order(SIM_ACCOUNT_ID, sim_headers, symbol, stop_client_order_id, "SIM_STOP_CANCEL")
+
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # LOCATE HELPERS  (real account — used by both real flow and phantom locate)
 # ══════════════════════════════════════════════════════════════════════════════
 def request_locate_quote(symbol, quantity, quote_req_id):
@@ -724,6 +865,10 @@ def resolve_symbol(qc_symbol):
             f'║    "{qc_symbol}": "{current_ticker}",{" " * max(0, 43 - len(qc_symbol) - len(current_ticker))}║\n'
             f"╚══════════════════════════════════════════════════════════╝"
         )
+        # Persist to sheet renames tab for periodic review and TICKER_ALIASES updates
+        log_rename(qc_ticker=qc_symbol, resolved_ticker=current_ticker,
+                   cik=cik, source="polygon",
+                   notes=f"detected at runtime; add to TICKER_ALIASES")
         return current_ticker
 
     except Exception as e:
@@ -1562,6 +1707,18 @@ def monitor_short_fill(symbol, client_order_id, timeout_minutes):
                     if entry_fill > 0:
                         set_state(symbol, entry_fill_price=entry_fill)
                         log.info(f"[{symbol}] SHORT MONITOR: order filled @ ${entry_fill:.4f} — monitor done")
+                        # Fire broker SL stop to protect against QC dead zones
+                        s = get_state(symbol)
+                        sl_pct  = float(s.get("sl_pct") or DEFAULT_SL_PCT)
+                        qty     = int(s.get("quantity") or executed or 0)
+                        if qty > 0 and sl_pct > 0:
+                            stop_id = place_real_stop(symbol, qty, entry_fill, sl_pct)
+                            if stop_id:
+                                set_state(symbol, sl_client_order_id=stop_id)
+                                log.info(f"[{symbol}] BROKER SL armed | stop_order={stop_id}")
+                            else:
+                                log.warning(f"[{symbol}] BROKER SL FAILED to place — "
+                                            f"trade relies on QC-side SL only")
                     else:
                         log.info(f"[{symbol}] SHORT MONITOR: order filled — monitor done")
                     return
@@ -1664,7 +1821,8 @@ def monitor_cover_fill(symbol, client_order_id, timeout_minutes):
             log.warning(f"[{symbol}] COVER MONITOR: poll error — {e}")
 
     log.warning(f"[{symbol}] COVER MONITOR: cover did not fill — cancelling and retrying aggressively")
-    cancel_all_open_orders(symbol)
+    cancel_all_open_orders(symbol)  # this also cancels any armed SL stop
+    set_state(symbol, sl_client_order_id=None)
 
     position = get_position(symbol)
     if not position or float(position.get("shares", 0)) >= 0:
@@ -1700,8 +1858,9 @@ def monitor_cover_fill(symbol, client_order_id, timeout_minutes):
 def cancel_and_cleanup(symbol, reason):
     log.info(f"[{symbol}] CANCEL+CLEANUP: {reason}")
 
-    cancelled = cancel_all_open_orders(symbol)
+    cancelled = cancel_all_open_orders(symbol)  # this also cancels any armed SL stop
     log.info(f"[{symbol}] Cancelled {cancelled} open order(s)")
+    set_state(symbol, sl_client_order_id=None)
 
     position = get_position(symbol)
     if position:
@@ -1780,6 +1939,18 @@ def sim_monitor_short_fill(symbol, client_order_id, timeout_minutes):
                     if entry_fill > 0:
                         sim_set_state(symbol, entry_fill_price=entry_fill)
                         log.info(f"[SIM:{symbol}] MONITOR: filled @ ${entry_fill:.4f} — done")
+                        # Fire broker SL stop on sim account too (so we can test the flow)
+                        s = sim_get_state(symbol)
+                        sl_pct  = float(s.get("sl_pct") or DEFAULT_SL_PCT)
+                        qty     = int(s.get("quantity") or executed or 0)
+                        if qty > 0 and sl_pct > 0:
+                            stop_id = place_sim_stop(symbol, qty, entry_fill, sl_pct)
+                            if stop_id:
+                                sim_set_state(symbol, sl_client_order_id=stop_id)
+                                log.info(f"[SIM:{symbol}] BROKER SL armed | stop_order={stop_id}")
+                            else:
+                                log.warning(f"[SIM:{symbol}] BROKER SL FAILED to place — "
+                                            f"sim trade relies on QC-side SL only")
                     else:
                         log.info(f"[SIM:{symbol}] MONITOR: filled — done")
                     return
@@ -1859,7 +2030,8 @@ def sim_monitor_cover_fill(symbol, client_order_id, timeout_minutes):
             log.warning(f"[SIM:{symbol}] COVER MONITOR: poll error — {e}")
 
     log.warning(f"[SIM:{symbol}] COVER MONITOR: retrying aggressively")
-    sim_cancel_all_open_orders(symbol)
+    sim_cancel_all_open_orders(symbol)  # this also cancels any armed SL stop
+    sim_set_state(symbol, sl_client_order_id=None)
 
     position = sim_get_position(symbol)
     if not position or float(position.get("shares", 0)) >= 0:
@@ -1898,8 +2070,9 @@ def sim_monitor_cover_fill(symbol, client_order_id, timeout_minutes):
 def sim_cancel_and_cleanup(symbol, reason):
     log.info(f"[SIM:{symbol}] CANCEL+CLEANUP: {reason}")
 
-    cancelled = sim_cancel_all_open_orders(symbol)
+    cancelled = sim_cancel_all_open_orders(symbol)  # this also cancels any armed SL stop
     log.info(f"[SIM:{symbol}] Cancelled {cancelled} open order(s)")
+    sim_set_state(symbol, sl_client_order_id=None)
 
     position = sim_get_position(symbol)
     if position:
@@ -2070,6 +2243,9 @@ def webhook():
     quantity    = int(body.get("quantity", 0))
     price       = float(body.get("price", 0))
     cycle       = int(body.get("cycle", 1))
+    # Optional SL pct from QC payload; falls back to DEFAULT_SL_PCT if absent.
+    sl_pct_raw  = body.get("sl_pct")
+    sl_pct      = float(sl_pct_raw) if sl_pct_raw is not None else DEFAULT_SL_PCT
 
     if not qc_symbol:
         return jsonify({"error": "missing symbol"}), 400
@@ -2108,7 +2284,7 @@ def webhook():
         if quantity <= 0 or price <= 0:
             return jsonify({"error": "quantity and price required for SHORT"}), 400
 
-        set_state(symbol, state="LOCATING", entry_price=price, quantity=quantity, cycle=cycle)
+        set_state(symbol, state="LOCATING", entry_price=price, quantity=quantity, cycle=cycle, sl_pct=sl_pct)
         threading.Thread(target=locate_and_short, args=(symbol, quantity, price), daemon=True).start()
         log.info(f"[{symbol}] Locate thread launched — returning 200 immediately")
         return jsonify({"status": "ok", "action": "SHORT", "symbol": symbol, "state": "LOCATING"}), 200
@@ -2152,6 +2328,15 @@ def webhook():
 
         log.info(f"[{symbol}] Covering {cover_qty} shares | "
                  f"qc_price=${price} | limit=${cover_limit} (QC pre-buffered)")
+
+        # Cancel any armed broker SL stop before placing the cover.
+        # The stop is on the same short position; if it remained active, the
+        # cover would attempt to flatten and the stop would still try to fire
+        # on adverse moves, potentially producing a second buy order.
+        stop_id = s.get("sl_client_order_id")
+        if stop_id:
+            cancel_real_stop(symbol, stop_id)
+            set_state(symbol, sl_client_order_id=None)
 
         try:
             result = place_order("Buy", symbol, cover_qty, cover_limit, "COVER_ORDER")
@@ -2220,6 +2405,9 @@ def sim_webhook():
     quantity  = int(body.get("quantity", 0))
     price     = float(body.get("price", 0))
     cycle     = int(body.get("cycle", 1))
+    # Optional SL pct from QC payload; falls back to DEFAULT_SL_PCT if absent.
+    sl_pct_raw = body.get("sl_pct")
+    sl_pct     = float(sl_pct_raw) if sl_pct_raw is not None else DEFAULT_SL_PCT
 
     if not qc_symbol:
         return jsonify({"error": "missing symbol"}), 400
@@ -2262,7 +2450,7 @@ def sim_webhook():
         if quantity <= 0 or price <= 0:
             return jsonify({"error": "quantity and price required for SHORT"}), 400
 
-        sim_set_state(symbol, state="LOCATING", entry_price=price, quantity=quantity, cycle=cycle)
+        sim_set_state(symbol, state="LOCATING", entry_price=price, quantity=quantity, cycle=cycle, sl_pct=sl_pct)
         threading.Thread(
             target=locate_and_short_sim, args=(symbol, quantity, price), daemon=True
         ).start()
@@ -2311,6 +2499,12 @@ def sim_webhook():
 
         log.info(f"[SIM:{symbol}] Covering {cover_qty}sh | limit=${cover_limit} | "
                  f"phantom_locate_cost=${phantom_cost:.2f}")
+
+        # Cancel armed sim broker SL stop before placing the cover
+        stop_id = s.get("sl_client_order_id")
+        if stop_id:
+            cancel_sim_stop(symbol, stop_id)
+            sim_set_state(symbol, sl_client_order_id=None)
 
         try:
             result = sim_place_order("Buy", symbol, cover_qty, cover_limit, "SIM_COVER_ORDER")
