@@ -1234,28 +1234,41 @@ def locate_and_short_sim(symbol, qc_quantity, entry_price):
     # sim quantity often fails with R35/R57. To still get a per-share cost
     # quote we probe at the largest quantity the real account can afford,
     # then extrapolate the cost up to the sim quantity.
+    #
+    # IMPORTANT: TZ enforces R35 on locate requests using ~1:1 buying power
+    # (notional <= available BP), NOT the leveraged margin used for orders.
+    # Empirically, locate requests at notional > BP fail with R35 even though
+    # the real account has 6x leverage available at order placement.
+    PROBE_BP_USAGE = 0.85  # use at most 85% of real BP for probe notional (safety buffer)
     probe_quantity = request_quantity
+    skip_probe = False
     try:
         real_account = get_account_details()
         if real_account is not None:
             real_cash   = float(real_account.get("buyingPower", real_account.get("availableCash", 0)))
             real_margin = float(real_account.get("marginAvailable", real_cash))
             real_usable = min(real_cash, real_margin)
-            # Match the same margin-per-share calc used above for sim
-            real_max_affordable = int(real_usable / margin_per_share)
-            # TZ enforces R57: position notional <= 50% of SOD BP.
-            # Approximate SOD BP from sodEquity * leverage; stay safely under 50%.
+            # Locate uses 1:1 margin (notional == cost), not leveraged margin
+            real_max_affordable = int(real_usable * PROBE_BP_USAGE / entry_price) if entry_price > 0 else 0
+            # R57: position notional <= 50% of SOD BP. Approximate from sodEquity * 6.
             sod_equity          = float(real_account.get("sodEquity", real_cash))
             sod_bp_estimate     = sod_equity * 6.0
             r57_cap_shares      = int((sod_bp_estimate * 0.45) / entry_price) if entry_price > 0 else real_max_affordable
             real_safe_qty       = min(real_max_affordable, r57_cap_shares)
             real_safe_qty       = max(MIN_LOCATE_QUANTITY, int(real_safe_qty / 100) * 100)
             probe_quantity      = min(request_quantity, real_safe_qty)
-            if probe_quantity < MIN_LOCATE_QUANTITY:
-                probe_quantity = MIN_LOCATE_QUANTITY
-            log.info(f"[SIM:{symbol}] PROBE SIZING: real_bp=${real_usable:,.2f} "
-                     f"real_safe_qty={real_safe_qty} sim_qty={request_quantity} "
-                     f"→ probe_quantity={probe_quantity}")
+            # If even 100 shares is over BP (high-priced stock + small account),
+            # we can't safely probe — skip the locate and proceed with sim order.
+            probe_notional = probe_quantity * entry_price
+            if probe_notional > real_usable * PROBE_BP_USAGE:
+                log.warning(f"[SIM:{symbol}] Cannot probe: even {probe_quantity}sh @ ${entry_price:.2f} "
+                            f"= ${probe_notional:.2f} > {PROBE_BP_USAGE*100:.0f}% of real BP ${real_usable:,.2f} — "
+                            f"skipping phantom locate")
+                skip_probe = True
+            else:
+                log.info(f"[SIM:{symbol}] PROBE SIZING: real_bp=${real_usable:,.2f} "
+                         f"real_safe_qty={real_safe_qty} sim_qty={request_quantity} "
+                         f"→ probe_quantity={probe_quantity} (notional ${probe_notional:.2f})")
         else:
             log.warning(f"[SIM:{symbol}] Could not get real account details — probing at sim_quantity={request_quantity}")
     except Exception as e:
@@ -1266,91 +1279,147 @@ def locate_and_short_sim(symbol, qc_quantity, entry_price):
     total_phantom_cost    = 0.0
     locate_check_ok       = False
 
-    quote_req_id = f"SIM{int(time.time() * 1000)}"
-    log.info(f"[SIM:{symbol}] Step 2: Phantom locate on REAL account | "
-             f"quoteReqID={quote_req_id} (probe_qty={probe_quantity}, will NOT be accepted)")
-    try:
-        r = request_locate_quote(symbol, probe_quantity, quote_req_id)
+    if skip_probe:
+        log_locate(symbol=symbol, entry_price=entry_price,
+                   outcome='OTHER', trade_outcome='UNKNOWN_PENDING',
+                   notes=f"SIM | sim wants {request_quantity}sh but real BP cannot support even {probe_quantity}sh probe — "
+                         f"phantom skipped, proceeding with sim order")
+    else:
+        # Retry loop: if probe fails with R35/R57 (BP/size issue, not "no shares"),
+        # halve the probe and try again. Max 3 attempts, floor at MIN_LOCATE_QUANTITY.
+        MAX_PROBE_ATTEMPTS = 3
+        probe_attempt = 0
+        locate = None
+        r = None
+        while probe_attempt < MAX_PROBE_ATTEMPTS:
+            probe_attempt += 1
+            quote_req_id = f"SIM{int(time.time() * 1000)}_{probe_attempt}"
+            log.info(f"[SIM:{symbol}] Step 2 attempt {probe_attempt}/{MAX_PROBE_ATTEMPTS}: "
+                     f"Phantom locate on REAL account | "
+                     f"quoteReqID={quote_req_id} (probe_qty={probe_quantity}, will NOT be accepted)")
+            try:
+                r = request_locate_quote(symbol, probe_quantity, quote_req_id)
+            except Exception as e:
+                log.warning(f"[SIM:{symbol}] Phantom locate request exception: {e}")
+                break
 
-        if r.status_code not in (200, 201, 202):
-            log.warning(f"[SIM:{symbol}] Phantom locate request failed: "
-                        f"{r.status_code} | {r.text[:200]} — proceeding without cost data")
-        else:
+            if r.status_code not in (200, 201, 202):
+                log.warning(f"[SIM:{symbol}] Phantom locate HTTP error: {r.status_code} | {r.text[:200]}")
+                break
+
             locate = poll_locate_status(symbol, quote_req_id)
-
             if locate is None:
-                log_locate(symbol=symbol, entry_price=entry_price,
-                           outcome='TIMEOUT', trade_outcome='UNKNOWN_PENDING',
-                           notes=f"SIM | probed {probe_quantity}sh (sim wants {request_quantity}sh) | "
-                                 f"phantom locate no status after {LOCATE_POLL_TIMEOUT}s — proceeding with sim order")
-                log.warning(f"[SIM:{symbol}] Phantom locate timed out — "
-                            f"proceeding without cost data")
+                # timeout — don't retry, treat as terminal
+                break
 
-            elif locate.get("locateStatus") == 56:
-                reason = locate.get("text", "no reason given")
-                log_locate(symbol=symbol, entry_price=entry_price,
-                           outcome='REJECTED_BY_TZ_NO_SHARES',
-                           trade_outcome='UNKNOWN_PENDING',
-                           notes=f"SIM | probed {probe_quantity}sh (sim wants {request_quantity}sh) | "
-                                 f"phantom status=56 text={reason} — proceeding with sim order")
-                log.warning(f"[SIM:{symbol}] Phantom locate REJECTED by TZ: {reason} — "
-                            f"logging only, proceeding with sim order (cost data: $0.00)")
-
-            elif locate.get("locateStatus") in (67, 52):
-                log_locate(symbol=symbol, entry_price=entry_price,
-                           outcome='OTHER', trade_outcome='UNKNOWN_PENDING',
-                           notes=f"SIM | probed {probe_quantity}sh (sim wants {request_quantity}sh) | "
-                                 f"phantom status={locate.get('locateStatus')} expired/cancelled — proceeding with sim order")
-                log.warning(f"[SIM:{symbol}] Phantom locate expired/cancelled — "
-                            f"proceeding without cost data")
-
-            elif locate.get("locateStatus") == 65:
-                # Offered — record cost per share, extrapolate to sim quantity, DO NOT accept
-                locate_cost_per_share = float(locate.get("locatePrice", 0))
-                offered_qty           = int(locate.get("locateShares", 0))
-                # Sim trade will execute at request_quantity; extrapolate cost from
-                # probe rate. Note this may underestimate true cost if inventory is
-                # thin (desk would quote higher for larger quantity).
-                total_phantom_cost    = locate_cost_per_share * request_quantity
-                cost_pct              = (locate_cost_per_share / entry_price * 100) if entry_price > 0 else 0
-                locate_check_ok       = True
-
-                log.info(
-                    f"\n[SIM:{symbol}] ╔══ PHANTOM LOCATE RESULT ═════════════════════╗\n"
-                    f"[SIM:{symbol}] ║  Probed qty  :  {probe_quantity} shares (real BP limited)\n"
-                    f"[SIM:{symbol}] ║  Offered qty :  {offered_qty} shares\n"
-                    f"[SIM:{symbol}] ║  Cost/share  :  ${locate_cost_per_share:.4f}  ({cost_pct:.3f}% of entry)\n"
-                    f"[SIM:{symbol}] ║  Sim qty     :  {request_quantity} shares\n"
-                    f"[SIM:{symbol}] ║  Extrap cost :  ${total_phantom_cost:.2f}  (cost/share × sim_qty)\n"
-                    f"[SIM:{symbol}] ║  Threshold   :  {MAX_LOCATE_COST_PCT*100:.1f}%  "
-                    f"→ {'✓ WITHIN' if cost_pct/100 <= MAX_LOCATE_COST_PCT else '✗ WOULD BLOCK'}\n"
-                    f"[SIM:{symbol}] ║  Action      :  NOT accepted (sim mode — expires naturally)\n"
-                    f"[SIM:{symbol}] ╚══════════════════════════════════════════════════╝"
-                )
-
-                if entry_price > 0 and locate_cost_per_share > 0:
-                    if locate_cost_per_share / entry_price > MAX_LOCATE_COST_PCT:
-                        log_locate(symbol=symbol, entry_price=entry_price,
-                                   shares_offered=request_quantity,
-                                   locate_cost_per_share=locate_cost_per_share,
-                                   route='PRIMARY',
-                                   outcome='REJECTED_BY_COST',
-                                   trade_outcome='BLOCKED_NO_TRADE',
-                                   notes=f"SIM | probed {probe_quantity}sh, extrap to sim {request_quantity}sh | "
-                                         f"{locate_cost_per_share / entry_price * 100:.2f}% > {MAX_LOCATE_COST_PCT * 100:.1f}%")
-                        sim_block(
-                            symbol,
-                            f"phantom locate too expensive: "
-                            f"{locate_cost_per_share / entry_price * 100:.3f}% > "
-                            f"{MAX_LOCATE_COST_PCT * 100:.1f}% threshold"
-                        )
-                        return
+            # Check if this is a BP/size rejection we should retry on
+            err = locate.get("locateError", 0)
+            if locate.get("locateStatus") == 56 and err in (35, 57):
+                # BP/size rejection → halve and retry
+                new_probe = max(MIN_LOCATE_QUANTITY, int(probe_quantity / 2 / 100) * 100)
+                if new_probe < MIN_LOCATE_QUANTITY or new_probe == probe_quantity:
+                    log.warning(f"[SIM:{symbol}] Probe at {probe_quantity}sh got R{err}, "
+                                f"cannot scale down further (already at minimum)")
+                    break
+                log.warning(f"[SIM:{symbol}] Probe at {probe_quantity}sh got R{err} — "
+                            f"scaling down to {new_probe}sh and retrying")
+                probe_quantity = new_probe
+                continue
             else:
-                log.warning(f"[SIM:{symbol}] Unexpected phantom locate status: "
-                            f"{locate.get('locateStatus')} — proceeding")
+                # Got an actionable status (65 offered, 56 with other error, 67 expired, 52 cancelled)
+                break
 
-    except Exception as e:
-        log.warning(f"[SIM:{symbol}] Phantom locate exception: {e} — proceeding without cost data")
+        # Now process the final locate result
+        try:
+            if r is None or r.status_code not in (200, 201, 202):
+                log.warning(f"[SIM:{symbol}] Phantom locate request failed after {probe_attempt} attempt(s) — "
+                            f"proceeding without cost data")
+            else:
+                # locate result already obtained by retry loop above
+
+                if locate is None:
+                    log_locate(symbol=symbol, entry_price=entry_price,
+                               outcome='TIMEOUT', trade_outcome='UNKNOWN_PENDING',
+                               notes=f"SIM | probed {probe_quantity}sh (sim wants {request_quantity}sh) | "
+                                     f"phantom locate no status after {LOCATE_POLL_TIMEOUT}s — proceeding with sim order")
+                    log.warning(f"[SIM:{symbol}] Phantom locate timed out — "
+                                f"proceeding without cost data")
+    
+                elif locate.get("locateStatus") == 56:
+                    reason = locate.get("text", "no reason given")
+                    err = locate.get("locateError", 0)
+                    # Did we exhaust retries on a BP-related error?
+                    if err in (35, 57):
+                        log_locate(symbol=symbol, entry_price=entry_price,
+                                   outcome='OTHER', trade_outcome='UNKNOWN_PENDING',
+                                   notes=f"SIM | sim wants {request_quantity}sh | probe exhausted at {probe_quantity}sh "
+                                         f"with R{err} after {probe_attempt} attempts — phantom skipped, proceeding with sim order")
+                        log.warning(f"[SIM:{symbol}] Probe retries exhausted — R{err} at {probe_quantity}sh — "
+                                    f"proceeding without cost data")
+                    else:
+                        log_locate(symbol=symbol, entry_price=entry_price,
+                                   outcome='REJECTED_BY_TZ_NO_SHARES',
+                                   trade_outcome='UNKNOWN_PENDING',
+                                   notes=f"SIM | probed {probe_quantity}sh (sim wants {request_quantity}sh) | "
+                                         f"phantom status=56 err={err} text={reason} — proceeding with sim order")
+                        log.warning(f"[SIM:{symbol}] Phantom locate REJECTED by TZ: {reason} — "
+                                    f"logging only, proceeding with sim order (cost data: $0.00)")
+    
+                elif locate.get("locateStatus") in (67, 52):
+                    log_locate(symbol=symbol, entry_price=entry_price,
+                               outcome='OTHER', trade_outcome='UNKNOWN_PENDING',
+                               notes=f"SIM | probed {probe_quantity}sh (sim wants {request_quantity}sh) | "
+                                     f"phantom status={locate.get('locateStatus')} expired/cancelled — proceeding with sim order")
+                    log.warning(f"[SIM:{symbol}] Phantom locate expired/cancelled — "
+                                f"proceeding without cost data")
+    
+                elif locate.get("locateStatus") == 65:
+                    # Offered — record cost per share, extrapolate to sim quantity, DO NOT accept
+                    locate_cost_per_share = float(locate.get("locatePrice", 0))
+                    offered_qty           = int(locate.get("locateShares", 0))
+                    # Sim trade will execute at request_quantity; extrapolate cost from
+                    # probe rate. Note this may underestimate true cost if inventory is
+                    # thin (desk would quote higher for larger quantity).
+                    total_phantom_cost    = locate_cost_per_share * request_quantity
+                    cost_pct              = (locate_cost_per_share / entry_price * 100) if entry_price > 0 else 0
+                    locate_check_ok       = True
+    
+                    log.info(
+                        f"\n[SIM:{symbol}] ╔══ PHANTOM LOCATE RESULT ═════════════════════╗\n"
+                        f"[SIM:{symbol}] ║  Probed qty  :  {probe_quantity} shares (real BP limited)\n"
+                        f"[SIM:{symbol}] ║  Offered qty :  {offered_qty} shares\n"
+                        f"[SIM:{symbol}] ║  Cost/share  :  ${locate_cost_per_share:.4f}  ({cost_pct:.3f}% of entry)\n"
+                        f"[SIM:{symbol}] ║  Sim qty     :  {request_quantity} shares\n"
+                        f"[SIM:{symbol}] ║  Extrap cost :  ${total_phantom_cost:.2f}  (cost/share × sim_qty)\n"
+                        f"[SIM:{symbol}] ║  Threshold   :  {MAX_LOCATE_COST_PCT*100:.1f}%  "
+                        f"→ {'✓ WITHIN' if cost_pct/100 <= MAX_LOCATE_COST_PCT else '✗ WOULD BLOCK'}\n"
+                        f"[SIM:{symbol}] ║  Action      :  NOT accepted (sim mode — expires naturally)\n"
+                        f"[SIM:{symbol}] ╚══════════════════════════════════════════════════╝"
+                    )
+    
+                    if entry_price > 0 and locate_cost_per_share > 0:
+                        if locate_cost_per_share / entry_price > MAX_LOCATE_COST_PCT:
+                            log_locate(symbol=symbol, entry_price=entry_price,
+                                       shares_offered=request_quantity,
+                                       locate_cost_per_share=locate_cost_per_share,
+                                       route='PRIMARY',
+                                       outcome='REJECTED_BY_COST',
+                                       trade_outcome='BLOCKED_NO_TRADE',
+                                       notes=f"SIM | probed {probe_quantity}sh, extrap to sim {request_quantity}sh | "
+                                             f"{locate_cost_per_share / entry_price * 100:.2f}% > {MAX_LOCATE_COST_PCT * 100:.1f}%")
+                            sim_block(
+                                symbol,
+                                f"phantom locate too expensive: "
+                                f"{locate_cost_per_share / entry_price * 100:.3f}% > "
+                                f"{MAX_LOCATE_COST_PCT * 100:.1f}% threshold"
+                            )
+                            return
+                else:
+                    log.warning(f"[SIM:{symbol}] Unexpected phantom locate status: "
+                                f"{locate.get('locateStatus')} — proceeding")
+    
+        except Exception as e:
+            log.warning(f"[SIM:{symbol}] Phantom locate exception: {e} — proceeding without cost data")
 
     if not locate_check_ok:
         log.info(f"[SIM:{symbol}] Locate check inconclusive — proceeding with sim order "
