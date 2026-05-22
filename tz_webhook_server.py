@@ -550,23 +550,57 @@ def poll_locate_status(symbol, quote_req_id):
                              f"error={item.get('locateError')} | "
                              f"text={item.get('text', '')}")
 
-            if primary_item and primary_item.get("locateStatus") in (65, 56, 67, 52):
+            # Decision logic — pick the cheapest available offer.
+            #
+            # For Reg SHO threshold symbols, TZ returns two parallel rows:
+            #   - primary quoteReqID → PreBorrow side (locateType=3, reusable, pricier)
+            #   - <quoteReqID>.SU    → SingleUse side (locateType=4, one-shot, cheaper)
+            # Per TZ docs: SU is typically 3-5x cheaper. Default is to prefer SU
+            # unless we need PB's reusable-through-day behavior. For one-direction
+            # short strategies (this code's use case), SU is always preferred.
+            #
+            # Non-threshold names get only one row (standard Locate, type 1 or 2),
+            # in which case SU sibling won't exist and we return the primary.
+            primary_offered = (primary_item is not None
+                               and primary_item.get("locateStatus") == 65)
+            su_offered      = (su_item is not None
+                               and su_item.get("locateStatus") == 65)
+
+            if primary_offered and su_offered:
+                # Both pools priced — pick cheaper (typically SU)
+                primary_price = float(primary_item.get("locatePrice", 0))
+                su_price      = float(su_item.get("locatePrice", 0))
+                if su_price > 0 and (primary_price == 0 or su_price <= primary_price):
+                    log.info(f"  [{symbol}] Both pools offered — choosing SU "
+                             f"@ ${su_price}/sh (vs PB @ ${primary_price}/sh, "
+                             f"saving ${primary_price - su_price:.4f}/sh, "
+                             f"{((primary_price - su_price) / primary_price * 100) if primary_price else 0:.0f}%)")
+                    return su_item
+                else:
+                    log.info(f"  [{symbol}] Both pools offered — choosing PB "
+                             f"@ ${primary_price}/sh (SU @ ${su_price}/sh not cheaper)")
+                    return primary_item
+
+            if primary_offered:
+                # Only primary is offered (non-threshold name, or SU still pending/never appeared)
                 return primary_item
 
-            primary_unavailable = (
-                primary_item is not None
-                and primary_item.get("locateError") == 11
-            )
-            if primary_unavailable and su_item:
-                su_status = su_item.get("locateStatus")
-                if su_status == 65:
-                    log.info(f"  [{symbol}] Primary unavailable — using SU locate "
-                             f"({su_id}) offered at ${su_item.get('locatePrice')}/share")
-                    return su_item
-                elif su_status in (56, 67, 52):
-                    log.info(f"  [{symbol}] SU locate also rejected/expired/canceled "
-                             f"(status={su_status}) — giving up")
-                    return su_item
+            if su_offered:
+                # SU offered but primary is not yet at 65 — could be Pending or Rejected
+                # Per docs: for threshold names where only SU has inventory, primary
+                # stays at status 54 (Pending) or transitions to 56 (Rejected with err 11).
+                # Either way, SU is our only choice and we should take it.
+                primary_status = primary_item.get("locateStatus") if primary_item else None
+                log.info(f"  [{symbol}] Only SU offered (primary status={primary_status}) — "
+                         f"using SU @ ${su_item.get('locatePrice')}/sh")
+                return su_item
+
+            # No offered row yet — check for terminal rejections on primary
+            if primary_item and primary_item.get("locateStatus") in (56, 67, 52):
+                # Primary terminally rejected and no SU offer — give up
+                if su_item and su_item.get("locateStatus") in (56, 67, 52):
+                    log.info(f"  [{symbol}] Both pools terminally rejected — giving up")
+                return primary_item
 
             log.info(f"  [{symbol}] {quote_req_id} not yet actionable — polling again")
         else:
@@ -1053,7 +1087,9 @@ def locate_and_short(symbol, qc_quantity, entry_price):
                        route=_route_for_log,
                        outcome='REJECTED_BY_COST',
                        trade_outcome='BLOCKED_NO_TRADE',
-                       notes=f"REAL | {locate_cost_pct*100:.2f}% > {MAX_LOCATE_COST_PCT*100:.1f}%")
+                       notes=f"REAL | {locate_cost_pct*100:.2f}% > {MAX_LOCATE_COST_PCT*100:.1f}%",
+                       locate_type=locate.get("locateType"),
+                       pre_borrow=locate.get("preBorrow"))
             block(symbol, f"locate too expensive: {locate_cost_pct*100:.3f}% > "
                           f"{MAX_LOCATE_COST_PCT*100:.1f}% threshold")
             return
@@ -1123,7 +1159,9 @@ def locate_and_short(symbol, qc_quantity, entry_price):
                    route='SU_SECONDARY' if accept_id != quote_req_id else 'PRIMARY',
                    outcome='ACCEPTED_TRADED',
                    trade_outcome='UNKNOWN_PENDING',
-                   notes='REAL')
+                   notes='REAL',
+                   locate_type=locate.get("locateType"),
+                   pre_borrow=locate.get("preBorrow"))
         log.info(f"[{symbol}] SHORT PLACED | qty={placed_qty} | "
                  f"limit=${limit_price} | clientOrderId={result.get('clientOrderId')}")
         threading.Thread(
@@ -1278,6 +1316,8 @@ def locate_and_short_sim(symbol, qc_quantity, entry_price):
     locate_cost_per_share = 0.0
     total_phantom_cost    = 0.0
     locate_check_ok       = False
+    locate_type_code      = None
+    pre_borrow_flag       = None
 
     if skip_probe:
         log_locate(symbol=symbol, entry_price=entry_price,
@@ -1377,6 +1417,8 @@ def locate_and_short_sim(symbol, qc_quantity, entry_price):
                     # Offered — record cost per share, extrapolate to sim quantity, DO NOT accept
                     locate_cost_per_share = float(locate.get("locatePrice", 0))
                     offered_qty           = int(locate.get("locateShares", 0))
+                    locate_type_code      = locate.get("locateType")
+                    pre_borrow_flag       = locate.get("preBorrow")
                     # Sim trade will execute at request_quantity; extrapolate cost from
                     # probe rate. Note this may underestimate true cost if inventory is
                     # thin (desk would quote higher for larger quantity).
@@ -1384,10 +1426,14 @@ def locate_and_short_sim(symbol, qc_quantity, entry_price):
                     cost_pct              = (locate_cost_per_share / entry_price * 100) if entry_price > 0 else 0
                     locate_check_ok       = True
     
+                    # Human-readable type label for log output
+                    type_label = {1: "Locate", 2: "Locate", 3: "PreBorrow", 4: "SingleUse"}.get(
+                        locate_type_code, f"unknown({locate_type_code})")
                     log.info(
                         f"\n[SIM:{symbol}] ╔══ PHANTOM LOCATE RESULT ═════════════════════╗\n"
                         f"[SIM:{symbol}] ║  Probed qty  :  {probe_quantity} shares (real BP limited)\n"
                         f"[SIM:{symbol}] ║  Offered qty :  {offered_qty} shares\n"
+                        f"[SIM:{symbol}] ║  Locate type :  {type_label} (code={locate_type_code}, preBorrow={pre_borrow_flag})\n"
                         f"[SIM:{symbol}] ║  Cost/share  :  ${locate_cost_per_share:.4f}  ({cost_pct:.3f}% of entry)\n"
                         f"[SIM:{symbol}] ║  Sim qty     :  {request_quantity} shares\n"
                         f"[SIM:{symbol}] ║  Extrap cost :  ${total_phantom_cost:.2f}  (cost/share × sim_qty)\n"
@@ -1406,7 +1452,9 @@ def locate_and_short_sim(symbol, qc_quantity, entry_price):
                                        outcome='REJECTED_BY_COST',
                                        trade_outcome='BLOCKED_NO_TRADE',
                                        notes=f"SIM | probed {probe_quantity}sh, extrap to sim {request_quantity}sh | "
-                                             f"{locate_cost_per_share / entry_price * 100:.2f}% > {MAX_LOCATE_COST_PCT * 100:.1f}%")
+                                             f"{locate_cost_per_share / entry_price * 100:.2f}% > {MAX_LOCATE_COST_PCT * 100:.1f}%",
+                                       locate_type=locate_type_code,
+                                       pre_borrow=pre_borrow_flag)
                             sim_block(
                                 symbol,
                                 f"phantom locate too expensive: "
@@ -1454,7 +1502,9 @@ def locate_and_short_sim(symbol, qc_quantity, entry_price):
                    trade_outcome='UNKNOWN_PENDING',
                    notes=f'SIM | probed {probe_quantity}sh @ ${locate_cost_per_share:.4f}/sh, '
                          f'extrap to sim {placed_qty}sh = ${total_phantom_cost:.2f} | '
-                         f'phantom locate cost recorded, not accepted')
+                         f'phantom locate cost recorded, not accepted',
+                   locate_type=locate_type_code,
+                   pre_borrow=pre_borrow_flag)
         log.info(f"[SIM:{symbol}] SIM SHORT PLACED | qty={placed_qty} | limit=${limit_price} | "
                  f"clientOrderId={result.get('clientOrderId')} | "
                  f"status={result.get('orderStatus')} | "
