@@ -41,9 +41,10 @@ from datetime import datetime, timezone, timedelta
 log = logging.getLogger("locate_logger")
 
 # ── Configuration ───────────────────────────────────────────────────────
-SHEET_ID  = (os.getenv("LOCATE_SHEET_ID")  or "").strip()
-SHEET_TAB = (os.getenv("LOCATE_SHEET_TAB") or "locates").strip()
-SA_JSON   = (os.getenv("GOOGLE_SHEETS_SA_JSON") or "").strip()
+SHEET_ID         = (os.getenv("LOCATE_SHEET_ID")  or "").strip()
+SHEET_TAB        = (os.getenv("LOCATE_SHEET_TAB") or "locates").strip()
+RENAMES_TAB      = (os.getenv("RENAMES_SHEET_TAB") or "renames").strip()
+SA_JSON          = (os.getenv("GOOGLE_SHEETS_SA_JSON") or "").strip()
 
 # Behaviour — tuned for your low-volume reality (~5 events/day)
 BATCH_SIZE         = 3
@@ -70,6 +71,15 @@ HEADERS = [
     "pre_borrow",
 ]
 
+RENAMES_HEADERS = [
+    "ts_et",
+    "qc_ticker",
+    "resolved_ticker",
+    "cik",
+    "source",
+    "notes",
+]
+
 # ── Internal state ──────────────────────────────────────────────────────
 _queue   = queue.Queue(maxsize=QUEUE_MAX_SIZE)
 _started = False
@@ -94,7 +104,12 @@ def _et_now():
     return et.strftime("%Y-%m-%d %H:%M:%S ET")
 
 
-def _build_client():
+def _build_client(tab_name=None, expected_headers=None):
+    """Build a worksheet handle for tab_name (defaults to SHEET_TAB).
+    Creates the tab with expected_headers if it doesn't exist.
+    """
+    tab_name        = tab_name or SHEET_TAB
+    expected_headers = expected_headers or HEADERS
     if not SHEET_ID or not SA_JSON:
         log.warning("locate_logger: SHEET_ID or SA_JSON not set — DISABLED")
         return None
@@ -104,69 +119,76 @@ def _build_client():
         gc = gspread.service_account_from_dict(creds)
         sh = gc.open_by_key(SHEET_ID)
         try:
-            ws = sh.worksheet(SHEET_TAB)
+            ws = sh.worksheet(tab_name)
         except gspread.WorksheetNotFound:
-            ws = sh.add_worksheet(title=SHEET_TAB, rows=1000, cols=len(HEADERS))
-            ws.append_row(HEADERS, value_input_option="RAW")
-            log.info(f"locate_logger: created tab '{SHEET_TAB}'")
+            ws = sh.add_worksheet(title=tab_name, rows=1000, cols=len(expected_headers))
+            ws.append_row(expected_headers, value_input_option="RAW")
+            log.info(f"locate_logger: created tab '{tab_name}'")
         first = ws.row_values(1)
         if not first:
-            ws.append_row(HEADERS, value_input_option="RAW")
-        elif first != HEADERS:
-            log.warning(f"locate_logger: header mismatch — "
-                        f"sheet: {first[:5]}... | expected: {HEADERS[:5]}...")
+            ws.append_row(expected_headers, value_input_option="RAW")
+        elif first != expected_headers:
+            log.warning(f"locate_logger: header mismatch on '{tab_name}' — "
+                        f"sheet: {first[:5]}... | expected: {expected_headers[:5]}...")
         return ws
     except Exception as e:
-        log.error(f"locate_logger: client build failed: {e}")
+        log.error(f"locate_logger: client build failed for '{tab_name}': {e}")
         return None
 
 
 def _drain_loop():
-    ws = None
-    while True:
-        if ws is None:
-            ws = _build_client()
-            if ws is None:
-                try:
-                    while True:
-                        _queue.get_nowait()
-                        _queue.task_done()
-                except queue.Empty:
-                    pass
-                time.sleep(60)
-                continue
+    # Per-tab worksheet handles, lazily initialized
+    ws_cache = {}
+    tab_headers = {SHEET_TAB: HEADERS, RENAMES_TAB: RENAMES_HEADERS}
 
-        batch = []
-        deadline = time.time() + BATCH_MAX_WAIT_SEC
+    while True:
+        # Drain one item to start a batch
         try:
-            batch.append(_queue.get(timeout=BATCH_MAX_WAIT_SEC))
+            first_item = _queue.get(timeout=BATCH_MAX_WAIT_SEC)
             _queue.task_done()
         except queue.Empty:
             continue
 
-        while len(batch) < BATCH_SIZE and time.time() < deadline:
+        # Group rows by destination tab — each item is (tab, row)
+        groups = {}
+        first_tab, first_row = first_item
+        groups.setdefault(first_tab, []).append(first_row)
+
+        deadline = time.time() + BATCH_MAX_WAIT_SEC
+        while sum(len(v) for v in groups.values()) < BATCH_SIZE and time.time() < deadline:
             try:
-                batch.append(_queue.get(timeout=max(0.1, deadline - time.time())))
+                tab, row = _queue.get(timeout=max(0.1, deadline - time.time()))
                 _queue.task_done()
+                groups.setdefault(tab, []).append(row)
             except queue.Empty:
                 break
 
-        for attempt in range(1, WRITE_RETRIES + 1):
-            try:
-                ws.append_rows(batch, value_input_option="RAW")
-                log.info(f"locate_logger: wrote {len(batch)} row(s)")
-                break
-            except Exception as e:
-                if attempt < WRITE_RETRIES:
-                    log.warning(f"locate_logger: attempt {attempt} failed: {e} — "
-                                f"retrying in {RETRY_BACKOFF_SEC}s")
-                    time.sleep(RETRY_BACKOFF_SEC)
-                    ws = _build_client()
-                    if ws is None:
-                        break
-                else:
-                    log.error(f"locate_logger: write failed after {WRITE_RETRIES} attempts: "
-                              f"{e} — DROPPING {len(batch)} row(s)")
+        # Write each group to its destination tab
+        for tab, batch in groups.items():
+            if tab not in ws_cache or ws_cache[tab] is None:
+                ws_cache[tab] = _build_client(tab, tab_headers.get(tab, HEADERS))
+                if ws_cache[tab] is None:
+                    log.error(f"locate_logger: cannot get client for '{tab}' — DROPPING {len(batch)} row(s)")
+                    continue
+
+            ws = ws_cache[tab]
+            for attempt in range(1, WRITE_RETRIES + 1):
+                try:
+                    ws.append_rows(batch, value_input_option="RAW")
+                    log.info(f"locate_logger: wrote {len(batch)} row(s) to '{tab}'")
+                    break
+                except Exception as e:
+                    if attempt < WRITE_RETRIES:
+                        log.warning(f"locate_logger: '{tab}' attempt {attempt} failed: {e} — "
+                                    f"retrying in {RETRY_BACKOFF_SEC}s")
+                        time.sleep(RETRY_BACKOFF_SEC)
+                        ws_cache[tab] = _build_client(tab, tab_headers.get(tab, HEADERS))
+                        ws = ws_cache[tab]
+                        if ws is None:
+                            break
+                    else:
+                        log.error(f"locate_logger: '{tab}' write failed after {WRITE_RETRIES} attempts: "
+                                  f"{e} — DROPPING {len(batch)} row(s)")
 
 
 def _start_once():
@@ -228,7 +250,7 @@ def log_locate(
         ]
 
         try:
-            _queue.put_nowait(row)
+            _queue.put_nowait((SHEET_TAB, row))
         except queue.Full:
             try:
                 _queue.get_nowait()
@@ -236,11 +258,50 @@ def log_locate(
             except queue.Empty:
                 pass
             try:
-                _queue.put_nowait(row)
+                _queue.put_nowait((SHEET_TAB, row))
             except queue.Full:
                 log.warning("locate_logger: queue full — row dropped")
     except Exception as e:
         log.error(f"locate_logger: log_locate failed: {e}")
+
+
+# ── Ticker-rename logger ────────────────────────────────────────────────
+# Dedupe set: don't re-log the same (qc_ticker → resolved_ticker) twice in
+# a single process lifetime. Renames detected by resolve_symbol() in the
+# server are already cached in-process; this just prevents redundant sheet
+# rows on the off chance the dedupe is bypassed.
+_renames_logged_lock = threading.Lock()
+_renames_logged      = set()
+
+
+def log_rename(qc_ticker, resolved_ticker, cik=None, source="polygon", notes=""):
+    """Enqueue a ticker-rename row to the renames tab. Returns immediately.
+    Dedupes by (qc_ticker, resolved_ticker) per process so a single rename is
+    only written once even if resolve_symbol() is called repeatedly.
+    """
+    _start_once()
+    try:
+        key = (str(qc_ticker or ""), str(resolved_ticker or ""))
+        with _renames_logged_lock:
+            if key in _renames_logged:
+                return
+            _renames_logged.add(key)
+
+        row = [
+            _et_now(),
+            str(qc_ticker or ""),
+            str(resolved_ticker or ""),
+            str(cik or ""),
+            str(source or "")[:40],
+            str(notes or "")[:200],
+        ]
+
+        try:
+            _queue.put_nowait((RENAMES_TAB, row))
+        except queue.Full:
+            log.warning(f"locate_logger: rename queue full — dropping {qc_ticker}→{resolved_ticker}")
+    except Exception as e:
+        log.error(f"locate_logger: log_rename failed: {e}")
 
 
 # ── Call-site cheat sheet ───────────────────────────────────────────────
