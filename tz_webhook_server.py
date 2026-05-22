@@ -51,7 +51,7 @@ from locate_logger import log_locate, log_rename
 # ══════════════════════════════════════════════════════════════════════════════
 BASE_URL             = "https://webapi.tradezero.com"
 ACCOUNT_ID           = "DHA41998"
-MAX_LOCATE_COST_PCT  = 0.1    # 5%  — reject if locatePrice / entryPrice > this
+MAX_LOCATE_COST_PCT  = 0.10    # 10%  — reject if locatePrice / entryPrice > this
 MIN_LOCATE_QUANTITY  = 100     # TZ minimum locate size
 MIN_SHORT_QUANTITY   = 1       # TZ minimum short order size (any size accepted)
 LOCATE_POLL_INTERVAL = 2       # seconds between locate status polls
@@ -61,6 +61,9 @@ LOCATE_ACCEPT_SLEEP  = 3       # seconds to wait after locate accept before plac
                                # the locate — placing the order too fast causes R43 rejection
 # QC strategies send already-buffered limit prices in webhooks — server uses them directly
 SHORT_FILL_TIMEOUT   = 5       # minutes to wait for short entry to fill before cancelling
+PARTIAL_FILL_PATIENCE = 30     # seconds to wait for the rest after first partial fill
+                               # then cancel leftover and arm stop on what filled
+STOP_FILL_POLL_INTERVAL = 5    # seconds between fill-status polls during entry monitoring
 COVER_FILL_TIMEOUT   = 3       # minutes to wait for cover to fill before retrying aggressively
 COVER_RETRY_BUFFER   = 0.005   # 0.5% above live price for aggressive cover retry
 
@@ -73,7 +76,7 @@ COVER_RETRY_BUFFER   = 0.005   # 0.5% above live price for aggressive cover retr
 # QC strategies will eventually send an `sl_pct` field in the SHORT webhook;
 # until then, all strategies use a 10% stop. The bridge falls back to
 # DEFAULT_SL_PCT when no sl_pct is provided in the payload.
-DEFAULT_SL_PCT  = 0.20    # 10% adverse move on short positions (price up)
+DEFAULT_SL_PCT  = 0.20    # 20% adverse move on short positions (price up) — matches QC strategy SL pct
 SL_LIMIT_SLACK  = 0.02    # 2% slack on StopLimit ETH orders so they actually fill
 # Stop type by session: RTH uses Stop (market on trigger), ETH uses StopLimit
 # because TZ doesn't accept market orders outside RTH.
@@ -575,9 +578,9 @@ def place_stop_order(account_id, headers_fn, symbol, quantity, trigger_price,
             return None
         data = r.json()
         log.info(f"  [{symbol}] Stop order placed: clientOrderId={data.get('clientOrderId')} "
-                 f"status={data.get('orderStatus')} type={payload['orderType']} "
-                 f"trigger=${payload['priceStop']}"
-                 + (f" limit=${payload.get('limitPrice')}" if 'limitPrice' in payload else ""))
+                 f"status={data.get('orderStatus')} type={payload.get('orderType', '?')} "
+                 f"trigger=${payload.get('stopPrice', '?')}"
+                 + (f" limit=${payload['limitPrice']}" if 'limitPrice' in payload else ""))
         return data
     except Exception as e:
         log.error(f"  [{symbol}] Stop order EXCEPTION: {e}")
@@ -1137,6 +1140,22 @@ def locate_and_short(symbol, qc_quantity, entry_price):
     log.info(f"[{symbol}] session={session_label} | "
              f"margin_per_share=${margin_per_share:.4f}{buffer_note} | "
              f"max_affordable={max_affordable}")
+
+    # ─── R57 CAP ──────────────────────────────────────────────────────────
+    # TZ rule R57: a single position cannot exceed 50% of Start-Of-Day BP.
+    # The R35 margin math above respects current BP but not the SOD-BP cap,
+    # so positions that fit margin-wise can still get R57'd at locate or
+    # order time. We pre-emptively cap at 45% (5% safety buffer below the
+    # actual 50% ceiling) so we get a smaller successful trade rather than
+    # an outright rejection on bigger positions.
+    sod_equity        = float(account.get("sodEquity", available_cash))
+    sod_bp_estimate   = sod_equity * 6.0   # margin account leverage
+    if entry_price > 0:
+        r57_cap_shares = int((sod_bp_estimate * 0.45) / entry_price)
+        if r57_cap_shares < max_affordable:
+            log.info(f"[{symbol}] R57 cap binding: SOD_BP=${sod_bp_estimate:,.0f} × 45% / ${entry_price} "
+                     f"= {r57_cap_shares}sh < margin_max {max_affordable}sh — using R57 cap")
+            max_affordable = r57_cap_shares
 
     if max_affordable < MIN_LOCATE_QUANTITY:
         block(symbol, f"cannot afford minimum {MIN_LOCATE_QUANTITY} shares — "
@@ -1724,11 +1743,22 @@ def locate_and_short_sim(symbol, qc_quantity, entry_price):
 # REAL ACCOUNT — CANCEL + CLEANUP HELPER
 # ══════════════════════════════════════════════════════════════════════════════
 def monitor_short_fill(symbol, client_order_id, timeout_minutes):
-    import time as _time
-    deadline = _time.time() + timeout_minutes * 60
-    poll_interval = 15
+    """Monitor a short entry order. Handles three outcomes:
+      1. Full fill (leaves=0) → arm stop on full quantity
+      2. Partial fill, no further progress within PARTIAL_FILL_PATIENCE →
+         cancel leftover, re-read, arm stop on what actually filled
+      3. No fill within timeout_minutes → cancel and block
 
-    log.info(f"[{symbol}] SHORT MONITOR started | order={client_order_id} | timeout={timeout_minutes}min")
+    Replaces the older "any partial fill = done" behavior that caused R41
+    rejections when the stop was placed while shares were still working.
+    """
+    import time as _time
+    deadline      = _time.time() + timeout_minutes * 60
+    poll_interval = STOP_FILL_POLL_INTERVAL
+    first_fill_time = None
+
+    log.info(f"[{symbol}] SHORT MONITOR started | order={client_order_id} | "
+             f"timeout={timeout_minutes}min | partial_patience={PARTIAL_FILL_PATIENCE}s")
 
     while _time.time() < deadline:
         _time.sleep(poll_interval)
@@ -1756,73 +1786,145 @@ def monitor_short_fill(symbol, client_order_id, timeout_minutes):
             if not isinstance(orders, list):
                 orders = orders.get("orders", [])
             order = next((o for o in orders if o.get("clientOrderId") == client_order_id), None)
-            if order:
-                status = order.get("orderStatus", "")
-                executed = int(order.get("executed", 0))
-                log.info(f"[{symbol}] SHORT MONITOR: status={status} executed={executed}")
-                if status in ("Filled",) or executed > 0:
-                    entry_fill = float(order.get("priceAvg") or order.get("lastPrice") or 0)
-                    if entry_fill > 0:
-                        set_state(symbol, entry_fill_price=entry_fill)
-                        log.info(f"[{symbol}] SHORT MONITOR: order filled @ ${entry_fill:.4f} — monitor done")
-                        # Fire broker SL stop to protect against QC dead zones
-                        s = get_state(symbol)
-                        sl_pct  = float(s.get("sl_pct") or DEFAULT_SL_PCT)
-                        qty     = int(s.get("quantity") or executed or 0)
-                        if qty > 0 and sl_pct > 0:
-                            stop_id = place_real_stop(symbol, qty, entry_fill, sl_pct)
-                            if stop_id:
-                                set_state(symbol, sl_client_order_id=stop_id)
-                                log.info(f"[{symbol}] BROKER SL armed | stop_order={stop_id}")
-                                # TZ sometimes accepts a stop synchronously but rejects it
-                                # ~5s later (e.g. malformed fields). Verify in background.
-                                threading.Thread(
-                                    target=verify_stop_alive,
-                                    args=(ACCOUNT_ID, tz_headers, symbol, stop_id),
-                                    kwargs={"is_sim": False, "delay_seconds": 10},
-                                    daemon=True,
-                                ).start()
-                            else:
-                                log.warning(f"[{symbol}] BROKER SL FAILED to place — "
-                                            f"trade relies on QC-side SL only")
-                    else:
-                        log.info(f"[{symbol}] SHORT MONITOR: order filled — monitor done")
-                    return
-                if status in ("Canceled", "Rejected"):
-                    reject_text = order.get("text") or order.get("rejectReason") or "no reason given"
-                    log.warning(f"[{symbol}] SHORT MONITOR: order {status} | reason: {reject_text}")
+            if not order:
+                continue
 
-                    if "R35" in reject_text or "Buying Power" in reject_text:
-                        s = get_state(symbol)
-                        prev_qty  = int(s.get("quantity", 0))
-                        lp        = float(s.get("entry_price", 0))
-                        if prev_qty > 0 and lp > 0:
-                            next_qty = max(1, int(prev_qty * 0.8))
-                            log.warning(f"[{symbol}] R35 — stepping down from {prev_qty}sh to {next_qty}sh")
-                            set_state(symbol, state="LOCATING")
-                            try:
-                                result = place_order_with_stepdown(symbol, next_qty, lp, "SHORT_ORDER_RETRY")
-                                placed_qty = result.get("orderQuantity", next_qty)
-                                set_state(symbol, state="ACTIVE",
-                                          entry_price=lp, quantity=placed_qty,
-                                          client_order_id=result.get("clientOrderId"))
-                                log.info(f"[{symbol}] SHORT RETRY PLACED | qty={placed_qty}")
-                                import threading as _threading
-                                _threading.Thread(
-                                    target=monitor_short_fill,
-                                    args=(symbol, result.get("clientOrderId"), timeout_minutes),
-                                    daemon=True
-                                ).start()
-                            except Exception as e:
-                                block(symbol, f"short order R35 retry failed: {e}")
-                            return
-                    block(symbol, f"short order {status}: {reject_text}")
+            status   = order.get("orderStatus", "")
+            executed = int(order.get("executed", 0))
+            leaves   = int(order.get("leavesQuantity", 0))
+            log.info(f"[{symbol}] SHORT MONITOR: status={status} executed={executed} leaves={leaves}")
+
+            # ─── Path 1: Full fill — clean entry, arm stop on full quantity ──
+            if status == "Filled" and leaves == 0 and executed > 0:
+                entry_fill = float(order.get("priceAvg") or order.get("lastPrice") or 0)
+                _arm_real_stop_after_fill(symbol, executed, entry_fill, source="full fill")
+                return
+
+            # ─── Path 2: Partial fill — wait, then cancel leftover ──
+            if executed > 0 and leaves > 0:
+                if first_fill_time is None:
+                    first_fill_time = _time.time()
+                    log.info(f"[{symbol}] SHORT MONITOR: PARTIAL fill detected at {executed}/{executed+leaves}sh — "
+                             f"waiting up to {PARTIAL_FILL_PATIENCE}s for rest")
+                elif _time.time() - first_fill_time > PARTIAL_FILL_PATIENCE:
+                    log.warning(f"[{symbol}] SHORT MONITOR: PARTIAL fill patience expired ({PARTIAL_FILL_PATIENCE}s) — "
+                                f"cancelling leftover {leaves}sh, keeping {executed}sh")
+                    # Cancel the working order; this kills the unfilled leaves
+                    try:
+                        rc = tz_delete(
+                            f"/v1/api/accounts/{ACCOUNT_ID}/orders/{client_order_id}",
+                            "SHORT_PARTIAL_CANCEL"
+                        )
+                        if rc.status_code not in (200, 204):
+                            log.warning(f"[{symbol}] SHORT MONITOR: cancel returned {rc.status_code} — "
+                                        f"order may have just filled; will re-read")
+                    except Exception as e:
+                        log.error(f"[{symbol}] SHORT MONITOR: cancel exception: {e}")
+
+                    # Give TZ ~3s to process the cancel and update the executed count
+                    _time.sleep(3)
+
+                    # Re-read the order to get the FINAL executed count (some shares
+                    # may have filled between our cancel call and TZ processing it)
+                    final_executed = executed
+                    final_entry_fill = float(order.get("priceAvg") or order.get("lastPrice") or 0)
+                    try:
+                        r2 = tz_get(f"/v1/api/accounts/{ACCOUNT_ID}/orders", "SHORT_FINAL_READ")
+                        orders2 = r2.json() if r2.ok else []
+                        if not isinstance(orders2, list):
+                            orders2 = orders2.get("orders", [])
+                        order2 = next((o for o in orders2 if o.get("clientOrderId") == client_order_id), None)
+                        if order2:
+                            final_executed   = int(order2.get("executed", executed))
+                            final_entry_fill = float(order2.get("priceAvg") or order2.get("lastPrice") or final_entry_fill)
+                            log.info(f"[{symbol}] SHORT MONITOR: final executed={final_executed} "
+                                     f"@ ${final_entry_fill:.4f} (was {executed} pre-cancel)")
+                    except Exception as e:
+                        log.warning(f"[{symbol}] SHORT MONITOR: final re-read failed: {e}")
+
+                    if final_executed > 0 and final_entry_fill > 0:
+                        _arm_real_stop_after_fill(symbol, final_executed, final_entry_fill,
+                                                  source="partial fill")
+                    else:
+                        log.warning(f"[{symbol}] SHORT MONITOR: no fills after cancel — blocking symbol")
+                        block(symbol, "partial fill cancel resulted in 0 shares")
                     return
+                # else: still within patience window, keep polling
+
+            # ─── Path 3: Order Cancelled/Rejected before any fill ──
+            if status in ("Canceled", "Rejected") and executed == 0:
+                reject_text = order.get("text") or order.get("rejectReason") or "no reason given"
+                log.warning(f"[{symbol}] SHORT MONITOR: order {status} | reason: {reject_text}")
+
+                if "R35" in reject_text or "Buying Power" in reject_text:
+                    s = get_state(symbol)
+                    prev_qty  = int(s.get("quantity", 0))
+                    lp        = float(s.get("entry_price", 0))
+                    if prev_qty > 0 and lp > 0:
+                        next_qty = max(1, int(prev_qty * 0.8))
+                        log.warning(f"[{symbol}] R35 — stepping down from {prev_qty}sh to {next_qty}sh")
+                        set_state(symbol, state="LOCATING")
+                        try:
+                            result = place_order_with_stepdown(symbol, next_qty, lp, "SHORT_ORDER_RETRY")
+                            placed_qty = result.get("orderQuantity", next_qty)
+                            set_state(symbol, state="ACTIVE",
+                                      entry_price=lp, quantity=placed_qty,
+                                      client_order_id=result.get("clientOrderId"))
+                            log.info(f"[{symbol}] SHORT RETRY PLACED | qty={placed_qty}")
+                            threading.Thread(
+                                target=monitor_short_fill,
+                                args=(symbol, result.get("clientOrderId"), timeout_minutes),
+                                daemon=True
+                            ).start()
+                        except Exception as e:
+                            block(symbol, f"short order R35 retry failed: {e}")
+                        return
+                block(symbol, f"short order {status}: {reject_text}")
+                return
+
+            # ─── Path 4: Cancelled/Rejected WITH some executed (rare) — treat as partial ──
+            if status in ("Canceled", "Rejected") and executed > 0:
+                entry_fill = float(order.get("priceAvg") or order.get("lastPrice") or 0)
+                log.warning(f"[{symbol}] SHORT MONITOR: order {status} but {executed}sh filled @ ${entry_fill:.4f} — "
+                            f"arming stop on filled portion")
+                _arm_real_stop_after_fill(symbol, executed, entry_fill, source=f"{status} with partial")
+                return
+
         except Exception as e:
             log.warning(f"[{symbol}] SHORT MONITOR: poll error — {e}")
 
     log.warning(f"[{symbol}] SHORT MONITOR: timeout after {timeout_minutes}min — cancelling and blocking")
     cancel_and_cleanup(symbol, f"short entry did not fill within {timeout_minutes} minutes")
+
+
+def _arm_real_stop_after_fill(symbol, filled_qty, entry_fill, source="full fill"):
+    """Helper: store fill state, place broker SL stop, kick verify thread."""
+    if entry_fill <= 0 or filled_qty <= 0:
+        log.warning(f"[{symbol}] _arm_real_stop_after_fill: invalid inputs "
+                    f"(qty={filled_qty} fill=${entry_fill}) — skipping SL")
+        return
+    set_state(symbol, entry_fill_price=entry_fill, quantity=filled_qty)
+    log.info(f"[{symbol}] SHORT MONITOR: {source} — {filled_qty}sh @ ${entry_fill:.4f}")
+
+    s = get_state(symbol)
+    sl_pct = float(s.get("sl_pct") or DEFAULT_SL_PCT)
+    if sl_pct <= 0:
+        log.info(f"[{symbol}] sl_pct={sl_pct} — skipping broker SL")
+        return
+
+    stop_id = place_real_stop(symbol, filled_qty, entry_fill, sl_pct)
+    if stop_id:
+        set_state(symbol, sl_client_order_id=stop_id)
+        log.info(f"[{symbol}] BROKER SL armed | stop_order={stop_id}")
+        # TZ may async-reject the stop; verify in 10s and log the actual reason
+        threading.Thread(
+            target=verify_stop_alive,
+            args=(ACCOUNT_ID, tz_headers, symbol, stop_id),
+            kwargs={"is_sim": False, "delay_seconds": 10},
+            daemon=True,
+        ).start()
+    else:
+        log.warning(f"[{symbol}] BROKER SL FAILED to place — trade relies on QC-side SL only")
 
 
 def monitor_cover_fill(symbol, client_order_id, timeout_minutes):
@@ -1966,12 +2068,14 @@ def cancel_and_cleanup(symbol, reason):
 # SIM ACCOUNT — MONITOR + CLEANUP FUNCTIONS
 # ══════════════════════════════════════════════════════════════════════════════
 def sim_monitor_short_fill(symbol, client_order_id, timeout_minutes):
-    """Watch sim short order until filled, cancelled/rejected, or timeout."""
-    deadline      = time.time() + timeout_minutes * 60
-    poll_interval = 15
+    """Sim equivalent of monitor_short_fill — handles full/partial/timeout
+    the same way, but acts on the sim account."""
+    deadline        = time.time() + timeout_minutes * 60
+    poll_interval   = STOP_FILL_POLL_INTERVAL
+    first_fill_time = None
 
     log.info(f"[SIM:{symbol}] SHORT MONITOR started | order={client_order_id} | "
-             f"timeout={timeout_minutes}min")
+             f"timeout={timeout_minutes}min | partial_patience={PARTIAL_FILL_PATIENCE}s")
 
     while time.time() < deadline:
         time.sleep(poll_interval)
@@ -1996,46 +2100,113 @@ def sim_monitor_short_fill(symbol, client_order_id, timeout_minutes):
             order = next(
                 (o for o in orders if o.get("clientOrderId") == client_order_id), None
             )
-            if order:
-                status   = order.get("orderStatus", "")
-                executed = int(order.get("executed", 0))
-                log.info(f"[SIM:{symbol}] MONITOR: status={status} executed={executed}")
-                if status == "Filled" or executed > 0:
-                    entry_fill = float(order.get("priceAvg") or order.get("lastPrice") or 0)
-                    if entry_fill > 0:
-                        sim_set_state(symbol, entry_fill_price=entry_fill)
-                        log.info(f"[SIM:{symbol}] MONITOR: filled @ ${entry_fill:.4f} — done")
-                        # Fire broker SL stop on sim account too (so we can test the flow)
-                        s = sim_get_state(symbol)
-                        sl_pct  = float(s.get("sl_pct") or DEFAULT_SL_PCT)
-                        qty     = int(s.get("quantity") or executed or 0)
-                        if qty > 0 and sl_pct > 0:
-                            stop_id = place_sim_stop(symbol, qty, entry_fill, sl_pct)
-                            if stop_id:
-                                sim_set_state(symbol, sl_client_order_id=stop_id)
-                                log.info(f"[SIM:{symbol}] BROKER SL armed | stop_order={stop_id}")
-                                # Verify the stop survived TZ's async validation
-                                threading.Thread(
-                                    target=verify_stop_alive,
-                                    args=(SIM_ACCOUNT_ID, sim_headers, symbol, stop_id),
-                                    kwargs={"is_sim": True, "delay_seconds": 10},
-                                    daemon=True,
-                                ).start()
-                            else:
-                                log.warning(f"[SIM:{symbol}] BROKER SL FAILED to place — "
-                                            f"sim trade relies on QC-side SL only")
+            if not order:
+                continue
+
+            status   = order.get("orderStatus", "")
+            executed = int(order.get("executed", 0))
+            leaves   = int(order.get("leavesQuantity", 0))
+            log.info(f"[SIM:{symbol}] MONITOR: status={status} executed={executed} leaves={leaves}")
+
+            # Path 1: Full fill
+            if status == "Filled" and leaves == 0 and executed > 0:
+                entry_fill = float(order.get("priceAvg") or order.get("lastPrice") or 0)
+                _arm_sim_stop_after_fill(symbol, executed, entry_fill, source="full fill")
+                return
+
+            # Path 2: Partial fill with patience timer
+            if executed > 0 and leaves > 0:
+                if first_fill_time is None:
+                    first_fill_time = time.time()
+                    log.info(f"[SIM:{symbol}] MONITOR: PARTIAL fill at {executed}/{executed+leaves}sh — "
+                             f"waiting up to {PARTIAL_FILL_PATIENCE}s for rest")
+                elif time.time() - first_fill_time > PARTIAL_FILL_PATIENCE:
+                    log.warning(f"[SIM:{symbol}] MONITOR: PARTIAL fill patience expired — "
+                                f"cancelling leftover {leaves}sh, keeping {executed}sh")
+                    try:
+                        rc = sim_tz_delete(
+                            f"/v1/api/accounts/{SIM_ACCOUNT_ID}/orders/{client_order_id}",
+                            "SIM_SHORT_PARTIAL_CANCEL"
+                        )
+                        if rc.status_code not in (200, 204):
+                            log.warning(f"[SIM:{symbol}] MONITOR: cancel returned {rc.status_code}")
+                    except Exception as e:
+                        log.error(f"[SIM:{symbol}] MONITOR: cancel exception: {e}")
+
+                    time.sleep(3)
+
+                    final_executed = executed
+                    final_entry_fill = float(order.get("priceAvg") or order.get("lastPrice") or 0)
+                    try:
+                        r2 = sim_tz_get(f"/v1/api/accounts/{SIM_ACCOUNT_ID}/orders", "SIM_SHORT_FINAL_READ")
+                        orders2 = r2.json() if r2.ok else []
+                        if not isinstance(orders2, list):
+                            orders2 = orders2.get("orders", [])
+                        order2 = next((o for o in orders2 if o.get("clientOrderId") == client_order_id), None)
+                        if order2:
+                            final_executed   = int(order2.get("executed", executed))
+                            final_entry_fill = float(order2.get("priceAvg") or order2.get("lastPrice") or final_entry_fill)
+                            log.info(f"[SIM:{symbol}] MONITOR: final executed={final_executed} "
+                                     f"@ ${final_entry_fill:.4f} (was {executed} pre-cancel)")
+                    except Exception as e:
+                        log.warning(f"[SIM:{symbol}] MONITOR: final re-read failed: {e}")
+
+                    if final_executed > 0 and final_entry_fill > 0:
+                        _arm_sim_stop_after_fill(symbol, final_executed, final_entry_fill,
+                                                 source="partial fill")
                     else:
-                        log.info(f"[SIM:{symbol}] MONITOR: filled — done")
+                        log.warning(f"[SIM:{symbol}] MONITOR: no fills after cancel — blocking symbol")
+                        sim_block(symbol, "partial fill cancel resulted in 0 shares")
                     return
-                if status in ("Canceled", "Rejected"):
-                    reject_text = order.get("text") or order.get("rejectReason") or "no reason"
-                    sim_block(symbol, f"SIM short {status}: {reject_text}")
-                    return
+
+            # Path 3: Cancelled/Rejected, nothing filled
+            if status in ("Canceled", "Rejected") and executed == 0:
+                reject_text = order.get("text") or order.get("rejectReason") or "no reason"
+                sim_block(symbol, f"SIM short {status}: {reject_text}")
+                return
+
+            # Path 4: Cancelled/Rejected with partial fill (rare)
+            if status in ("Canceled", "Rejected") and executed > 0:
+                entry_fill = float(order.get("priceAvg") or order.get("lastPrice") or 0)
+                log.warning(f"[SIM:{symbol}] MONITOR: order {status} but {executed}sh filled "
+                            f"@ ${entry_fill:.4f} — arming stop on filled portion")
+                _arm_sim_stop_after_fill(symbol, executed, entry_fill, source=f"{status} with partial")
+                return
+
         except Exception as e:
             log.warning(f"[SIM:{symbol}] MONITOR: poll error — {e}")
 
     log.warning(f"[SIM:{symbol}] MONITOR: timeout after {timeout_minutes}min — cancelling")
     sim_cancel_and_cleanup(symbol, f"SIM short did not fill within {timeout_minutes}min")
+
+
+def _arm_sim_stop_after_fill(symbol, filled_qty, entry_fill, source="full fill"):
+    """Sim equivalent of _arm_real_stop_after_fill."""
+    if entry_fill <= 0 or filled_qty <= 0:
+        log.warning(f"[SIM:{symbol}] _arm_sim_stop_after_fill: invalid inputs "
+                    f"(qty={filled_qty} fill=${entry_fill}) — skipping SL")
+        return
+    sim_set_state(symbol, entry_fill_price=entry_fill, quantity=filled_qty)
+    log.info(f"[SIM:{symbol}] MONITOR: {source} — {filled_qty}sh @ ${entry_fill:.4f}")
+
+    s = sim_get_state(symbol)
+    sl_pct = float(s.get("sl_pct") or DEFAULT_SL_PCT)
+    if sl_pct <= 0:
+        log.info(f"[SIM:{symbol}] sl_pct={sl_pct} — skipping broker SL")
+        return
+
+    stop_id = place_sim_stop(symbol, filled_qty, entry_fill, sl_pct)
+    if stop_id:
+        sim_set_state(symbol, sl_client_order_id=stop_id)
+        log.info(f"[SIM:{symbol}] BROKER SL armed | stop_order={stop_id}")
+        threading.Thread(
+            target=verify_stop_alive,
+            args=(SIM_ACCOUNT_ID, sim_headers, symbol, stop_id),
+            kwargs={"is_sim": True, "delay_seconds": 10},
+            daemon=True,
+        ).start()
+    else:
+        log.warning(f"[SIM:{symbol}] BROKER SL FAILED to place — sim trade relies on QC-side SL only")
 
 
 def sim_monitor_cover_fill(symbol, client_order_id, timeout_minutes):
