@@ -51,7 +51,7 @@ from locate_logger import log_locate
 # ══════════════════════════════════════════════════════════════════════════════
 BASE_URL             = "https://webapi.tradezero.com"
 ACCOUNT_ID           = "DHA41998"
-MAX_LOCATE_COST_PCT  = 0.1    # 5%  — reject if locatePrice / entryPrice > this
+MAX_LOCATE_COST_PCT  = 0.05    # 5%  — reject if locatePrice / entryPrice > this
 MIN_LOCATE_QUANTITY  = 100     # TZ minimum locate size
 MIN_SHORT_QUANTITY   = 1       # TZ minimum short order size (any size accepted)
 LOCATE_POLL_INTERVAL = 2       # seconds between locate status polls
@@ -1229,6 +1229,38 @@ def locate_and_short_sim(symbol, qc_quantity, entry_price):
     log.info(f"[SIM:{symbol}] request_quantity={request_quantity} "
              f"(qc={qc_quantity} raw={raw_quantity} max_affordable={max_affordable})")
 
+    # ── Step 1b: Compute probe quantity for phantom locate ─────────────────
+    # The real account is smaller than the sim account, so locating the full
+    # sim quantity often fails with R35/R57. To still get a per-share cost
+    # quote we probe at the largest quantity the real account can afford,
+    # then extrapolate the cost up to the sim quantity.
+    probe_quantity = request_quantity
+    try:
+        real_account = get_account_details()
+        if real_account is not None:
+            real_cash   = float(real_account.get("buyingPower", real_account.get("availableCash", 0)))
+            real_margin = float(real_account.get("marginAvailable", real_cash))
+            real_usable = min(real_cash, real_margin)
+            # Match the same margin-per-share calc used above for sim
+            real_max_affordable = int(real_usable / margin_per_share)
+            # TZ enforces R57: position notional <= 50% of SOD BP.
+            # Approximate SOD BP from sodEquity * leverage; stay safely under 50%.
+            sod_equity          = float(real_account.get("sodEquity", real_cash))
+            sod_bp_estimate     = sod_equity * 6.0
+            r57_cap_shares      = int((sod_bp_estimate * 0.45) / entry_price) if entry_price > 0 else real_max_affordable
+            real_safe_qty       = min(real_max_affordable, r57_cap_shares)
+            real_safe_qty       = max(MIN_LOCATE_QUANTITY, int(real_safe_qty / 100) * 100)
+            probe_quantity      = min(request_quantity, real_safe_qty)
+            if probe_quantity < MIN_LOCATE_QUANTITY:
+                probe_quantity = MIN_LOCATE_QUANTITY
+            log.info(f"[SIM:{symbol}] PROBE SIZING: real_bp=${real_usable:,.2f} "
+                     f"real_safe_qty={real_safe_qty} sim_qty={request_quantity} "
+                     f"→ probe_quantity={probe_quantity}")
+        else:
+            log.warning(f"[SIM:{symbol}] Could not get real account details — probing at sim_quantity={request_quantity}")
+    except Exception as e:
+        log.warning(f"[SIM:{symbol}] Probe sizing failed: {e} — probing at sim_quantity={request_quantity}")
+
     # ── Step 2: Phantom locate on REAL account ─────────────────────────────
     locate_cost_per_share = 0.0
     total_phantom_cost    = 0.0
@@ -1236,9 +1268,9 @@ def locate_and_short_sim(symbol, qc_quantity, entry_price):
 
     quote_req_id = f"SIM{int(time.time() * 1000)}"
     log.info(f"[SIM:{symbol}] Step 2: Phantom locate on REAL account | "
-             f"quoteReqID={quote_req_id} (will NOT be accepted)")
+             f"quoteReqID={quote_req_id} (probe_qty={probe_quantity}, will NOT be accepted)")
     try:
-        r = request_locate_quote(symbol, request_quantity, quote_req_id)
+        r = request_locate_quote(symbol, probe_quantity, quote_req_id)
 
         if r.status_code not in (200, 201, 202):
             log.warning(f"[SIM:{symbol}] Phantom locate request failed: "
@@ -1249,7 +1281,8 @@ def locate_and_short_sim(symbol, qc_quantity, entry_price):
             if locate is None:
                 log_locate(symbol=symbol, entry_price=entry_price,
                            outcome='TIMEOUT', trade_outcome='UNKNOWN_PENDING',
-                           notes=f"SIM | phantom locate no status after {LOCATE_POLL_TIMEOUT}s — proceeding with sim order")
+                           notes=f"SIM | probed {probe_quantity}sh (sim wants {request_quantity}sh) | "
+                                 f"phantom locate no status after {LOCATE_POLL_TIMEOUT}s — proceeding with sim order")
                 log.warning(f"[SIM:{symbol}] Phantom locate timed out — "
                             f"proceeding without cost data")
 
@@ -1258,31 +1291,37 @@ def locate_and_short_sim(symbol, qc_quantity, entry_price):
                 log_locate(symbol=symbol, entry_price=entry_price,
                            outcome='REJECTED_BY_TZ_NO_SHARES',
                            trade_outcome='UNKNOWN_PENDING',
-                           notes=f"SIM | phantom status=56 text={reason} — proceeding with sim order")
+                           notes=f"SIM | probed {probe_quantity}sh (sim wants {request_quantity}sh) | "
+                                 f"phantom status=56 text={reason} — proceeding with sim order")
                 log.warning(f"[SIM:{symbol}] Phantom locate REJECTED by TZ: {reason} — "
                             f"logging only, proceeding with sim order (cost data: $0.00)")
 
             elif locate.get("locateStatus") in (67, 52):
                 log_locate(symbol=symbol, entry_price=entry_price,
                            outcome='OTHER', trade_outcome='UNKNOWN_PENDING',
-                           notes=f"SIM | phantom status={locate.get('locateStatus')} expired/cancelled — proceeding with sim order")
+                           notes=f"SIM | probed {probe_quantity}sh (sim wants {request_quantity}sh) | "
+                                 f"phantom status={locate.get('locateStatus')} expired/cancelled — proceeding with sim order")
                 log.warning(f"[SIM:{symbol}] Phantom locate expired/cancelled — "
                             f"proceeding without cost data")
 
             elif locate.get("locateStatus") == 65:
-                # Offered — record cost, DO NOT accept
+                # Offered — record cost per share, extrapolate to sim quantity, DO NOT accept
                 locate_cost_per_share = float(locate.get("locatePrice", 0))
                 offered_qty           = int(locate.get("locateShares", 0))
-                used_qty              = min(request_quantity, offered_qty) if offered_qty > 0 else request_quantity
-                total_phantom_cost    = locate_cost_per_share * used_qty
+                # Sim trade will execute at request_quantity; extrapolate cost from
+                # probe rate. Note this may underestimate true cost if inventory is
+                # thin (desk would quote higher for larger quantity).
+                total_phantom_cost    = locate_cost_per_share * request_quantity
                 cost_pct              = (locate_cost_per_share / entry_price * 100) if entry_price > 0 else 0
                 locate_check_ok       = True
 
                 log.info(
                     f"\n[SIM:{symbol}] ╔══ PHANTOM LOCATE RESULT ═════════════════════╗\n"
+                    f"[SIM:{symbol}] ║  Probed qty  :  {probe_quantity} shares (real BP limited)\n"
                     f"[SIM:{symbol}] ║  Offered qty :  {offered_qty} shares\n"
                     f"[SIM:{symbol}] ║  Cost/share  :  ${locate_cost_per_share:.4f}  ({cost_pct:.3f}% of entry)\n"
-                    f"[SIM:{symbol}] ║  Total cost  :  ${total_phantom_cost:.2f}  ({used_qty}sh)\n"
+                    f"[SIM:{symbol}] ║  Sim qty     :  {request_quantity} shares\n"
+                    f"[SIM:{symbol}] ║  Extrap cost :  ${total_phantom_cost:.2f}  (cost/share × sim_qty)\n"
                     f"[SIM:{symbol}] ║  Threshold   :  {MAX_LOCATE_COST_PCT*100:.1f}%  "
                     f"→ {'✓ WITHIN' if cost_pct/100 <= MAX_LOCATE_COST_PCT else '✗ WOULD BLOCK'}\n"
                     f"[SIM:{symbol}] ║  Action      :  NOT accepted (sim mode — expires naturally)\n"
@@ -1292,12 +1331,13 @@ def locate_and_short_sim(symbol, qc_quantity, entry_price):
                 if entry_price > 0 and locate_cost_per_share > 0:
                     if locate_cost_per_share / entry_price > MAX_LOCATE_COST_PCT:
                         log_locate(symbol=symbol, entry_price=entry_price,
-                                   shares_offered=used_qty,
+                                   shares_offered=request_quantity,
                                    locate_cost_per_share=locate_cost_per_share,
                                    route='PRIMARY',
                                    outcome='REJECTED_BY_COST',
                                    trade_outcome='BLOCKED_NO_TRADE',
-                                   notes=f"SIM | phantom {locate_cost_per_share / entry_price * 100:.2f}% > {MAX_LOCATE_COST_PCT * 100:.1f}%")
+                                   notes=f"SIM | probed {probe_quantity}sh, extrap to sim {request_quantity}sh | "
+                                         f"{locate_cost_per_share / entry_price * 100:.2f}% > {MAX_LOCATE_COST_PCT * 100:.1f}%")
                         sim_block(
                             symbol,
                             f"phantom locate too expensive: "
@@ -1343,7 +1383,9 @@ def locate_and_short_sim(symbol, qc_quantity, entry_price):
                    route='PRIMARY',
                    outcome='ACCEPTED_TRADED',
                    trade_outcome='UNKNOWN_PENDING',
-                   notes='SIM | phantom locate cost recorded, not accepted')
+                   notes=f'SIM | probed {probe_quantity}sh @ ${locate_cost_per_share:.4f}/sh, '
+                         f'extrap to sim {placed_qty}sh = ${total_phantom_cost:.2f} | '
+                         f'phantom locate cost recorded, not accepted')
         log.info(f"[SIM:{symbol}] SIM SHORT PLACED | qty={placed_qty} | limit=${limit_price} | "
                  f"clientOrderId={result.get('clientOrderId')} | "
                  f"status={result.get('orderStatus')} | "
