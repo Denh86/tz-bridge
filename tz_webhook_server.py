@@ -44,19 +44,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# ─── TEMPORARY SMOKE TEST ─── remove after first successful write
 from locate_logger import log_locate
-log_locate(
-    symbol="SMOKETEST",
-    entry_price=1.00,
-    shares_offered=100,
-    locate_cost_per_share=0.01,
-    route="PRIMARY",
-    outcome="ACCEPTED_TRADED",
-    trade_outcome="UNKNOWN_PENDING",
-    notes="smoke test on server startup",
-)
-# ─── END TEMPORARY SMOKE TEST ───
 
 # ══════════════════════════════════════════════════════════════════════════════
 # CONFIG — adjust these without touching any other code
@@ -852,6 +840,11 @@ def locate_and_short(symbol, qc_quantity, entry_price):
         if live_session == "yahoo_v8(lastClose)":
             log.info(f"[{symbol}] Price sanity SKIPPED — {live_session} is yesterday's close")
         elif deviation > PRICE_SANITY_PCT:
+            log_locate(symbol=symbol, entry_price=entry_price,
+                       outcome='REJECTED_BY_PRICE_SANITY',
+                       trade_outcome='BLOCKED_NO_TRADE',
+                       notes=f"REAL | QC=${entry_price} vs {live_session}=${live_price:.4f} "
+                             f"({deviation*100:.1f}%)")
             block(symbol, f"price sanity FAILED: QC=${entry_price} vs {live_session}=${live_price:.4f} "
                           f"({deviation*100:.1f}% > {PRICE_SANITY_PCT*100:.0f}% limit)")
             return
@@ -987,21 +980,37 @@ def locate_and_short(symbol, qc_quantity, entry_price):
         return
 
     if locate is None:
+        log_locate(symbol=symbol, entry_price=entry_price,
+                   outcome='TIMEOUT', trade_outcome='BLOCKED_NO_TRADE',
+                   notes=f"REAL | no actionable status after {LOCATE_POLL_TIMEOUT}s")
         block(symbol, f"locate timed out after {LOCATE_POLL_TIMEOUT}s")
         return
 
     status = locate.get("locateStatus")
 
     if status == 56:
+        log_locate(symbol=symbol, entry_price=entry_price,
+                   outcome='REJECTED_BY_TZ_NO_SHARES',
+                   trade_outcome='BLOCKED_NO_TRADE',
+                   notes=f"REAL | status=56 text={locate.get('text', '')}")
         block(symbol, f"locate rejected by TZ | text: {locate.get('text', '')}")
         return
     if status == 67:
+        log_locate(symbol=symbol, entry_price=entry_price,
+                   outcome='OTHER', trade_outcome='BLOCKED_NO_TRADE',
+                   notes="REAL | status=67 quote expired")
         block(symbol, "locate quote expired")
         return
     if status == 52:
+        log_locate(symbol=symbol, entry_price=entry_price,
+                   outcome='OTHER', trade_outcome='BLOCKED_NO_TRADE',
+                   notes="REAL | status=52 cancelled")
         block(symbol, "locate cancelled")
         return
     if status != 65:
+        log_locate(symbol=symbol, entry_price=entry_price,
+                   outcome='OTHER', trade_outcome='BLOCKED_NO_TRADE',
+                   notes=f"REAL | unexpected status={status}")
         block(symbol, f"unexpected locate status: {status}")
         return
 
@@ -1037,6 +1046,14 @@ def locate_and_short(symbol, qc_quantity, entry_price):
                  f"${total_locate_cost:.2f} total | "
                  f"{locate_cost_pct*100:.3f}% of entry ${entry_price}")
         if locate_cost_pct > MAX_LOCATE_COST_PCT:
+            _route_for_log = 'SU_SECONDARY' if locate.get("quoteReqID", quote_req_id) != quote_req_id else 'PRIMARY'
+            log_locate(symbol=symbol, entry_price=entry_price,
+                       shares_offered=final_quantity,
+                       locate_cost_per_share=locate_price,
+                       route=_route_for_log,
+                       outcome='REJECTED_BY_COST',
+                       trade_outcome='BLOCKED_NO_TRADE',
+                       notes=f"REAL | {locate_cost_pct*100:.2f}% > {MAX_LOCATE_COST_PCT*100:.1f}%")
             block(symbol, f"locate too expensive: {locate_cost_pct*100:.3f}% > "
                           f"{MAX_LOCATE_COST_PCT*100:.1f}% threshold")
             return
@@ -1098,7 +1115,15 @@ def locate_and_short(symbol, qc_quantity, entry_price):
             entry_price=entry_price,
             quantity=placed_qty,
             client_order_id=result.get("clientOrderId"),
+            locate_cost_per_share=locate_price,
         )
+        log_locate(symbol=symbol, entry_price=entry_price,
+                   shares_offered=placed_qty,
+                   locate_cost_per_share=locate_price,
+                   route='SU_SECONDARY' if accept_id != quote_req_id else 'PRIMARY',
+                   outcome='ACCEPTED_TRADED',
+                   trade_outcome='UNKNOWN_PENDING',
+                   notes='REAL')
         log.info(f"[{symbol}] SHORT PLACED | qty={placed_qty} | "
                  f"limit=${limit_price} | clientOrderId={result.get('clientOrderId')}")
         threading.Thread(
@@ -1141,6 +1166,11 @@ def locate_and_short_sim(symbol, qc_quantity, entry_price):
         if live_session == "yahoo_v8(lastClose)":
             log.info(f"[SIM:{symbol}] Price sanity SKIPPED — lastClose is stale reference")
         elif deviation > PRICE_SANITY_PCT:
+            log_locate(symbol=symbol, entry_price=entry_price,
+                       outcome='REJECTED_BY_PRICE_SANITY',
+                       trade_outcome='BLOCKED_NO_TRADE',
+                       notes=f"SIM | QC=${entry_price} vs {live_session}=${live_price:.4f} "
+                             f"({deviation*100:.1f}%)")
             sim_block(symbol, f"price sanity FAILED: QC=${entry_price} vs "
                               f"{live_session}=${live_price:.4f} ({deviation*100:.1f}%)")
             return
@@ -1217,15 +1247,25 @@ def locate_and_short_sim(symbol, qc_quantity, entry_price):
             locate = poll_locate_status(symbol, quote_req_id)
 
             if locate is None:
+                log_locate(symbol=symbol, entry_price=entry_price,
+                           outcome='TIMEOUT', trade_outcome='UNKNOWN_PENDING',
+                           notes=f"SIM | phantom locate no status after {LOCATE_POLL_TIMEOUT}s — proceeding with sim order")
                 log.warning(f"[SIM:{symbol}] Phantom locate timed out — "
                             f"proceeding without cost data")
 
             elif locate.get("locateStatus") == 56:
                 reason = locate.get("text", "no reason given")
+                log_locate(symbol=symbol, entry_price=entry_price,
+                           outcome='REJECTED_BY_TZ_NO_SHARES',
+                           trade_outcome='UNKNOWN_PENDING',
+                           notes=f"SIM | phantom status=56 text={reason} — proceeding with sim order")
                 log.warning(f"[SIM:{symbol}] Phantom locate REJECTED by TZ: {reason} — "
                             f"logging only, proceeding with sim order (cost data: $0.00)")
 
             elif locate.get("locateStatus") in (67, 52):
+                log_locate(symbol=symbol, entry_price=entry_price,
+                           outcome='OTHER', trade_outcome='UNKNOWN_PENDING',
+                           notes=f"SIM | phantom status={locate.get('locateStatus')} expired/cancelled — proceeding with sim order")
                 log.warning(f"[SIM:{symbol}] Phantom locate expired/cancelled — "
                             f"proceeding without cost data")
 
@@ -1251,6 +1291,13 @@ def locate_and_short_sim(symbol, qc_quantity, entry_price):
 
                 if entry_price > 0 and locate_cost_per_share > 0:
                     if locate_cost_per_share / entry_price > MAX_LOCATE_COST_PCT:
+                        log_locate(symbol=symbol, entry_price=entry_price,
+                                   shares_offered=used_qty,
+                                   locate_cost_per_share=locate_cost_per_share,
+                                   route='PRIMARY',
+                                   outcome='REJECTED_BY_COST',
+                                   trade_outcome='BLOCKED_NO_TRADE',
+                                   notes=f"SIM | phantom {locate_cost_per_share / entry_price * 100:.2f}% > {MAX_LOCATE_COST_PCT * 100:.1f}%")
                         sim_block(
                             symbol,
                             f"phantom locate too expensive: "
@@ -1290,6 +1337,13 @@ def locate_and_short_sim(symbol, qc_quantity, entry_price):
             phantom_locate_cost=total_phantom_cost,
             phantom_locate_cost_per_share=locate_cost_per_share,
         )
+        log_locate(symbol=symbol, entry_price=entry_price,
+                   shares_offered=placed_qty,
+                   locate_cost_per_share=locate_cost_per_share,
+                   route='PRIMARY',
+                   outcome='ACCEPTED_TRADED',
+                   trade_outcome='UNKNOWN_PENDING',
+                   notes='SIM | phantom locate cost recorded, not accepted')
         log.info(f"[SIM:{symbol}] SIM SHORT PLACED | qty={placed_qty} | limit=${limit_price} | "
                  f"clientOrderId={result.get('clientOrderId')} | "
                  f"status={result.get('orderStatus')} | "
@@ -1301,7 +1355,6 @@ def locate_and_short_sim(symbol, qc_quantity, entry_price):
         ).start()
     except Exception as e:
         sim_block(symbol, f"SIM order placement failed after all stepdown attempts: {e}")
-
 
 # ══════════════════════════════════════════════════════════════════════════════
 # REAL ACCOUNT — CANCEL + CLEANUP HELPER
@@ -1344,7 +1397,12 @@ def monitor_short_fill(symbol, client_order_id, timeout_minutes):
                 executed = int(order.get("executed", 0))
                 log.info(f"[{symbol}] SHORT MONITOR: status={status} executed={executed}")
                 if status in ("Filled",) or executed > 0:
-                    log.info(f"[{symbol}] SHORT MONITOR: order filled — monitor done")
+                    entry_fill = float(order.get("priceAvg") or order.get("lastPrice") or 0)
+                    if entry_fill > 0:
+                        set_state(symbol, entry_fill_price=entry_fill)
+                        log.info(f"[{symbol}] SHORT MONITOR: order filled @ ${entry_fill:.4f} — monitor done")
+                    else:
+                        log.info(f"[{symbol}] SHORT MONITOR: order filled — monitor done")
                     return
                 if status in ("Canceled", "Rejected"):
                     reject_text = order.get("text") or order.get("rejectReason") or "no reason given"
@@ -1409,7 +1467,33 @@ def monitor_cover_fill(symbol, client_order_id, timeout_minutes):
                 executed = int(order.get("executed", 0))
                 log.info(f"[{symbol}] COVER MONITOR: status={status} executed={executed}")
                 if status in ("Filled",) or executed > 0:
-                    log.info(f"[{symbol}] COVER MONITOR: cover filled — done")
+                    cover_fill = float(order.get("priceAvg") or order.get("lastPrice") or 0)
+                    order_fee  = float(order.get("orderFee") or 0)
+                    s = get_state(symbol)
+                    entry_fill = float(s.get("entry_fill_price") or s.get("entry_price") or 0)
+                    placed_qty = int(s.get("quantity") or executed or 0)
+                    locate_cps = float(s.get("locate_cost_per_share") or 0)
+                    pnl_pct = None
+                    if entry_fill > 0 and cover_fill > 0 and placed_qty > 0:
+                        gross = (entry_fill - cover_fill) * placed_qty
+                        net   = gross - (locate_cps * placed_qty) - order_fee
+                        pnl_pct = net / (entry_fill * placed_qty) * 100.0
+                    trade_oc = ('WIN' if (pnl_pct or 0) > 0
+                                else 'LOSS' if (pnl_pct or 0) < 0
+                                else 'UNKNOWN_PENDING')
+                    log_locate(symbol=symbol,
+                               entry_price=entry_fill,
+                               shares_offered=placed_qty,
+                               route='COVER',
+                               outcome='COVER_FILLED',
+                               trade_outcome=trade_oc,
+                               cover_fill_price=cover_fill,
+                               realized_pnl_pct=pnl_pct,
+                               notes=f"REAL | entry_fill=${entry_fill:.4f} cover_fill=${cover_fill:.4f} "
+                                     f"fee=${order_fee:.2f} locate=${locate_cps*placed_qty:.2f}")
+                    log.info(f"[{symbol}] COVER MONITOR: cover filled @ ${cover_fill:.4f} | "
+                             f"pnl={pnl_pct:.2f}% — done" if pnl_pct is not None
+                             else f"[{symbol}] COVER MONITOR: cover filled — done")
                     set_state(symbol, state="FLAT", reason="cover filled (monitor confirmed)")
                     return
                 if status in ("Canceled", "Rejected"):
@@ -1531,7 +1615,12 @@ def sim_monitor_short_fill(symbol, client_order_id, timeout_minutes):
                 executed = int(order.get("executed", 0))
                 log.info(f"[SIM:{symbol}] MONITOR: status={status} executed={executed}")
                 if status == "Filled" or executed > 0:
-                    log.info(f"[SIM:{symbol}] MONITOR: filled — done")
+                    entry_fill = float(order.get("priceAvg") or order.get("lastPrice") or 0)
+                    if entry_fill > 0:
+                        sim_set_state(symbol, entry_fill_price=entry_fill)
+                        log.info(f"[SIM:{symbol}] MONITOR: filled @ ${entry_fill:.4f} — done")
+                    else:
+                        log.info(f"[SIM:{symbol}] MONITOR: filled — done")
                     return
                 if status in ("Canceled", "Rejected"):
                     reject_text = order.get("text") or order.get("rejectReason") or "no reason"
@@ -1572,10 +1661,34 @@ def sim_monitor_cover_fill(symbol, client_order_id, timeout_minutes):
                 executed = int(order.get("executed", 0))
                 log.info(f"[SIM:{symbol}] COVER MONITOR: status={status} executed={executed}")
                 if status == "Filled" or executed > 0:
+                    cover_fill = float(order.get("priceAvg") or order.get("lastPrice") or 0)
+                    order_fee  = float(order.get("orderFee") or 0)
                     s            = sim_get_state(symbol)
-                    phantom_cost = s.get("phantom_locate_cost", 0)
-                    log.info(f"[SIM:{symbol}] COVER MONITOR: filled ✓ | "
-                             f"phantom_locate_cost=${phantom_cost:.2f}")
+                    phantom_cost = float(s.get("phantom_locate_cost") or 0)
+                    locate_cps   = float(s.get("phantom_locate_cost_per_share") or 0)
+                    entry_fill   = float(s.get("entry_fill_price") or s.get("entry_price") or 0)
+                    placed_qty   = int(s.get("quantity") or executed or 0)
+                    pnl_pct = None
+                    if entry_fill > 0 and cover_fill > 0 and placed_qty > 0:
+                        gross = (entry_fill - cover_fill) * placed_qty
+                        net   = gross - phantom_cost - order_fee
+                        pnl_pct = net / (entry_fill * placed_qty) * 100.0
+                    trade_oc = ('WIN' if (pnl_pct or 0) > 0
+                                else 'LOSS' if (pnl_pct or 0) < 0
+                                else 'UNKNOWN_PENDING')
+                    log_locate(symbol=symbol,
+                               entry_price=entry_fill,
+                               shares_offered=placed_qty,
+                               route='COVER',
+                               outcome='COVER_FILLED',
+                               trade_outcome=trade_oc,
+                               cover_fill_price=cover_fill,
+                               realized_pnl_pct=pnl_pct,
+                               notes=f"SIM | entry_fill=${entry_fill:.4f} cover_fill=${cover_fill:.4f} "
+                                     f"fee=${order_fee:.2f} phantom_locate=${phantom_cost:.2f}")
+                    log.info(f"[SIM:{symbol}] COVER MONITOR: filled @ ${cover_fill:.4f} | "
+                             f"pnl={pnl_pct:.2f}% | phantom_locate_cost=${phantom_cost:.2f}" if pnl_pct is not None
+                             else f"[SIM:{symbol}] COVER MONITOR: filled ✓ | phantom_locate_cost=${phantom_cost:.2f}")
                     sim_set_state(symbol, state="FLAT", reason="cover filled (sim monitor)")
                     return
                 if status in ("Canceled", "Rejected"):
