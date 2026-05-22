@@ -66,6 +66,8 @@ HEADERS = [
     "notes",
     "cover_fill_price",
     "realized_pnl_pct",
+    "locate_type",
+    "pre_borrow",
 ]
 
 # ── Internal state ──────────────────────────────────────────────────────
@@ -193,12 +195,20 @@ def log_locate(
     notes="",
     cover_fill_price=None,
     realized_pnl_pct=None,
+    locate_type=None,
+    pre_borrow=None,
 ):
     """Enqueue a locate event. Returns immediately — never blocks."""
     _start_once()
     try:
         cost_pct = ((locate_cost_per_share / entry_price * 100.0)
                     if (entry_price and locate_cost_per_share) else 0.0)
+
+        # Map locateType code to human-readable string
+        type_str = ""
+        if locate_type is not None:
+            type_map = {1: "Locate", 2: "Locate", 3: "PreBorrow", 4: "SingleUse", 0: ""}
+            type_str = type_map.get(int(locate_type), str(locate_type))
 
         row = [
             _et_now(),
@@ -213,6 +223,8 @@ def log_locate(
             str(notes or "")[:300],
             round(float(cover_fill_price), 4) if cover_fill_price else "",
             round(float(realized_pnl_pct), 3) if realized_pnl_pct is not None else "",
+            type_str,
+            ("TRUE" if pre_borrow else "FALSE") if pre_borrow is not None else "",
         ]
 
         try:
