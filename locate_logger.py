@@ -64,6 +64,8 @@ HEADERS = [
     "outcome",
     "trade_outcome",
     "notes",
+    "cover_fill_price",
+    "realized_pnl_pct",
 ]
 
 # ── Internal state ──────────────────────────────────────────────────────
@@ -189,6 +191,8 @@ def log_locate(
     outcome="",
     trade_outcome="UNKNOWN_PENDING",
     notes="",
+    cover_fill_price=None,
+    realized_pnl_pct=None,
 ):
     """Enqueue a locate event. Returns immediately — never blocks."""
     _start_once()
@@ -207,6 +211,8 @@ def log_locate(
             str(outcome or ""),
             str(trade_outcome or "UNKNOWN_PENDING"),
             str(notes or "")[:300],
+            round(float(cover_fill_price), 4) if cover_fill_price else "",
+            round(float(realized_pnl_pct), 3) if realized_pnl_pct is not None else "",
         ]
 
         try:
