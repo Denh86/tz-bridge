@@ -32,6 +32,7 @@ HOW TO RUN:
     TZ_SIM_API_KEY=...
     TZ_SIM_API_SECRET=...
     SIM_ACCOUNT_ID=...
+    STOP_LOSS_ENABLED=true     # set false to skip broker SL and rely on QC cover
   python tz_webhook_server.py
 """
 
@@ -51,7 +52,7 @@ from locate_logger import log_locate, log_rename
 # ══════════════════════════════════════════════════════════════════════════════
 BASE_URL             = "https://webapi.tradezero.com"
 ACCOUNT_ID           = "DHA41998"
-MAX_LOCATE_COST_PCT  = 0.10    # 10%  — reject if locatePrice / entryPrice > this
+MAX_LOCATE_COST_PCT  = 0.2    # 10%  — reject if locatePrice / entryPrice > this
 MIN_LOCATE_QUANTITY  = 100     # TZ minimum locate size
 MIN_SHORT_QUANTITY   = 1       # TZ minimum short order size (any size accepted)
 LOCATE_POLL_INTERVAL = 2       # seconds between locate status polls
@@ -76,10 +77,32 @@ COVER_RETRY_BUFFER   = 0.005   # 0.5% above live price for aggressive cover retr
 # QC strategies will eventually send an `sl_pct` field in the SHORT webhook;
 # until then, all strategies use a 10% stop. The bridge falls back to
 # DEFAULT_SL_PCT when no sl_pct is provided in the payload.
-DEFAULT_SL_PCT  = 0.20    # 20% adverse move on short positions (price up) — matches QC strategy SL pct
+DEFAULT_SL_PCT  = 0.22    # 20% adverse move on short positions (price up) — matches QC strategy SL pct
 SL_LIMIT_SLACK  = 0.02    # 2% slack on StopLimit ETH orders so they actually fill
 # Stop type by session: RTH uses Stop (market on trigger), ETH uses StopLimit
 # because TZ doesn't accept market orders outside RTH.
+
+# ── BROKER STOP-LOSS TOGGLE ─────────────────────────────────────────────────
+# True  → arm a TZ stop/stoplimit after each short fill (server-side protection)
+# False → place only the limit short; rely entirely on QC's TP/SL/EOD cover
+#         webhook (QC strategy already monitors the stop-loss condition).
+# Flip via env var STOP_LOSS_ENABLED ("false"/"0"/"no"/"off") without code edits.
+STOP_LOSS_ENABLED = (os.getenv("STOP_LOSS_ENABLED", "true").strip().lower()
+                     not in ("0", "false", "no", "off"))
+
+# ── LOCATE BUYING-POWER SIZING ──────────────────────────────────────────────
+# TZ evaluates LOCATE requests against ~1:1 buying power (notional <= BP), NOT
+# the leveraged margin used at order placement (same finding the SIM phantom
+# locate probe relies on). Size the fresh locate request so its notional stays
+# under LOCATE_BP_USAGE × usable BP, or it gets R35'd before any order is placed.
+# NOTE: this cap is applied ONLY to fresh locate requests — reuse of an already
+# secured existing locate stays bound by the leveraged order margin.
+LOCATE_BP_USAGE        = 0.85   # max 85% of 1:1 BP for fresh locate notional
+LOCATE_STEPDOWN_FACTOR = 0.6    # on R35/R57 (start >= 1000sh): retry at 60% of previous qty
+LOCATE_MAX_ATTEMPTS    = 6      # ceiling on geometric-ladder attempts (incl. final 100sh try)
+# Stepdown rule on a BP/size rejection:
+#   start  < 1000sh  → cycle DOWN by 100 each retry, to MIN_LOCATE_QUANTITY
+#   start >= 1000sh  → geometric LOCATE_STEPDOWN_FACTOR ladder, capped, to MIN_LOCATE_QUANTITY
 
 # ══════════════════════════════════════════════════════════════════════════════
 # CREDENTIALS — REAL ACCOUNT
@@ -490,6 +513,41 @@ def place_order_with_stepdown(symbol, initial_quantity, limit_price, label="SHOR
                             f"(20% minimum): {e} — giving up")
     raise last_exc or Exception(f"[{symbol}] All stepdown tiers failed "
                                 f"(located {initial_quantity}sh)")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# LOCATE QUANTITY LADDER  (R35/R57 stepdown for fresh locate requests)
+# ══════════════════════════════════════════════════════════════════════════════
+def _build_locate_ladder(start_qty):
+    """Descending list of locate quantities to try on R35/R57 (BP/size) rejections,
+    always ending at MIN_LOCATE_QUANTITY.
+
+      • start <  1000sh → cycle DOWN by 100 each retry (fine-grained, small sizes)
+      • start >= 1000sh → multiply by LOCATE_STEPDOWN_FACTOR each retry, floored to
+                          100s, capped at LOCATE_MAX_ATTEMPTS entries
+
+    Consecutive duplicates are removed. Used only for FRESH locate requests
+    (not order placement, not existing-locate reuse).
+    """
+    start = max(MIN_LOCATE_QUANTITY, int(start_qty / 100) * 100)
+
+    if start < 1000:
+        ladder = list(range(start, MIN_LOCATE_QUANTITY - 1, -100))
+        if not ladder or ladder[-1] != MIN_LOCATE_QUANTITY:
+            ladder.append(MIN_LOCATE_QUANTITY)
+    else:
+        ladder = []
+        q = start
+        while q > MIN_LOCATE_QUANTITY and len(ladder) < LOCATE_MAX_ATTEMPTS - 1:
+            ladder.append(q)
+            q = max(MIN_LOCATE_QUANTITY, int(q * LOCATE_STEPDOWN_FACTOR / 100) * 100)
+        ladder.append(MIN_LOCATE_QUANTITY)
+
+    out = []
+    for x in ladder:                       # drop consecutive duplicates
+        if not out or out[-1] != x:
+            out.append(x)
+    return out
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1172,13 +1230,35 @@ def locate_and_short(symbol, qc_quantity, entry_price):
     log.info(f"[{symbol}] request_quantity={request_quantity} "
              f"(floored to 100s | qc={qc_quantity}, raw={raw_quantity}, max_affordable={max_affordable})")
 
+    # ── LOCATE 1:1 BP CAP ──────────────────────────────────────────────────
+    # TZ evaluates fresh LOCATE requests at ~1:1 notional (not leveraged margin).
+    # Cap the fresh locate request size so its notional stays under
+    # LOCATE_BP_USAGE × usable BP — otherwise TZ R35's the locate before any
+    # order is placed. This cap applies ONLY to the fresh locate request size;
+    # order affordability and reuse of an existing locate stay on max_affordable
+    # (leveraged), since a secured locate carries no R35 risk.
+    locate_request_quantity = request_quantity
+    if entry_price > 0:
+        locate_bp_cap = max(
+            MIN_LOCATE_QUANTITY,
+            int((usable_capital * LOCATE_BP_USAGE) / entry_price / 100) * 100
+        )
+        if locate_bp_cap < locate_request_quantity:
+            log.info(f"[{symbol}] Locate 1:1 BP cap: {LOCATE_BP_USAGE*100:.0f}% × "
+                     f"${usable_capital:,.0f} / ${entry_price} = {locate_bp_cap}sh "
+                     f"< request {locate_request_quantity}sh — capping fresh locate size "
+                     f"(TZ locates are ~1:1, not leveraged)")
+            locate_request_quantity = locate_bp_cap
+
     # ── Step 3b: Check existing locate ────────────────────────────────────
     log.info(f"[{symbol}] Step 3b: Checking for existing locate today")
-    has_locate, located_qty = check_existing_locate(symbol, request_quantity)
+    has_locate, located_qty = check_existing_locate(symbol, locate_request_quantity)
     if has_locate:
         log.info(f"[{symbol}] Skipping locate request — using existing locate "
                  f"({located_qty} shares already accepted today)")
 
+        # Existing locate is already secured → bound by leveraged order margin,
+        # NOT the 1:1 locate cap.
         affordable_qty = min(located_qty, max_affordable)
         if affordable_qty < MIN_SHORT_QUANTITY:
             block(symbol, f"existing locate ({located_qty}sh) but cannot afford "
@@ -1208,32 +1288,63 @@ def locate_and_short(symbol, qc_quantity, entry_price):
             block(symbol, f"order placement failed after all stepdown attempts: {e}")
         return
 
-    # ── Step 4: Request locate quote ───────────────────────────────────────
-    quote_req_id = f"Q{int(time.time() * 1000)}"
-    set_state(symbol, quote_req_id=quote_req_id)
-    log.info(f"[{symbol}] Step 4: Requesting locate | quoteReqID={quote_req_id}")
-    r = request_locate_quote(symbol, request_quantity, quote_req_id)
+    # ── Step 4+5: Request locate + poll, with R35/R57 stepdown ─────────────
+    # TZ can R35/R57 a fresh locate even after the 1:1 pre-sizing (intraday BP
+    # drift; locate notional is ~1:1). On those BP/size rejections ONLY, retry
+    # at a smaller quantity via the ladder, down to MIN_LOCATE_QUANTITY.
+    #   start  < 1000sh → cycle down by 100 each retry
+    #   start >= 1000sh → geometric LOCATE_STEPDOWN_FACTOR ladder (capped)
+    # "No shares" (other err), expired, cancelled, and timeout are terminal and
+    # handled by the status block below.
+    ladder = _build_locate_ladder(locate_request_quantity)
+    log.info(f"[{symbol}] Locate stepdown ladder: {ladder}")
+    locate       = None
+    quote_req_id = None
+    for attempt, attempt_qty in enumerate(ladder, 1):
+        if get_state(symbol).get("state") != "LOCATING":
+            log.warning(f"[{symbol}] State changed during locate stepdown — aborting")
+            return
 
-    if r.status_code not in (200, 201, 202):
-        body = r.text
-        if "insufficient" in body.lower() or "inventory" in body.lower():
-            block(symbol, f"locate request failed — insufficient inventory: {body[:200]}")
-        else:
-            block(symbol, f"locate request failed: {r.status_code} | {body[:200]}")
-        return
+        quote_req_id     = f"Q{int(time.time() * 1000)}"
+        request_quantity = attempt_qty          # downstream final_quantity = min(request_quantity, offered)
+        set_state(symbol, quote_req_id=quote_req_id)
+        log.info(f"[{symbol}] Step 4 (attempt {attempt}/{len(ladder)}): "
+                 f"Requesting locate | qty={attempt_qty} | quoteReqID={quote_req_id}")
 
-    # ── Step 5: Poll locate status ─────────────────────────────────────────
-    log.info(f"[{symbol}] Step 5: Polling locate status (max {LOCATE_POLL_TIMEOUT}s)")
+        r = request_locate_quote(symbol, attempt_qty, quote_req_id)
+        if r.status_code not in (200, 201, 202):
+            body  = r.text
+            is_bp = ("R35" in body or "R57" in body or "buying power" in body.lower())
+            if is_bp and attempt < len(ladder):
+                log.warning(f"[{symbol}] Locate HTTP rejection at {attempt_qty}sh "
+                            f"({r.status_code}: {body[:120]}) — stepping down")
+                continue
+            if "insufficient" in body.lower() or "inventory" in body.lower():
+                block(symbol, f"locate request failed — insufficient inventory: {body[:200]}")
+            else:
+                block(symbol, f"locate request failed: {r.status_code} | {body[:200]}")
+            return
 
-    if get_state(symbol).get("state") != "LOCATING":
-        log.warning(f"[{symbol}] State changed during locate request — aborting")
-        return
+        log.info(f"[{symbol}] Step 5: Polling locate status (max {LOCATE_POLL_TIMEOUT}s)")
+        locate = poll_locate_status(symbol, quote_req_id)
 
-    locate = poll_locate_status(symbol, quote_req_id)
+        if get_state(symbol).get("state") != "LOCATING":
+            log.warning(f"[{symbol}] State changed during locate poll — aborting")
+            return
 
-    if get_state(symbol).get("state") != "LOCATING":
-        log.warning(f"[{symbol}] State changed during locate poll — aborting")
-        return
+        if locate is None:
+            break  # timeout — terminal, handled below
+
+        # R35/R57 on the poll result → step down and retry
+        if (locate.get("locateStatus") == 56
+                and int(locate.get("locateError", 0) or 0) in (35, 57)
+                and attempt < len(ladder)):
+            log.warning(f"[{symbol}] Locate R{locate.get('locateError')} at {attempt_qty}sh "
+                        f"(text: {locate.get('text','')[:80]}) — stepping down")
+            continue
+
+        # Offered (65) or any non-BP terminal status — stop retrying
+        break
 
     if locate is None:
         log_locate(symbol=symbol, entry_price=entry_price,
@@ -1906,6 +2017,14 @@ def _arm_real_stop_after_fill(symbol, filled_qty, entry_fill, source="full fill"
     set_state(symbol, entry_fill_price=entry_fill, quantity=filled_qty)
     log.info(f"[{symbol}] SHORT MONITOR: {source} — {filled_qty}sh @ ${entry_fill:.4f}")
 
+    # ── BROKER SL TOGGLE ──────────────────────────────────────────────────
+    # Entry fill state is recorded above (needed for cover-side PnL) BEFORE this
+    # check, so disabling the broker stop does not affect PnL accounting.
+    if not STOP_LOSS_ENABLED:
+        log.info(f"[{symbol}] STOP_LOSS_ENABLED=False — no broker SL; "
+                 f"relying on QC cover webhook ({filled_qty}sh @ ${entry_fill:.4f})")
+        return
+
     s = get_state(symbol)
     sl_pct = float(s.get("sl_pct") or DEFAULT_SL_PCT)
     if sl_pct <= 0:
@@ -2189,6 +2308,13 @@ def _arm_sim_stop_after_fill(symbol, filled_qty, entry_fill, source="full fill")
     sim_set_state(symbol, entry_fill_price=entry_fill, quantity=filled_qty)
     log.info(f"[SIM:{symbol}] MONITOR: {source} — {filled_qty}sh @ ${entry_fill:.4f}")
 
+    # ── BROKER SL TOGGLE ──────────────────────────────────────────────────
+    # Entry fill state recorded above (for cover-side PnL) BEFORE this check.
+    if not STOP_LOSS_ENABLED:
+        log.info(f"[SIM:{symbol}] STOP_LOSS_ENABLED=False — no broker SL; "
+                 f"relying on QC cover webhook ({filled_qty}sh @ ${entry_fill:.4f})")
+        return
+
     s = sim_get_state(symbol)
     sl_pct = float(s.get("sl_pct") or DEFAULT_SL_PCT)
     if sl_pct <= 0:
@@ -2414,10 +2540,15 @@ def health():
         "ticker_aliases":    TICKER_ALIASES,
         "polygon_key":       POLYGON_API_KEY[:8] + "..." if POLYGON_API_KEY else "NOT SET",
         "twelvedata_key":    TWELVEDATA_API_KEY[:8] + "..." if TWELVEDATA_API_KEY else "NOT SET",
+        "stop_loss_enabled": STOP_LOSS_ENABLED,
         "config": {
             "max_locate_cost_pct": MAX_LOCATE_COST_PCT,
             "min_locate_quantity": MIN_LOCATE_QUANTITY,
             "locate_poll_timeout": LOCATE_POLL_TIMEOUT,
+            "locate_bp_usage":     LOCATE_BP_USAGE,
+            "locate_stepdown":     f"<1000sh: -100/step | >=1000sh: x{LOCATE_STEPDOWN_FACTOR} (max {LOCATE_MAX_ATTEMPTS})",
+            "stop_loss_enabled":   STOP_LOSS_ENABLED,
+            "default_sl_pct":      DEFAULT_SL_PCT,
             "price_handling":      "QC pre-buffered — server uses received price directly",
         },
     }
@@ -2829,6 +2960,9 @@ if __name__ == "__main__":
     log.info(f"  Max locate cost:   {MAX_LOCATE_COST_PCT*100:.1f}%")
     log.info(f"  Min locate qty:    {MIN_LOCATE_QUANTITY}")
     log.info(f"  Locate timeout:    {LOCATE_POLL_TIMEOUT}s")
+    log.info(f"  Locate BP usage:   {LOCATE_BP_USAGE*100:.0f}% of 1:1 BP (fresh locate sizing)")
+    log.info(f"  Locate stepdown:   <1000sh: -100/step | >=1000sh: x{LOCATE_STEPDOWN_FACTOR} (max {LOCATE_MAX_ATTEMPTS} attempts)")
+    log.info(f"  Stop-loss:         {'ENABLED — broker SL armed after each fill' if STOP_LOSS_ENABLED else 'DISABLED — relying on QC cover webhook only'}")
     log.info(f"  Price handling:    QC pre-buffered — server uses received price directly")
     log.info(f"  Listening on port: {port}")
     log.info("")
