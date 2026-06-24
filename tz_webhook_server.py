@@ -2621,6 +2621,9 @@ def webhook():
     # Optional SL pct from QC payload; falls back to DEFAULT_SL_PCT if absent.
     sl_pct_raw  = body.get("sl_pct")
     sl_pct      = float(sl_pct_raw) if sl_pct_raw is not None else DEFAULT_SL_PCT
+    # Ownership tag: which QC strategy sent this. Used to stamp owner on SHORT and
+    # to reject stray COVERs from a non-owning strategy. Empty → guards no-op.
+    strategy    = str(body.get("strategy") or body.get("slot") or "").lower()
 
     if not qc_symbol:
         return jsonify({"error": "missing symbol"}), 400
@@ -2652,14 +2655,17 @@ def webhook():
             return jsonify({"status": "ignored", "reason": "locate in progress"}), 200
 
         if current_state == "ACTIVE":
-            log.warning(f"[{symbol}] SHORT rejected — already have active position")
-            block(symbol, "duplicate SHORT received while ACTIVE")
-            return jsonify({"status": "rejected", "reason": "already active"}), 200
+            # SOFT-IGNORE: do NOT block() here. block() poisons the symbol so the
+            # holder's own later COVER gets ignored → orphaned position. Just drop
+            # the duplicate and leave the existing position/state fully intact.
+            log.info(f"[{symbol}] SHORT ignored — symbol busy (already ACTIVE); "
+                     f"leaving holder's position untouched")
+            return jsonify({"status": "ignored", "reason": "symbol busy (already active)"}), 200
 
         if quantity <= 0 or price <= 0:
             return jsonify({"error": "quantity and price required for SHORT"}), 400
 
-        set_state(symbol, state="LOCATING", entry_price=price, quantity=quantity, cycle=cycle, sl_pct=sl_pct)
+        set_state(symbol, state="LOCATING", entry_price=price, quantity=quantity, cycle=cycle, sl_pct=sl_pct, owner=strategy)
         threading.Thread(target=locate_and_short, args=(symbol, quantity, price), daemon=True).start()
         log.info(f"[{symbol}] Locate thread launched — returning 200 immediately")
         return jsonify({"status": "ok", "action": "SHORT", "symbol": symbol, "state": "LOCATING"}), 200
@@ -2683,6 +2689,16 @@ def webhook():
                 daemon=True
             ).start()
             return jsonify({"status": "ok", "action": "cleanup_on_cover_during_locate"}), 200
+
+        # OWNERSHIP GUARD: a skipped strategy's QC algo still fires a fire-and-forget
+        # COVER. If it isn't the strategy that opened this position, ignore it so it
+        # can't flatten the real holder. Empty owner/strategy → no-op (back-compat).
+        owner = s.get("owner")
+        if owner and strategy and strategy != owner:
+            log.info(f"[{symbol}] COVER ignored — strategy '{strategy}' is not owner "
+                     f"'{owner}'; leaving holder's position untouched")
+            return jsonify({"status": "ignored", "reason": "not position owner",
+                            "owner": owner, "strategy": strategy}), 200
 
         log.info(f"[{symbol}] COVER: looking up actual position size from TZ")
         position = get_position(symbol)
@@ -2715,7 +2731,7 @@ def webhook():
 
         try:
             result = place_order("Buy", symbol, cover_qty, cover_limit, "COVER_ORDER")
-            set_state(symbol, state="FLAT", reason="covered")
+            set_state(symbol, state="FLAT", reason="covered", owner=None)
             log.info(f"[{symbol}] COVER PLACED | qty={cover_qty} | limit=${cover_limit} | "
                      f"clientOrderId={result.get('clientOrderId')} | "
                      f"status={result.get('orderStatus')}")
@@ -2783,6 +2799,8 @@ def sim_webhook():
     # Optional SL pct from QC payload; falls back to DEFAULT_SL_PCT if absent.
     sl_pct_raw = body.get("sl_pct")
     sl_pct     = float(sl_pct_raw) if sl_pct_raw is not None else DEFAULT_SL_PCT
+    # Ownership tag (see real /webhook). Empty → guards no-op.
+    strategy   = str(body.get("strategy") or body.get("slot") or "").lower()
 
     if not qc_symbol:
         return jsonify({"error": "missing symbol"}), 400
@@ -2818,14 +2836,16 @@ def sim_webhook():
             return jsonify({"status": "ignored", "reason": "locate in progress", "mode": "sim"}), 200
 
         if current_state == "ACTIVE":
-            log.warning(f"[SIM:{symbol}] SHORT rejected — already active")
-            sim_block(symbol, "duplicate SHORT while ACTIVE")
-            return jsonify({"status": "rejected", "reason": "already active", "mode": "sim"}), 200
+            # SOFT-IGNORE (see real /webhook): never sim_block() on a duplicate —
+            # it would orphan the holder's position when its own COVER arrives.
+            log.info(f"[SIM:{symbol}] SHORT ignored — symbol busy (already ACTIVE); "
+                     f"leaving holder's position untouched")
+            return jsonify({"status": "ignored", "reason": "symbol busy (already active)", "mode": "sim"}), 200
 
         if quantity <= 0 or price <= 0:
             return jsonify({"error": "quantity and price required for SHORT"}), 400
 
-        sim_set_state(symbol, state="LOCATING", entry_price=price, quantity=quantity, cycle=cycle, sl_pct=sl_pct)
+        sim_set_state(symbol, state="LOCATING", entry_price=price, quantity=quantity, cycle=cycle, sl_pct=sl_pct, owner=strategy)
         threading.Thread(
             target=locate_and_short_sim, args=(symbol, quantity, price), daemon=True
         ).start()
@@ -2856,6 +2876,14 @@ def sim_webhook():
                 "status": "ok", "action": "cleanup_on_cover_during_locate", "mode": "sim"
             }), 200
 
+        # OWNERSHIP GUARD (see real /webhook)
+        owner = s.get("owner")
+        if owner and strategy and strategy != owner:
+            log.info(f"[SIM:{symbol}] COVER ignored — strategy '{strategy}' is not owner "
+                     f"'{owner}'; leaving holder's position untouched")
+            return jsonify({"status": "ignored", "reason": "not position owner",
+                            "owner": owner, "strategy": strategy, "mode": "sim"}), 200
+
         position = sim_get_position(symbol)
         if position is None:
             log.warning(f"[SIM:{symbol}] COVER: no sim position found")
@@ -2883,7 +2911,7 @@ def sim_webhook():
 
         try:
             result = sim_place_order("Buy", symbol, cover_qty, cover_limit, "SIM_COVER_ORDER")
-            sim_set_state(symbol, state="FLAT", reason="covered")
+            sim_set_state(symbol, state="FLAT", reason="covered", owner=None)
             log.info(f"[SIM:{symbol}] COVER PLACED | qty={cover_qty} | limit=${cover_limit} | "
                      f"clientOrderId={result.get('clientOrderId')} | "
                      f"status={result.get('orderStatus')} | "
