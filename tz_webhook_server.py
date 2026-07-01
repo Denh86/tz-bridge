@@ -52,7 +52,7 @@ from locate_logger import log_locate, log_rename
 # ══════════════════════════════════════════════════════════════════════════════
 BASE_URL             = "https://webapi.tradezero.com"
 ACCOUNT_ID           = "DHA41998"
-MAX_LOCATE_COST_PCT  = 0.2    # 10%  — reject if locatePrice / entryPrice > this
+MAX_LOCATE_COST_PCT  = 0.1    # 10%  — reject if locatePrice / entryPrice > this
 MIN_LOCATE_QUANTITY  = 100     # TZ minimum locate size
 MIN_SHORT_QUANTITY   = 1       # TZ minimum short order size (any size accepted)
 LOCATE_POLL_INTERVAL = 2       # seconds between locate status polls
