@@ -916,6 +916,13 @@ TICKER_ALIASES = {
     "FPGP": "ALTO",
     "AGE":  "SER",
     "HAPP": "PAVS",
+    "GTNR": "CLRO",
+    "IINN": "QTEX",
+    "SYTA": "CHAI",
+    "PHH":  "BYAH",
+    "DFFN": "CRVO",
+    "RMED": "VTAK",
+    "AGBA": "ILLR",
 }
 
 POLYGON_API_KEY = (os.getenv("POLYGON_API_KEY") or "").strip()
