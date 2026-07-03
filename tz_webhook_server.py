@@ -167,6 +167,29 @@ def block(symbol, reason):
     log.warning(f"[{symbol}] BLOCKED: {reason}")
 
 
+def try_begin_cover(symbol):
+    """Atomically claim the cover for `symbol` under the state lock.
+
+    Returns True if this caller won the claim (proceed to place the buy),
+    False if a cover is already in progress (caller must bail). This is the
+    fix for the double-buy: when two COVER webhooks for the same symbol arrive
+    together (e.g. two RSI sleeves L74+L80 on one ticker), only the first wins
+    the COVERING claim; the second is ignored, so exactly one buy is placed and
+    the position can't be over-covered into a long. The check-and-set must be
+    atomic (same lock acquisition), or two simultaneous covers both pass a
+    separate get_state()/set_state() and the race survives.
+    """
+    with state_lock:
+        st = symbol_state.get(symbol, {}).get("state")
+        if st == "COVERING":
+            return False
+        if symbol not in symbol_state:
+            symbol_state[symbol] = {"state": "FLAT"}
+        symbol_state[symbol]["state"] = "COVERING"
+    log.info(f"[{symbol}] STATE → COVERING")
+    return True
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # SIM ACCOUNT STATE MACHINE  (separate dict — never collides with real states)
 # ══════════════════════════════════════════════════════════════════════════════
@@ -192,6 +215,19 @@ def sim_block(symbol, reason):
     last_cycle = sim_symbol_state.get(symbol, {}).get("cycle", 0)
     sim_set_state(symbol, state="BLOCKED", reason=reason, cycle=last_cycle)
     log.warning(f"[SIM:{symbol}] BLOCKED: {reason}")
+
+
+def sim_try_begin_cover(symbol):
+    """Atomically claim the sim cover for `symbol` (see try_begin_cover)."""
+    with sim_state_lock:
+        st = sim_symbol_state.get(symbol, {}).get("state")
+        if st == "COVERING":
+            return False
+        if symbol not in sim_symbol_state:
+            sim_symbol_state[symbol] = {"state": "FLAT"}
+        sim_symbol_state[symbol]["state"] = "COVERING"
+    log.info(f"[SIM:{symbol}] STATE → COVERING")
+    return True
 
 
 def midnight_reset_thread():
@@ -616,14 +652,15 @@ def place_stop_order(account_id, headers_fn, symbol, quantity, trigger_price,
         "side":          "Buy",
         "securityType":  "Stock",
         "stopPrice":     round(trigger_price, 2),
-        "timeInForce":   "Day_Plus",
         "route":         route,
     }
     if limit_price is not None:
-        payload["orderType"]  = "StopLimit"
-        payload["limitPrice"] = round(limit_price, 2)
+        payload["orderType"]   = "StopLimit"
+        payload["limitPrice"]  = round(limit_price, 2)
+        payload["timeInForce"] = "Day_Plus"   # Stop-LMT IS Day+ eligible
     else:
-        payload["orderType"]  = "Stop"
+        payload["orderType"]   = "Stop"
+        payload["timeInForce"] = "Day"         # R135: a plain market Stop is NOT Day+ eligible (RTH only)
 
     url = f"{BASE_URL}/v1/api/accounts/{account_id}/order"
     log.info(f"  → {label} POST {url}")
@@ -2707,8 +2744,21 @@ def webhook():
             return jsonify({"status": "ignored", "reason": "not position owner",
                             "owner": owner, "strategy": strategy}), 200
 
+        # DOUBLE-BUY GUARD: atomically claim the cover. If another COVER for this
+        # symbol is already mid-flight (e.g. the second of two RSI sleeves on one
+        # ticker), bail here so exactly one buy is placed and we never over-cover
+        # the short into a long.
+        if not try_begin_cover(symbol):
+            log.info(f"[{symbol}] COVER ignored — cover already in progress")
+            return jsonify({"status": "ignored", "reason": "cover in progress"}), 200
+
         log.info(f"[{symbol}] COVER: looking up actual position size from TZ")
-        position = get_position(symbol)
+        try:
+            position = get_position(symbol)
+        except Exception as e:
+            log.error(f"[{symbol}] COVER position lookup failed: {e}")
+            set_state(symbol, state="ACTIVE", reason="cover lookup failed")  # un-claim
+            return jsonify({"error": str(e)}), 500
 
         if position is None:
             log.warning(f"[{symbol}] COVER: no TZ position found — entry may not have filled")
@@ -2758,6 +2808,7 @@ def webhook():
             }), 200
         except Exception as e:
             log.error(f"[{symbol}] Cover order failed: {e}")
+            set_state(symbol, state="ACTIVE", reason="cover failed")  # un-claim so a retry can proceed
             return jsonify({"error": str(e)}), 500
 
     # ── CANCEL ───────────────────────────────────────────────────────────────
@@ -2891,7 +2942,18 @@ def sim_webhook():
             return jsonify({"status": "ignored", "reason": "not position owner",
                             "owner": owner, "strategy": strategy, "mode": "sim"}), 200
 
-        position = sim_get_position(symbol)
+        # DOUBLE-BUY GUARD (see real /webhook)
+        if not sim_try_begin_cover(symbol):
+            log.info(f"[SIM:{symbol}] COVER ignored — cover already in progress")
+            return jsonify({"status": "ignored", "reason": "cover in progress", "mode": "sim"}), 200
+
+        try:
+            position = sim_get_position(symbol)
+        except Exception as e:
+            log.error(f"[SIM:{symbol}] COVER position lookup failed: {e}")
+            sim_set_state(symbol, state="ACTIVE", reason="cover lookup failed")  # un-claim
+            return jsonify({"error": str(e), "mode": "sim"}), 500
+
         if position is None:
             log.warning(f"[SIM:{symbol}] COVER: no sim position found")
             sim_block(symbol, "COVER received but no sim position found")
@@ -2941,7 +3003,8 @@ def sim_webhook():
             }), 200
         except Exception as e:
             log.error(f"[SIM:{symbol}] Cover order failed: {e}")
-            return jsonify({"error": str(e)}), 500
+            sim_set_state(symbol, state="ACTIVE", reason="cover failed")  # un-claim so a retry can proceed
+            return jsonify({"error": str(e), "mode": "sim"}), 500
 
     # ── CANCEL ───────────────────────────────────────────────────────────────
     elif action == "CANCEL":
