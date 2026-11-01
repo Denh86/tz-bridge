@@ -62,7 +62,10 @@ from locate_logger import log_locate, log_rename
 # ══════════════════════════════════════════════════════════════════════════════
 BASE_URL             = "https://webapi.tradezero.com"
 ACCOUNT_ID           = "DHA41998"
-MAX_LOCATE_COST_PCT  = 0.02    # 2%   — reject if locatePrice / entryPrice > this
+MAX_LOCATE_COST_PCT  = 0.02    # 2%   — REAL account: reject if locatePrice / entryPrice > this
+# SIM account only (phantom locate quote). Set env var SIM_MAX_LOCATE_COST_PCT in Render
+# to change it without a code edit, e.g. 0.05 = 5%. The real-account limit is unaffected.
+SIM_MAX_LOCATE_COST_PCT = float(os.getenv("SIM_MAX_LOCATE_COST_PCT", "0.05"))
 MIN_LOCATE_QUANTITY  = 100     # TZ minimum locate size
 MIN_SHORT_QUANTITY   = 1       # TZ minimum short order size (any size accepted)
 LOCATE_POLL_INTERVAL = 2       # seconds between locate status polls
@@ -1818,14 +1821,15 @@ def locate_and_short_sim(symbol, qc_quantity, entry_price):
                         f"[SIM:{symbol}] ║  Cost/share  :  ${locate_cost_per_share:.4f}  ({cost_pct:.3f}% of entry)\n"
                         f"[SIM:{symbol}] ║  Sim qty     :  {request_quantity} shares\n"
                         f"[SIM:{symbol}] ║  Extrap cost :  ${total_phantom_cost:.2f}  (cost/share × sim_qty)\n"
-                        f"[SIM:{symbol}] ║  Threshold   :  {MAX_LOCATE_COST_PCT*100:.1f}%  "
-                        f"→ {'✓ WITHIN' if cost_pct/100 <= MAX_LOCATE_COST_PCT else '✗ WOULD BLOCK'}\n"
+                        f"[SIM:{symbol}] ║  Threshold   :  {SIM_MAX_LOCATE_COST_PCT*100:.1f}%  "
+                        f"→ {'✓ WITHIN' if cost_pct/100 <= SIM_MAX_LOCATE_COST_PCT else '✗ WOULD BLOCK'}"
+                        f"{'  (REAL limit ' + format(MAX_LOCATE_COST_PCT*100, '.1f') + '% would BLOCK)' if cost_pct/100 > MAX_LOCATE_COST_PCT else ''}\n"
                         f"[SIM:{symbol}] ║  Action      :  NOT accepted (sim mode — expires naturally)\n"
                         f"[SIM:{symbol}] ╚══════════════════════════════════════════════════╝"
                     )
     
                     if entry_price > 0 and locate_cost_per_share > 0:
-                        if locate_cost_per_share / entry_price > MAX_LOCATE_COST_PCT:
+                        if locate_cost_per_share / entry_price > SIM_MAX_LOCATE_COST_PCT:
                             log_locate(symbol=symbol, entry_price=entry_price,
                                        shares_offered=request_quantity,
                                        locate_cost_per_share=locate_cost_per_share,
@@ -1833,14 +1837,14 @@ def locate_and_short_sim(symbol, qc_quantity, entry_price):
                                        outcome='REJECTED_BY_COST',
                                        trade_outcome='BLOCKED_NO_TRADE',
                                        notes=f"SIM | probed {probe_quantity}sh, extrap to sim {request_quantity}sh | "
-                                             f"{locate_cost_per_share / entry_price * 100:.2f}% > {MAX_LOCATE_COST_PCT * 100:.1f}%",
+                                             f"{locate_cost_per_share / entry_price * 100:.2f}% > {SIM_MAX_LOCATE_COST_PCT * 100:.1f}%",
                                        locate_type=locate_type_code,
                                        pre_borrow=pre_borrow_flag)
                             sim_block(
                                 symbol,
                                 f"phantom locate too expensive: "
                                 f"{locate_cost_per_share / entry_price * 100:.3f}% > "
-                                f"{MAX_LOCATE_COST_PCT * 100:.1f}% threshold"
+                                f"{SIM_MAX_LOCATE_COST_PCT * 100:.1f}% threshold"
                             )
                             return
                 else:
@@ -2896,6 +2900,7 @@ def health():
         "stop_loss_enabled": STOP_LOSS_ENABLED,
         "config": {
             "max_locate_cost_pct": MAX_LOCATE_COST_PCT,
+            "sim_max_locate_cost_pct": SIM_MAX_LOCATE_COST_PCT,
             "min_locate_quantity": MIN_LOCATE_QUANTITY,
             "locate_poll_timeout": LOCATE_POLL_TIMEOUT,
             "locate_bp_usage":     LOCATE_BP_USAGE,
@@ -3210,7 +3215,7 @@ if __name__ == "__main__":
     log.info(f"  Ticker aliases:    {TICKER_ALIASES}")
     log.info(f"  Polygon key:       {POLYGON_API_KEY[:8] + '...' if POLYGON_API_KEY else 'NOT SET'}")
     log.info(f"  Twelve Data key:   {TWELVEDATA_API_KEY[:8] + '...' if TWELVEDATA_API_KEY else 'NOT SET'}")
-    log.info(f"  Max locate cost:   {MAX_LOCATE_COST_PCT*100:.1f}%")
+    log.info(f"  Max locate cost:   {MAX_LOCATE_COST_PCT*100:.1f}% real | {SIM_MAX_LOCATE_COST_PCT*100:.1f}% sim")
     log.info(f"  Min locate qty:    {MIN_LOCATE_QUANTITY}")
     log.info(f"  Locate timeout:    {LOCATE_POLL_TIMEOUT}s")
     log.info(f"  Locate BP usage:   {LOCATE_BP_USAGE*100:.0f}% of 1:1 BP (fresh locate sizing)")
