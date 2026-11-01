@@ -12,8 +12,18 @@ SIGNAL FORMAT (from QC):
 SYMBOL STATES:
   FLAT      → ready, will accept SHORT
   LOCATING  → locate request in progress
-  ACTIVE    → short position placed, waiting for COVER
-  BLOCKED   → dead for the day, all signals ignored
+  ACTIVE    → short position placed, waiting for COVER (carried=True: still short
+              from an earlier session, waiting for QC's 04:00 / 09:30 COVER)
+  COVERING  → cover working; retried every COVER_FILL_TIMEOUT min until TZ shows no short
+  BLOCKED   → dead for the day, SHORT signals ignored (a COVER still closes a real short)
+
+DAILY CYCLE (America/New_York):
+  03:50  reset: clear FLAT/BLOCKED states (ACTIVE/COVERING/LOCATING kept);
+         cancel leftover bridge stops (SL_*) on tickers with no short
+  09:35  check: log MANUAL ACTION for any short that is carried or that the
+         bridge has no record of (logging only)
+  16:01  re-arm: ACTIVE shorts whose RTH Stop (Day TIF) expired at 16:00 get a
+         GTC_Plus StopLimit (active 04:00-20:00, carries into the next premarket)
 
 ENDPOINTS:
   POST /webhook          ← real account: SHORT / COVER / CANCEL
@@ -52,7 +62,7 @@ from locate_logger import log_locate, log_rename
 # ══════════════════════════════════════════════════════════════════════════════
 BASE_URL             = "https://webapi.tradezero.com"
 ACCOUNT_ID           = "DHA41998"
-MAX_LOCATE_COST_PCT  = 0.02    # 10%  — reject if locatePrice / entryPrice > this
+MAX_LOCATE_COST_PCT  = 0.02    # 2%   — reject if locatePrice / entryPrice > this
 MIN_LOCATE_QUANTITY  = 100     # TZ minimum locate size
 MIN_SHORT_QUANTITY   = 1       # TZ minimum short order size (any size accepted)
 LOCATE_POLL_INTERVAL = 2       # seconds between locate status polls
@@ -65,8 +75,18 @@ SHORT_FILL_TIMEOUT   = 5       # minutes to wait for short entry to fill before 
 PARTIAL_FILL_PATIENCE = 30     # seconds to wait for the rest after first partial fill
                                # then cancel leftover and arm stop on what filled
 STOP_FILL_POLL_INTERVAL = 5    # seconds between fill-status polls during entry monitoring
-COVER_FILL_TIMEOUT   = 3       # minutes to wait for cover to fill before retrying aggressively
-COVER_RETRY_BUFFER   = 0.005   # 0.5% above live price for aggressive cover retry
+COVER_FILL_TIMEOUT   = 3       # minutes between cover retries while the short is still open
+COVER_RETRY_BUFFER   = 0.005   # (legacy) 0.5% above live price — cancel/cleanup cover
+# Cover retries OUTSIDE RTH: limit = max(price x (1 + step), QC's cover limit), stepping
+# through these and then repeating the last. RTH retries are market orders.
+# price = TZ's own mark (/pnl exposure / shares); Yahoo/Twelve Data if unavailable.
+COVER_RETRY_STEPS    = (0.005, 0.02, 0.05)
+# Day_Plus orders live 04:00-20:00 ET. After this time an unfilled cover is handed
+# back to QC (state ACTIVE, carried=True) and QC's 04:00 COVER restarts it.
+COVER_LAST_RETRY_ET  = (19, 58)
+RESET_TIME_ET        = (3, 50)     # daily state reset (New York time)
+CARRY_CHECK_ET       = (9, 35)     # MANUAL ACTION check for carried / unknown shorts
+STOP_REARM_ET        = (16, 1)     # re-arm expired RTH stops as GTC_Plus StopLimit
 
 # ── BROKER STOP-LOSS (server-side protection against QC dead zones) ─────────
 # QC strategies emit 1-minute bars, so price can move 5-15% between bars on
@@ -74,10 +94,9 @@ COVER_RETRY_BUFFER   = 0.005   # 0.5% above live price for aggressive cover retr
 # a TZ-side stop order immediately after each short fill. When QC's TP/SL/EOD
 # cover signal arrives, the stop is cancelled before the cover is placed.
 #
-# QC strategies will eventually send an `sl_pct` field in the SHORT webhook;
-# until then, all strategies use a 10% stop. The bridge falls back to
-# DEFAULT_SL_PCT when no sl_pct is provided in the payload.
-DEFAULT_SL_PCT  = 0.22    # 20% adverse move on short positions (price up) — matches QC strategy SL pct
+# QC strategies send an `sl_pct` field in the SHORT webhook (VOL/EMA 0.12, BGS 0.20).
+# The bridge falls back to DEFAULT_SL_PCT only when a payload has no sl_pct.
+DEFAULT_SL_PCT  = 0.22    # 22% adverse move on short positions (price up) — fallback only
 SL_LIMIT_SLACK  = 0.02    # 2% slack on StopLimit ETH orders so they actually fill
 # Stop type by session: RTH uses Stop (market on trigger), ETH uses StopLimit
 # because TZ doesn't accept market orders outside RTH.
@@ -140,7 +159,7 @@ for _gunicorn_logger in ("gunicorn.access", "gunicorn.error", "werkzeug"):
     logging.getLogger(_gunicorn_logger).addFilter(_HealthCheckFilter())
 
 # ══════════════════════════════════════════════════════════════════════════════
-# REAL ACCOUNT STATE MACHINE  (reset at midnight)
+# REAL ACCOUNT STATE MACHINE  (reset daily at 03:50 New York time — see ny_scheduler_thread)
 # ══════════════════════════════════════════════════════════════════════════════
 symbol_state = {}
 state_lock   = threading.Lock()
@@ -228,23 +247,6 @@ def sim_try_begin_cover(symbol):
         sim_symbol_state[symbol]["state"] = "COVERING"
     log.info(f"[SIM:{symbol}] STATE → COVERING")
     return True
-
-
-def midnight_reset_thread():
-    global reset_date
-    while True:
-        time.sleep(30)
-        today = date.today()
-        if today != reset_date:
-            with state_lock:
-                symbol_state.clear()
-            with sim_state_lock:
-                sim_symbol_state.clear()
-            reset_date = today
-            log.info("MIDNIGHT RESET: all symbol states cleared (real + sim)")
-
-
-threading.Thread(target=midnight_reset_thread, daemon=True).start()
 
 
 def self_watchdog_thread():
@@ -414,7 +416,7 @@ def cancel_all_open_orders(symbol):
     return cancelled
 
 
-def place_order(side, symbol, quantity, limit_price, label="ORDER"):
+def place_order(side, symbol, quantity, limit_price, label="ORDER", decimals=2):
     client_id = f"QC_{side[:1].upper()}_{uuid.uuid4().hex[:8].upper()}"
     side_str = "Sell" if side.lower() == "sell" else "Buy"
     payload = {
@@ -424,7 +426,7 @@ def place_order(side, symbol, quantity, limit_price, label="ORDER"):
         "side":          side_str,
         "orderType":     "Limit",
         "securityType":  "Stock",
-        "limitPrice":    round(limit_price, 2),
+        "limitPrice":    round(limit_price, decimals),
         "timeInForce":   "Day_Plus",
         "route":         "SMART",
     }
@@ -494,7 +496,7 @@ def sim_cancel_all_open_orders(symbol):
     return cancelled
 
 
-def sim_place_order(side, symbol, quantity, limit_price, label="SIM_ORDER"):
+def sim_place_order(side, symbol, quantity, limit_price, label="SIM_ORDER", decimals=2):
     client_id = f"SIM_{side[:1].upper()}_{uuid.uuid4().hex[:8].upper()}"
     side_str  = "Sell" if side.lower() == "sell" else "Buy"
     payload = {
@@ -504,7 +506,7 @@ def sim_place_order(side, symbol, quantity, limit_price, label="SIM_ORDER"):
         "side":          side_str,
         "orderType":     "Limit",
         "securityType":  "Stock",
-        "limitPrice":    round(limit_price, 2),
+        "limitPrice":    round(limit_price, decimals),
         "timeInForce":   "Day_Plus",
         "route":         "SMART",
     }
@@ -635,7 +637,7 @@ def _compute_sl_prices(entry_fill, sl_pct):
 
 
 def place_stop_order(account_id, headers_fn, symbol, quantity, trigger_price,
-                     limit_price=None, label="STOP_ORDER", route="SMART"):
+                     limit_price=None, label="STOP_ORDER", route="SMART", tif=None):
     """Place a Buy Stop or StopLimit order to cover a short on adverse move.
     
     - If limit_price is None: places a Stop (market on trigger), only valid in RTH.
@@ -657,7 +659,10 @@ def place_stop_order(account_id, headers_fn, symbol, quantity, trigger_price,
     if limit_price is not None:
         payload["orderType"]   = "StopLimit"
         payload["limitPrice"]  = round(limit_price, 2)
-        payload["timeInForce"] = "Day_Plus"   # Stop-LMT IS Day+ eligible
+        # GTC_Plus: active 04:00-20:00 ET and carries into the next session, so a
+        # short held overnight is protected from the premarket open. Cancelled by the
+        # cover path; leftovers on flat tickers are swept at the 03:50 reset.
+        payload["timeInForce"] = tif or "GTC_Plus"
     else:
         payload["orderType"]   = "Stop"
         payload["timeInForce"] = "Day"         # R135: a plain market Stop is NOT Day+ eligible (RTH only)
@@ -1145,8 +1150,7 @@ def _get_yahoo_price(symbol):
 
 def get_live_price(symbol):
     import datetime as _dt
-    now_et = _dt.datetime.now(_dt.timezone.utc).astimezone(
-        _dt.timezone(_dt.timedelta(hours=-4)))
+    now_et = _dt.datetime.now(ZoneInfo("America/New_York"))
     t = now_et.time()
 
     rth_start = _dt.time(9, 30)
@@ -2090,102 +2094,6 @@ def _arm_real_stop_after_fill(symbol, filled_qty, entry_fill, source="full fill"
         log.warning(f"[{symbol}] BROKER SL FAILED to place — trade relies on QC-side SL only")
 
 
-def monitor_cover_fill(symbol, client_order_id, timeout_minutes):
-    import time as _time
-    deadline = _time.time() + timeout_minutes * 60
-    poll_interval = 15
-
-    log.info(f"[{symbol}] COVER MONITOR started | order={client_order_id} | timeout={timeout_minutes}min")
-
-    while _time.time() < deadline:
-        _time.sleep(poll_interval)
-
-        state = get_state(symbol).get("state")
-        if state == "FLAT":
-            log.info(f"[{symbol}] COVER MONITOR: already FLAT — done")
-            return
-
-        try:
-            r = tz_get(f"/v1/api/accounts/{ACCOUNT_ID}/orders", "COVER_MONITOR_ORDERS")
-            orders = r.json() if r.ok else []
-            if not isinstance(orders, list):
-                orders = orders.get("orders", [])
-            order = next((o for o in orders if o.get("clientOrderId") == client_order_id), None)
-            if order:
-                status = order.get("orderStatus", "")
-                executed = int(order.get("executed", 0))
-                log.info(f"[{symbol}] COVER MONITOR: status={status} executed={executed}")
-                if status in ("Filled",) or executed > 0:
-                    cover_fill = float(order.get("priceAvg") or order.get("lastPrice") or 0)
-                    order_fee  = float(order.get("orderFee") or 0)
-                    s = get_state(symbol)
-                    entry_fill = float(s.get("entry_fill_price") or s.get("entry_price") or 0)
-                    placed_qty = int(s.get("quantity") or executed or 0)
-                    locate_cps = float(s.get("locate_cost_per_share") or 0)
-                    pnl_pct = None
-                    if entry_fill > 0 and cover_fill > 0 and placed_qty > 0:
-                        gross = (entry_fill - cover_fill) * placed_qty
-                        net   = gross - (locate_cps * placed_qty) - order_fee
-                        pnl_pct = net / (entry_fill * placed_qty) * 100.0
-                    trade_oc = ('WIN' if (pnl_pct or 0) > 0
-                                else 'LOSS' if (pnl_pct or 0) < 0
-                                else 'UNKNOWN_PENDING')
-                    log_locate(symbol=symbol,
-                               entry_price=entry_fill,
-                               shares_offered=placed_qty,
-                               route='COVER',
-                               outcome='COVER_FILLED',
-                               trade_outcome=trade_oc,
-                               cover_fill_price=cover_fill,
-                               realized_pnl_pct=pnl_pct,
-                               notes=f"REAL | entry_fill=${entry_fill:.4f} cover_fill=${cover_fill:.4f} "
-                                     f"fee=${order_fee:.2f} locate=${locate_cps*placed_qty:.2f}")
-                    log.info(f"[{symbol}] COVER MONITOR: cover filled @ ${cover_fill:.4f} | "
-                             f"pnl={pnl_pct:.2f}% — done" if pnl_pct is not None
-                             else f"[{symbol}] COVER MONITOR: cover filled — done")
-                    set_state(symbol, state="FLAT", reason="cover filled (monitor confirmed)")
-                    return
-                if status in ("Canceled", "Rejected"):
-                    log.warning(f"[{symbol}] COVER MONITOR: cover {status} — will retry aggressively")
-                    break
-        except Exception as e:
-            log.warning(f"[{symbol}] COVER MONITOR: poll error — {e}")
-
-    log.warning(f"[{symbol}] COVER MONITOR: cover did not fill — cancelling and retrying aggressively")
-    cancel_all_open_orders(symbol)  # this also cancels any armed SL stop
-    set_state(symbol, sl_client_order_id=None)
-
-    position = get_position(symbol)
-    if not position or float(position.get("shares", 0)) >= 0:
-        log.info(f"[{symbol}] COVER MONITOR: no short position remaining — marking FLAT")
-        set_state(symbol, state="FLAT", reason="cover monitor: no position found on retry")
-        return
-
-    yahoo_price, yahoo_session = get_yahoo_price(symbol)
-    if yahoo_price:
-        aggressive_price = round(yahoo_price * (1 + COVER_RETRY_BUFFER), 2)
-        log.info(f"[{symbol}] COVER MONITOR: aggressive retry at ${aggressive_price}")
-    else:
-        priceClose = float(position.get("priceClose") or 0)
-        if priceClose > 0:
-            aggressive_price = round(priceClose * (1 + COVER_RETRY_BUFFER), 2)
-            log.warning(f"[{symbol}] COVER MONITOR: Yahoo unavailable — using priceClose fallback ${aggressive_price}")
-        else:
-            log.error(f"[{symbol}] COVER MONITOR: no price source — MANUAL ACTION REQUIRED")
-            block(symbol, "aggressive cover failed: no price source available — MANUAL ACTION REQUIRED")
-            return
-
-    cover_qty = abs(int(float(position.get("shares", 0))))
-    try:
-        result = place_order("Buy", symbol, cover_qty, aggressive_price, "COVER_AGGRESSIVE")
-        log.info(f"[{symbol}] COVER MONITOR: aggressive cover placed | "
-                 f"clientOrderId={result.get('clientOrderId')}")
-        set_state(symbol, state="FLAT", reason="aggressive cover placed")
-    except Exception as e:
-        log.error(f"[{symbol}] COVER MONITOR: aggressive cover FAILED: {e} — MANUAL ACTION REQUIRED")
-        block(symbol, "aggressive cover failed — MANUAL ACTION REQUIRED")
-
-
 def cancel_and_cleanup(symbol, reason):
     log.info(f"[{symbol}] CANCEL+CLEANUP: {reason}")
 
@@ -2196,21 +2104,22 @@ def cancel_and_cleanup(symbol, reason):
     position = get_position(symbol)
     if position:
         shares = float(position.get("shares", 0))
-        if shares < 0:
-            cover_qty   = abs(int(shares))
-            last_price = float(position.get("priceClose") or 0)
+        if _short_qty(position) > 0:
+            cover_qty   = _short_qty(position)
+            last_price, _src = _tz_mark_price(REAL, symbol, position)
+            last_price = last_price or 0
             if last_price <= 0:
                 yahoo_price, yahoo_session = get_yahoo_price(symbol)
                 if yahoo_price:
                     last_price = yahoo_price
-                    log.info(f"[{symbol}] priceClose=0, using Yahoo ${last_price} ({yahoo_session})")
+                    log.info(f"[{symbol}] TZ mark unavailable, using Yahoo ${last_price} ({yahoo_session})")
                 else:
                     log.error(f"[{symbol}] Cannot determine cover price — MANUAL ACTION REQUIRED")
-                    block(symbol, "cleanup: no priceClose and Yahoo unavailable — MANUAL ACTION REQUIRED")
+                    block(symbol, "cleanup: no TZ mark and Yahoo unavailable — MANUAL ACTION REQUIRED")
                     return
             cover_limit = round(last_price * 1.005, 2)
             log.info(f"[{symbol}] Found short position: {cover_qty} shares | "
-                     f"priceClose=${last_price} | covering at ${cover_limit}")
+                     f"price=${last_price} | covering at ${cover_limit}")
             try:
                 result = place_order("Buy", symbol, cover_qty, cover_limit, "COVER_ON_CANCEL")
                 log.info(f"[{symbol}] Cover placed: {result.get('clientOrderId')} "
@@ -2379,108 +2288,6 @@ def _arm_sim_stop_after_fill(symbol, filled_qty, entry_fill, source="full fill")
         log.warning(f"[SIM:{symbol}] BROKER SL FAILED to place — sim trade relies on QC-side SL only")
 
 
-def sim_monitor_cover_fill(symbol, client_order_id, timeout_minutes):
-    """Watch sim cover order until filled; retry aggressively if it stalls."""
-    deadline      = time.time() + timeout_minutes * 60
-    poll_interval = 15
-
-    log.info(f"[SIM:{symbol}] COVER MONITOR started | order={client_order_id} | "
-             f"timeout={timeout_minutes}min")
-
-    while time.time() < deadline:
-        time.sleep(poll_interval)
-
-        if sim_get_state(symbol).get("state") == "FLAT":
-            log.info(f"[SIM:{symbol}] COVER MONITOR: already FLAT — done")
-            return
-
-        try:
-            r = sim_tz_get(f"/v1/api/accounts/{SIM_ACCOUNT_ID}/orders", "SIM_COVER_MONITOR")
-            orders = r.json() if r.ok else []
-            if not isinstance(orders, list):
-                orders = orders.get("orders", [])
-            order = next(
-                (o for o in orders if o.get("clientOrderId") == client_order_id), None
-            )
-            if order:
-                status   = order.get("orderStatus", "")
-                executed = int(order.get("executed", 0))
-                log.info(f"[SIM:{symbol}] COVER MONITOR: status={status} executed={executed}")
-                if status == "Filled" or executed > 0:
-                    cover_fill = float(order.get("priceAvg") or order.get("lastPrice") or 0)
-                    order_fee  = float(order.get("orderFee") or 0)
-                    s            = sim_get_state(symbol)
-                    phantom_cost = float(s.get("phantom_locate_cost") or 0)
-                    locate_cps   = float(s.get("phantom_locate_cost_per_share") or 0)
-                    entry_fill   = float(s.get("entry_fill_price") or s.get("entry_price") or 0)
-                    placed_qty   = int(s.get("quantity") or executed or 0)
-                    pnl_pct = None
-                    if entry_fill > 0 and cover_fill > 0 and placed_qty > 0:
-                        gross = (entry_fill - cover_fill) * placed_qty
-                        net   = gross - phantom_cost - order_fee
-                        pnl_pct = net / (entry_fill * placed_qty) * 100.0
-                    trade_oc = ('WIN' if (pnl_pct or 0) > 0
-                                else 'LOSS' if (pnl_pct or 0) < 0
-                                else 'UNKNOWN_PENDING')
-                    log_locate(symbol=symbol,
-                               entry_price=entry_fill,
-                               shares_offered=placed_qty,
-                               route='COVER',
-                               outcome='COVER_FILLED',
-                               trade_outcome=trade_oc,
-                               cover_fill_price=cover_fill,
-                               realized_pnl_pct=pnl_pct,
-                               notes=f"SIM | entry_fill=${entry_fill:.4f} cover_fill=${cover_fill:.4f} "
-                                     f"fee=${order_fee:.2f} phantom_locate=${phantom_cost:.2f}")
-                    log.info(f"[SIM:{symbol}] COVER MONITOR: filled @ ${cover_fill:.4f} | "
-                             f"pnl={pnl_pct:.2f}% | phantom_locate_cost=${phantom_cost:.2f}" if pnl_pct is not None
-                             else f"[SIM:{symbol}] COVER MONITOR: filled ✓ | phantom_locate_cost=${phantom_cost:.2f}")
-                    sim_set_state(symbol, state="FLAT", reason="cover filled (sim monitor)")
-                    return
-                if status in ("Canceled", "Rejected"):
-                    log.warning(f"[SIM:{symbol}] COVER MONITOR: {status} — retrying aggressively")
-                    break
-        except Exception as e:
-            log.warning(f"[SIM:{symbol}] COVER MONITOR: poll error — {e}")
-
-    log.warning(f"[SIM:{symbol}] COVER MONITOR: retrying aggressively")
-    sim_cancel_all_open_orders(symbol)  # this also cancels any armed SL stop
-    sim_set_state(symbol, sl_client_order_id=None)
-
-    position = sim_get_position(symbol)
-    if not position or float(position.get("shares", 0)) >= 0:
-        log.info(f"[SIM:{symbol}] COVER MONITOR: no short remaining — marking FLAT")
-        sim_set_state(symbol, state="FLAT", reason="cover monitor: no position on retry")
-        return
-
-    yahoo_price, yahoo_session = get_yahoo_price(symbol)
-    if yahoo_price:
-        aggressive_price = round(yahoo_price * (1 + COVER_RETRY_BUFFER), 2)
-        log.info(f"[SIM:{symbol}] COVER MONITOR: aggressive retry at ${aggressive_price}")
-    else:
-        priceClose = float(position.get("priceClose") or 0)
-        if priceClose > 0:
-            aggressive_price = round(priceClose * (1 + COVER_RETRY_BUFFER), 2)
-            log.warning(f"[SIM:{symbol}] COVER MONITOR: Yahoo unavailable — "
-                        f"using priceClose fallback ${aggressive_price}")
-        else:
-            log.error(f"[SIM:{symbol}] COVER MONITOR: no price source — MANUAL ACTION REQUIRED")
-            sim_block(symbol, "SIM aggressive cover failed: no price source")
-            return
-
-    cover_qty = abs(int(float(position.get("shares", 0))))
-    try:
-        result = sim_place_order(
-            "Buy", symbol, cover_qty, aggressive_price, "SIM_COVER_AGGRESSIVE"
-        )
-        log.info(f"[SIM:{symbol}] COVER MONITOR: aggressive cover placed | "
-                 f"clientOrderId={result.get('clientOrderId')}")
-        sim_set_state(symbol, state="FLAT", reason="SIM aggressive cover placed")
-    except Exception as e:
-        log.error(f"[SIM:{symbol}] COVER MONITOR: aggressive cover FAILED: {e}")
-        sim_block(symbol, "SIM aggressive cover failed — MANUAL ACTION REQUIRED")
-
-
 def sim_cancel_and_cleanup(symbol, reason):
     log.info(f"[SIM:{symbol}] CANCEL+CLEANUP: {reason}")
 
@@ -2491,14 +2298,15 @@ def sim_cancel_and_cleanup(symbol, reason):
     position = sim_get_position(symbol)
     if position:
         shares = float(position.get("shares", 0))
-        if shares < 0:
-            cover_qty  = abs(int(shares))
-            last_price = float(position.get("priceClose") or 0)
+        if _short_qty(position) > 0:
+            cover_qty  = _short_qty(position)
+            last_price, _src = _tz_mark_price(SIM, symbol, position)
+            last_price = last_price or 0
             if last_price <= 0:
                 yahoo_price, yahoo_session = get_yahoo_price(symbol)
                 if yahoo_price:
                     last_price = yahoo_price
-                    log.info(f"[SIM:{symbol}] priceClose=0, using Yahoo ${last_price}")
+                    log.info(f"[SIM:{symbol}] TZ mark unavailable, using Yahoo ${last_price}")
                 else:
                     log.error(f"[SIM:{symbol}] Cannot determine cover price — MANUAL ACTION REQUIRED")
                     sim_block(symbol, "SIM cleanup: no price source — MANUAL ACTION REQUIRED")
@@ -2515,6 +2323,507 @@ def sim_cancel_and_cleanup(symbol, reason):
         log.info(f"[SIM:{symbol}] No sim position found")
 
     sim_block(symbol, reason)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# COVER UNTIL FLAT + NEW YORK DAILY CYCLE  (real + sim share this code)
+# ══════════════════════════════════════════════════════════════════════════════
+import math as _math
+from datetime import datetime as _datetime, time as _dtime
+
+NY = ZoneInfo("America/New_York")
+
+
+class _Acct:
+    """Everything the shared cover / schedule code needs for one account."""
+    def __init__(self, name, is_sim, acct_id, headers, get_fn, post_fn,
+                 get_st, set_st, blk, claim, states, lock,
+                 position, cancel_all, place, place_stop):
+        self.name, self.is_sim = name, is_sim
+        self.acct_id, self.headers = acct_id, headers
+        self.get_fn, self.post_fn = get_fn, post_fn
+        self.get_state, self.set_state, self.block, self.claim = get_st, set_st, blk, claim
+        self.states, self.lock = states, lock
+        self.position, self.cancel_all, self.place, self.place_stop = position, cancel_all, place, place_stop
+        self.pfx = "SIM:" if is_sim else ""
+
+    def tag(self, symbol):
+        return f"[{self.pfx}{symbol}]"
+
+
+REAL = _Acct("REAL", False, lambda: ACCOUNT_ID, tz_headers, tz_get, tz_post,
+             get_state, set_state, block, try_begin_cover,
+             lambda: symbol_state, state_lock,
+             get_position, cancel_all_open_orders, place_order, place_real_stop)
+SIM = _Acct("SIM", True, lambda: SIM_ACCOUNT_ID, sim_headers, sim_tz_get, sim_tz_post,
+            sim_get_state, sim_set_state, sim_block, sim_try_begin_cover,
+            lambda: sim_symbol_state, sim_state_lock,
+            sim_get_position, sim_cancel_all_open_orders, sim_place_order, place_sim_stop)
+
+OPEN_ORDER_STATUSES = {"PendingNew", "New", "PartiallyFilled", "Submitted"}
+
+
+def _now_et():
+    return _datetime.now(NY)
+
+
+def _short_qty(position):
+    """Shares short in a TZ position row (0 if none / long). Handles both a negative
+    share count and a positive count with side='Short'."""
+    if not position:
+        return 0
+    try:
+        sh = float(position.get("shares", 0) or 0)
+    except (TypeError, ValueError):
+        return 0
+    if sh < 0:
+        return int(abs(sh))
+    if sh > 0 and str(position.get("side", "")).lower() == "short":
+        return int(sh)
+    return 0
+
+
+def _cover_px(p):
+    """Buy limit in whole cents, rounded UP (never down), so rounding can't leave a
+    cover below the price it was meant to cross. Returns (price, decimals)."""
+    return _math.ceil(p * 100 - 1e-9) / 100, 2
+
+
+def _in_day_plus_window(now=None):
+    t = (now or _now_et()).time()
+    return _dtime(4, 0) <= t < _dtime(*COVER_LAST_RETRY_ET)
+
+
+def _tz_mark_price(A, symbol, position):
+    """TZ's own current price for a held position: /pnl exposure ÷ shares.
+    exposure = 'absolute market value of the position right now' (TZ docs).
+    Returns (price, source) or (None, None)."""
+    try:
+        qty = _short_qty(position) or abs(int(float((position or {}).get("shares", 0) or 0)))
+        if qty <= 0:
+            return None, None
+        r = A.get_fn(f"/v1/api/accounts/{A.acct_id()}/pnl", "PNL")
+        if not r.ok:
+            return None, None
+        rows = r.json().get("pnl", []) or []
+        pid = str((position or {}).get("positionId", "") or "")
+        row = next((x for x in rows if pid and str(x.get("positionId", "")) == pid), None)
+        if row is None:
+            row = next((x for x in rows if str(x.get("symbol", "")).upper() == symbol.upper()), None)
+        if row is None:
+            return None, None
+        exposure = abs(float(row.get("exposure") or 0))
+        if exposure <= 0:
+            return None, None
+        px = exposure / qty
+        log.info(f"{A.tag(symbol)} TZ mark: exposure=${exposure:,.2f} / {qty}sh = ${px:.4f}")
+        return px, "tz_pnl"
+    except Exception as e:
+        log.warning(f"{A.tag(symbol)} TZ mark price failed: {e}")
+        return None, None
+
+
+def _cover_ref_price(A, symbol, position):
+    """Price to step the cover limit from: TZ mark first, Yahoo/Twelve Data fallback."""
+    px, src = _tz_mark_price(A, symbol, position)
+    if px:
+        return px, src
+    px, src = get_live_price(symbol)
+    return (px, src) if px else (None, None)
+
+
+def place_market(A, symbol, quantity, label="COVER_MARKET"):
+    """Market buy (RTH only: TZ accepts Market with Day TIF 09:30-16:00 ET)."""
+    client_id = f"{'SIM' if A.is_sim else 'QC'}_B_{uuid.uuid4().hex[:8].upper()}"
+    payload = {
+        "clientOrderId": client_id,
+        "symbol":        symbol,
+        "orderQuantity": int(quantity),
+        "side":          "Buy",
+        "orderType":     "Market",
+        "securityType":  "Stock",
+        "timeInForce":   "Day",
+        "route":         "SMART",
+    }
+    r = A.post_fn(f"/v1/api/accounts/{A.acct_id()}/order", payload, label)
+    if not r.ok:
+        log.error(f"  {A.tag(symbol)} Market order FAILED {r.status_code} — body: {r.text[:500]}")
+        r.raise_for_status()
+    data = r.json()
+    log.info(f"  {A.tag(symbol)} Market order placed: clientOrderId={data.get('clientOrderId')} "
+             f"status={data.get('orderStatus')}")
+    return data
+
+
+def _place_cover(A, symbol, qty, ref_price, label):
+    """RTH → market. Otherwise a Day_Plus limit at ref_price (rounded up to a tick)."""
+    if _is_rth_now():
+        return place_market(A, symbol, qty, label + "_MKT"), "market"
+    if not ref_price or ref_price <= 0:
+        raise ValueError("no limit price outside RTH")
+    px, dec = _cover_px(ref_price)
+    return A.place("Buy", symbol, qty, px, label, decimals=dec), f"limit ${px}"
+
+
+def _list_orders(A):
+    r = A.get_fn(f"/v1/api/accounts/{A.acct_id()}/orders", "ORDERS")
+    if not r.ok:
+        return []
+    o = r.json()
+    return o if isinstance(o, list) else o.get("orders", [])
+
+
+def _list_positions(A):
+    r = A.get_fn(f"/v1/api/accounts/{A.acct_id()}/positions", "POSITIONS")
+    if not r.ok:
+        return None
+    p = r.json()
+    return p if isinstance(p, list) else p.get("positions", [])
+
+
+def _log_cover_fill(A, symbol, order_ids):
+    """Cover complete: log the realised P&L (same sheet fields as before)."""
+    try:
+        orders = [o for o in _list_orders(A) if o.get("clientOrderId") in set(order_ids)]
+        filled = [(int(o.get("executed", 0) or 0), float(o.get("priceAvg") or o.get("lastPrice") or 0),
+                   float(o.get("orderFee") or 0)) for o in orders]
+        filled = [f for f in filled if f[0] > 0 and f[1] > 0]
+        ex = sum(f[0] for f in filled)
+        cover_fill = sum(f[0] * f[1] for f in filled) / ex if ex else 0.0
+        fee = sum(f[2] for f in filled)
+        s = A.get_state(symbol)
+        entry_fill = float(s.get("entry_fill_price") or s.get("entry_price") or 0)
+        qty = int(s.get("quantity") or ex or 0)
+        if A.is_sim:
+            locate_cost = float(s.get("phantom_locate_cost") or 0)
+        else:
+            locate_cost = float(s.get("locate_cost_per_share") or 0) * qty
+        pnl_pct = None
+        if entry_fill > 0 and cover_fill > 0 and qty > 0:
+            net = (entry_fill - cover_fill) * qty - locate_cost - fee
+            pnl_pct = net / (entry_fill * qty) * 100.0
+        trade_oc = 'WIN' if (pnl_pct or 0) > 0 else 'LOSS' if (pnl_pct or 0) < 0 else 'UNKNOWN_PENDING'
+        log_locate(symbol=symbol, entry_price=entry_fill, shares_offered=qty, route='COVER',
+                   outcome='COVER_FILLED', trade_outcome=trade_oc, cover_fill_price=cover_fill,
+                   realized_pnl_pct=pnl_pct,
+                   notes=f"{A.name} | entry_fill=${entry_fill:.4f} cover_fill=${cover_fill:.4f} "
+                         f"fee=${fee:.2f} locate=${locate_cost:.2f} orders={len(filled)}")
+        log.info(f"{A.tag(symbol)} COVER DONE — flat @ avg ${cover_fill:.4f}"
+                 + (f" | pnl={pnl_pct:.2f}%" if pnl_pct is not None else ""))
+    except Exception as e:
+        log.warning(f"{A.tag(symbol)} cover fill logging failed: {e}")
+
+
+def _arm_carried_stop(A, symbol, qty):
+    """A short left open at 20:00: GTC_Plus StopLimit at the original stop level, so it
+    is protected from the 04:00 premarket even if QC's COVER doesn't arrive."""
+    if not STOP_LOSS_ENABLED or qty <= 0:
+        return
+    s = A.get_state(symbol)
+    entry = float(s.get("entry_fill_price") or s.get("entry_price") or 0)
+    sl_pct = float(s.get("sl_pct") or DEFAULT_SL_PCT)
+    if entry <= 0 or sl_pct <= 0:
+        return
+    trigger, limit = _compute_sl_prices(entry, sl_pct)
+    res = place_stop_order(A.acct_id(), A.headers, symbol, qty, trigger, limit_price=limit,
+                           label=f"{A.name}_CARRY_STOP", tif="GTC_Plus")
+    if res:
+        A.set_state(symbol, sl_client_order_id=res.get("clientOrderId"))
+        log.info(f"{A.tag(symbol)} CARRY STOP armed (GTC_Plus) trigger=${trigger} limit=${limit}")
+
+
+def handle_cover(A, symbol, qc_price, strategy):
+    """COVER webhook (any state except LOCATING, which the caller handles).
+    Returns (json_dict, http_code)."""
+    s = A.get_state(symbol)
+    current = s.get("state", "FLAT")
+
+    if current == "COVERING":
+        log.info(f"{A.tag(symbol)} COVER ignored — cover already working")
+        return {"status": "ignored", "reason": "cover in progress"}, 200
+
+    if current in ("FLAT", "BLOCKED"):
+        # The bridge has no live record (e.g. after a reset, or blocked) — trust TZ.
+        try:
+            pos = A.position(symbol)
+        except Exception as e:
+            log.error(f"{A.tag(symbol)} COVER position lookup failed: {e}")
+            return {"error": str(e)}, 500
+        if _short_qty(pos) <= 0:
+            log.info(f"{A.tag(symbol)} COVER ignored — state {current} and no TZ short (not blocking)")
+            return {"status": "ignored", "reason": "no short position"}, 200
+        log.warning(f"{A.tag(symbol)} COVER on state {current} but TZ shows {_short_qty(pos)}sh short — covering")
+    else:
+        # OWNERSHIP GUARD: only the strategy that opened the position may cover it.
+        owner = s.get("owner")
+        if owner and strategy and strategy != owner:
+            log.info(f"{A.tag(symbol)} COVER ignored — strategy '{strategy}' is not owner '{owner}'")
+            return {"status": "ignored", "reason": "not position owner",
+                    "owner": owner, "strategy": strategy}, 200
+
+    # DOUBLE-BUY GUARD: atomically claim the cover.
+    if not A.claim(symbol):
+        log.info(f"{A.tag(symbol)} COVER ignored — cover already in progress")
+        return {"status": "ignored", "reason": "cover in progress"}, 200
+
+    try:
+        pos = A.position(symbol)
+    except Exception as e:
+        log.error(f"{A.tag(symbol)} COVER position lookup failed: {e}")
+        A.set_state(symbol, state=current, reason="cover lookup failed")   # un-claim
+        return {"error": str(e)}, 500
+
+    qty = _short_qty(pos)
+    if qty <= 0:
+        log.warning(f"{A.tag(symbol)} COVER: no TZ short found — marking FLAT (not blocking)")
+        A.set_state(symbol, state="FLAT", reason="cover: no short found", owner=None, carried=False)
+        return {"status": "ok", "note": "no short position"}, 200
+
+    stop_id = A.get_state(symbol).get("sl_client_order_id")
+    if stop_id:
+        cancel_stop_order(A.acct_id(), A.headers, symbol, stop_id, f"{A.name}_STOP_CANCEL")
+        A.set_state(symbol, sl_client_order_id=None)
+
+    qc_price = float(qc_price or 0)
+    ref = qc_price
+    if ref <= 0:
+        ref, _src = _cover_ref_price(A, symbol, pos)
+        ref = (ref or 0) * (1 + COVER_RETRY_STEPS[0])
+    if ref <= 0:
+        log.error(f"{A.tag(symbol)} COVER: no price available — retry loop will keep trying")
+    try:
+        if ref > 0:
+            px, dec = _cover_px(ref)           # first cover: limit at QC's price (all sessions)
+            result = A.place("Buy", symbol, qty, px, "COVER_ORDER", decimals=dec)
+            how, cid = f"limit ${px}", result.get("clientOrderId")
+        else:
+            result, how, cid = {}, "deferred (no price)", None
+        A.set_state(symbol, state="COVERING", carried=False, reason="cover working",
+                    cover_started=time.time())
+        log.info(f"{A.tag(symbol)} COVER PLACED | qty={qty} | {how} | qc_price=${qc_price} | clientOrderId={cid}")
+        threading.Thread(target=cover_until_flat,
+                         args=(A, symbol, [cid] if cid else [], qc_price, _is_rth_now(), bool(cid)),
+                         daemon=True).start()
+        return {"status": "ok", "action": "COVER", "symbol": symbol, "quantity": qty,
+                "order": how, "clientOrderId": cid,
+                "orderStatus": result.get("orderStatus")}, 200
+    except Exception as e:
+        log.error(f"{A.tag(symbol)} Cover order failed: {e}")
+        A.set_state(symbol, state="ACTIVE", reason="cover failed")   # un-claim so QC's next COVER retries
+        return {"error": str(e)}, 500
+
+
+def cover_until_flat(A, symbol, order_ids, qc_price, placed_in_rth, placed=True):
+    """Keep covering until TZ shows no short.
+      * every 15 s: flat? → log fill, state FLAT, done.
+      * every COVER_FILL_TIMEOUT min (or at once when RTH opens): cancel and replace —
+        market in RTH; outside RTH a limit at max(price x (1+step), QC's limit),
+        stepping through COVER_RETRY_STEPS (price = TZ mark, Yahoo fallback).
+      * past COVER_LAST_RETRY_ET (Day_Plus ends 20:00): cancel, mark ACTIVE carried=True,
+        arm a GTC_Plus stop, and wait for QC's 04:00 COVER.
+    """
+    tag = A.tag(symbol)
+    step = 0
+    last_place = time.time() if placed else 0.0
+    last_rth = placed_in_rth
+    log.info(f"{tag} COVER LOOP started | orders={order_ids} | qc_price=${qc_price}")
+    while True:
+        time.sleep(15)
+        st = A.get_state(symbol).get("state")
+        if st != "COVERING":
+            log.info(f"{tag} COVER LOOP: state={st} — stopping")
+            return
+        try:
+            pos = A.position(symbol)
+        except Exception as e:
+            log.warning(f"{tag} COVER LOOP: position lookup failed: {e}")
+            continue
+        qty = _short_qty(pos)
+        if qty <= 0:
+            _log_cover_fill(A, symbol, order_ids)
+            A.set_state(symbol, state="FLAT", reason="cover filled", owner=None, carried=False)
+            return
+
+        now = _now_et()
+        rth = _is_rth_now()
+        if not rth and not _in_day_plus_window(now):
+            try:
+                A.cancel_all(symbol)
+            except Exception as e:
+                log.warning(f"{tag} COVER LOOP: cancel failed: {e}")
+            # A cover can fill in the moments before the cancel lands. Re-read the
+            # position so the carry stop is sized to what is really still short (and
+            # not placed at all if the cover filled) — a buy stop on a flat ticker would
+            # open a LONG. Leftovers are also swept at the 03:50 reset.
+            time.sleep(5)
+            try:
+                qty = _short_qty(A.position(symbol))
+            except Exception as e:
+                log.warning(f"{tag} COVER LOOP: re-read failed ({e}) — no carry stop placed")
+                qty = -1
+            if qty == 0:
+                _log_cover_fill(A, symbol, order_ids)
+                A.set_state(symbol, state="FLAT", reason="cover filled at session end", owner=None, carried=False)
+                return
+            A.set_state(symbol, state="ACTIVE", carried=True,
+                        reason="cover unfilled at session end — carried; waiting for QC COVER")
+            log.warning(f"{tag} COVER LOOP: still {qty}sh short at {now.strftime('%H:%M')} ET — "
+                        f"CARRIED to next session (QC re-sends COVER at 04:00 / 09:30)")
+            if qty > 0:
+                _arm_carried_stop(A, symbol, qty)
+            return
+
+        due = (time.time() - last_place >= COVER_FILL_TIMEOUT * 60) or (rth and not last_rth)
+        if not due:
+            continue
+
+        try:
+            A.cancel_all(symbol)          # the working cover (and any stop)
+            time.sleep(2)
+            pos = A.position(symbol)
+            qty = _short_qty(pos)
+            if qty <= 0:
+                continue                  # filled while cancelling; next pass logs it
+            if rth:
+                res, how = _place_cover(A, symbol, qty, 0, "COVER_RETRY")
+            else:
+                px, src = _cover_ref_price(A, symbol, pos)
+                stepv = COVER_RETRY_STEPS[min(step, len(COVER_RETRY_STEPS) - 1)]
+                target = max((px or 0) * (1 + stepv), float(qc_price or 0))
+                if target <= 0:
+                    log.error(f"{tag} COVER LOOP: no price source — MANUAL ACTION REQUIRED (will retry)")
+                    last_place = time.time()
+                    continue
+                res, how = _place_cover(A, symbol, qty, target, "COVER_RETRY")
+                log.info(f"{tag} COVER RETRY {step + 1}: ref ${px or 0:.4f} ({src}) +{stepv*100:.1f}% "
+                         f"| QC floor ${float(qc_price or 0):.4f}")
+                step += 1
+            if res.get("clientOrderId"):
+                order_ids.append(res.get("clientOrderId"))
+            last_place, last_rth = time.time(), rth
+            log.info(f"{tag} COVER RETRY placed | {qty}sh | {how}")
+        except Exception as e:
+            log.error(f"{tag} COVER RETRY failed: {e} — will retry")
+            last_place = time.time()
+
+
+# ── scheduled jobs (New York time) ──────────────────────────────────────────
+def _daily_reset(A):
+    keep = {"ACTIVE", "COVERING", "LOCATING"}
+    with A.lock:
+        states = A.states()
+        dropped = [k for k, v in states.items() if v.get("state") not in keep]
+        for k in dropped:
+            states.pop(k, None)
+        kept = {k: v.get("state") for k, v in states.items()}
+    log.info(f"[{A.name}] DAILY RESET 03:50 ET: cleared {len(dropped)} | kept {kept}")
+    # leftover bridge stops (SL_*) on tickers with no short → cancel
+    try:
+        positions = _list_positions(A)
+        if positions is None:
+            log.warning(f"[{A.name}] RESET: positions unavailable — stop sweep skipped")
+            return
+        shorts = {str(p.get("symbol", "")).upper() for p in positions if _short_qty(p) > 0}
+        for o in _list_orders(A):
+            cid = str(o.get("clientOrderId", ""))
+            if (cid.startswith("SL_") and o.get("orderStatus", "") in OPEN_ORDER_STATUSES
+                    and str(o.get("symbol", "")).upper() not in shorts):
+                sym = str(o.get("symbol", "")).upper()
+                cancel_stop_order(A.acct_id(), A.headers, sym, cid, f"{A.name}_ORPHAN_STOP_CANCEL")
+                log.warning(f"[{A.name}] RESET: cancelled leftover stop {cid} on {sym} (no short)")
+    except Exception as e:
+        log.warning(f"[{A.name}] RESET stop sweep failed: {e}")
+
+
+def _carry_check(A):
+    """09:35 ET — logging only."""
+    try:
+        positions = _list_positions(A) or []
+    except Exception as e:
+        log.warning(f"[{A.name}] CARRY CHECK: positions unavailable: {e}")
+        return
+    with A.lock:
+        states = {k: dict(v) for k, v in A.states().items()}
+    for p in positions:
+        q = _short_qty(p)
+        if q <= 0:
+            continue
+        sym = str(p.get("symbol", "")).upper()
+        st = states.get(sym, {})
+        if st.get("carried"):
+            log.error(f"[{A.pfx}{sym}] MANUAL ACTION: {q}sh short carried from an earlier session "
+                      f"is still open at 09:35 ET (state={st.get('state')})")
+        elif st.get("state") not in ("ACTIVE", "COVERING", "LOCATING"):
+            log.error(f"[{A.pfx}{sym}] MANUAL ACTION: {q}sh short on TZ that the bridge has no "
+                      f"record of (state={st.get('state', 'none')})")
+
+
+def _rearm_stops(A):
+    """16:01 ET — RTH stops are Stop/Day and expired at 16:00. Re-arm every ACTIVE short
+    without a live stop as a GTC_Plus StopLimit at the original stop level."""
+    if not STOP_LOSS_ENABLED:
+        return
+    try:
+        open_ids = {str(o.get("clientOrderId")) for o in _list_orders(A)
+                    if o.get("orderStatus", "") in OPEN_ORDER_STATUSES}
+    except Exception as e:
+        log.warning(f"[{A.name}] STOP RE-ARM: orders unavailable: {e}")
+        return
+    with A.lock:
+        active = {k: dict(v) for k, v in A.states().items() if v.get("state") == "ACTIVE"}
+    for sym, st in active.items():
+        sid = st.get("sl_client_order_id")
+        if sid and str(sid) in open_ids:
+            continue                      # an ETH StopLimit (GTC_Plus) is still working
+        entry = float(st.get("entry_fill_price") or 0)
+        sl_pct = float(st.get("sl_pct") or DEFAULT_SL_PCT)
+        if entry <= 0 or sl_pct <= 0:
+            continue
+        try:
+            qty = _short_qty(A.position(sym))
+        except Exception:
+            qty = 0
+        if qty <= 0:
+            continue
+        trigger, limit = _compute_sl_prices(entry, sl_pct)
+        res = place_stop_order(A.acct_id(), A.headers, sym, qty, trigger, limit_price=limit,
+                               label=f"{A.name}_STOP_REARM", tif="GTC_Plus")
+        if res:
+            A.set_state(sym, sl_client_order_id=res.get("clientOrderId"))
+            log.info(f"[{A.pfx}{sym}] STOP RE-ARMED 16:01 (GTC_Plus) trigger=${trigger} limit=${limit}")
+        else:
+            log.warning(f"[{A.pfx}{sym}] STOP RE-ARM FAILED — position relies on QC-side SL")
+
+
+def ny_scheduler_thread():
+    """Runs the New York-time jobs once per day each (replaces the midnight-UTC reset)."""
+    jobs = [  # (name, (h, m), weekdays_only, fn)
+        ("reset",   RESET_TIME_ET,  False, _daily_reset),
+        ("check",   CARRY_CHECK_ET, True,  _carry_check),
+        ("rearm",   STOP_REARM_ET,  True,  _rearm_stops),
+    ]
+    now = _now_et()
+    # On startup, treat jobs whose time already passed today as done (no surprise reset).
+    done = {name: (now.date() if now.time() >= _dtime(*hm) else None) for name, hm, _w, _f in jobs}
+    log.info(f"NY SCHEDULER started at {now.strftime('%Y-%m-%d %H:%M')} ET | "
+             f"reset {RESET_TIME_ET} check {CARRY_CHECK_ET} rearm {STOP_REARM_ET}")
+    while True:
+        time.sleep(20)
+        now = _now_et()
+        for name, hm, weekdays_only, fn in jobs:
+            if done.get(name) == now.date() or now.time() < _dtime(*hm):
+                continue
+            done[name] = now.date()
+            if weekdays_only and now.weekday() >= 5:
+                continue
+            for A in ((REAL,) + ((SIM,) if SIM_API_KEY and SIM_ACCOUNT_ID else ())):
+                try:
+                    fn(A)
+                except Exception as e:
+                    log.error(f"[{A.name}] scheduled job '{name}' failed: {e}")
+
+
+threading.Thread(target=ny_scheduler_thread, daemon=True).start()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2698,6 +3007,10 @@ def webhook():
             log.warning(f"[{symbol}] SHORT ignored — locate already in progress")
             return jsonify({"status": "ignored", "reason": "locate in progress"}), 200
 
+        if current_state == "COVERING":
+            log.info(f"[{symbol}] SHORT ignored — cover still working on this ticker")
+            return jsonify({"status": "ignored", "reason": "cover in progress"}), 200
+
         if current_state == "ACTIVE":
             # SOFT-IGNORE: do NOT block() here. block() poisons the symbol so the
             # holder's own later COVER gets ignored → orphaned position. Just drop
@@ -2716,15 +3029,6 @@ def webhook():
 
     # ── COVER ────────────────────────────────────────────────────────────────
     elif action == "COVER":
-        if current_state == "BLOCKED":
-            log.info(f"[{symbol}] COVER ignored — blocked today: {s.get('reason', '')}")
-            return jsonify({"status": "ignored", "reason": "blocked"}), 200
-
-        if current_state == "FLAT":
-            log.warning(f"[{symbol}] COVER rejected — no position to cover (FLAT)")
-            block(symbol, "COVER received with no active position")
-            return jsonify({"status": "rejected", "reason": "no position"}), 200
-
         if current_state == "LOCATING":
             log.warning(f"[{symbol}] COVER received during locate — cancelling and cleaning up")
             threading.Thread(
@@ -2733,83 +3037,8 @@ def webhook():
                 daemon=True
             ).start()
             return jsonify({"status": "ok", "action": "cleanup_on_cover_during_locate"}), 200
-
-        # OWNERSHIP GUARD: a skipped strategy's QC algo still fires a fire-and-forget
-        # COVER. If it isn't the strategy that opened this position, ignore it so it
-        # can't flatten the real holder. Empty owner/strategy → no-op (back-compat).
-        owner = s.get("owner")
-        if owner and strategy and strategy != owner:
-            log.info(f"[{symbol}] COVER ignored — strategy '{strategy}' is not owner "
-                     f"'{owner}'; leaving holder's position untouched")
-            return jsonify({"status": "ignored", "reason": "not position owner",
-                            "owner": owner, "strategy": strategy}), 200
-
-        # DOUBLE-BUY GUARD: atomically claim the cover. If another COVER for this
-        # symbol is already mid-flight (e.g. the second of two RSI sleeves on one
-        # ticker), bail here so exactly one buy is placed and we never over-cover
-        # the short into a long.
-        if not try_begin_cover(symbol):
-            log.info(f"[{symbol}] COVER ignored — cover already in progress")
-            return jsonify({"status": "ignored", "reason": "cover in progress"}), 200
-
-        log.info(f"[{symbol}] COVER: looking up actual position size from TZ")
-        try:
-            position = get_position(symbol)
-        except Exception as e:
-            log.error(f"[{symbol}] COVER position lookup failed: {e}")
-            set_state(symbol, state="ACTIVE", reason="cover lookup failed")  # un-claim
-            return jsonify({"error": str(e)}), 500
-
-        if position is None:
-            log.warning(f"[{symbol}] COVER: no TZ position found — entry may not have filled")
-            block(symbol, "COVER received but no TZ position found")
-            return jsonify({"status": "ok", "note": "no position found — blocked"}), 200
-
-        shares = float(position.get("shares", 0))
-        if shares >= 0:
-            log.warning(f"[{symbol}] COVER: position shares={shares} — not a short | blocking")
-            block(symbol, f"COVER received but position is not short (shares={shares})")
-            return jsonify({"status": "ok", "note": "not a short position"}), 200
-
-        cover_qty   = abs(int(shares))
-        cover_limit = float(price)
-
-        log.info(f"[{symbol}] Covering {cover_qty} shares | "
-                 f"qc_price=${price} | limit=${cover_limit} (QC pre-buffered)")
-
-        # Cancel any armed broker SL stop before placing the cover.
-        # The stop is on the same short position; if it remained active, the
-        # cover would attempt to flatten and the stop would still try to fire
-        # on adverse moves, potentially producing a second buy order.
-        stop_id = s.get("sl_client_order_id")
-        if stop_id:
-            cancel_real_stop(symbol, stop_id)
-            set_state(symbol, sl_client_order_id=None)
-
-        try:
-            result = place_order("Buy", symbol, cover_qty, cover_limit, "COVER_ORDER")
-            set_state(symbol, state="FLAT", reason="covered", owner=None)
-            log.info(f"[{symbol}] COVER PLACED | qty={cover_qty} | limit=${cover_limit} | "
-                     f"clientOrderId={result.get('clientOrderId')} | "
-                     f"status={result.get('orderStatus')}")
-            threading.Thread(
-                target=monitor_cover_fill,
-                args=(symbol, result.get("clientOrderId"), COVER_FILL_TIMEOUT),
-                daemon=True
-            ).start()
-            return jsonify({
-                "status":        "ok",
-                "action":        "COVER",
-                "symbol":        symbol,
-                "quantity":      cover_qty,
-                "limit_price":   cover_limit,
-                "clientOrderId": result.get("clientOrderId"),
-                "orderStatus":   result.get("orderStatus"),
-            }), 200
-        except Exception as e:
-            log.error(f"[{symbol}] Cover order failed: {e}")
-            set_state(symbol, state="ACTIVE", reason="cover failed")  # un-claim so a retry can proceed
-            return jsonify({"error": str(e)}), 500
+        body_out, code = handle_cover(REAL, symbol, price, strategy)
+        return jsonify(body_out), code
 
     # ── CANCEL ───────────────────────────────────────────────────────────────
     elif action == "CANCEL":
@@ -2893,6 +3122,10 @@ def sim_webhook():
             log.warning(f"[SIM:{symbol}] SHORT ignored — locate already in progress")
             return jsonify({"status": "ignored", "reason": "locate in progress", "mode": "sim"}), 200
 
+        if current_state == "COVERING":
+            log.info(f"[SIM:{symbol}] SHORT ignored — cover still working on this ticker")
+            return jsonify({"status": "ignored", "reason": "cover in progress", "mode": "sim"}), 200
+
         if current_state == "ACTIVE":
             # SOFT-IGNORE (see real /webhook): never sim_block() on a duplicate —
             # it would orphan the holder's position when its own COVER arrives.
@@ -2914,15 +3147,6 @@ def sim_webhook():
 
     # ── COVER ────────────────────────────────────────────────────────────────
     elif action == "COVER":
-        if current_state == "BLOCKED":
-            log.info(f"[SIM:{symbol}] COVER ignored — blocked: {s.get('reason', '')}")
-            return jsonify({"status": "ignored", "reason": "blocked", "mode": "sim"}), 200
-
-        if current_state == "FLAT":
-            log.warning(f"[SIM:{symbol}] COVER rejected — no position (FLAT)")
-            sim_block(symbol, "COVER received with no active position")
-            return jsonify({"status": "rejected", "reason": "no position", "mode": "sim"}), 200
-
         if current_state == "LOCATING":
             log.warning(f"[SIM:{symbol}] COVER during locate — cancelling")
             threading.Thread(
@@ -2933,78 +3157,9 @@ def sim_webhook():
             return jsonify({
                 "status": "ok", "action": "cleanup_on_cover_during_locate", "mode": "sim"
             }), 200
-
-        # OWNERSHIP GUARD (see real /webhook)
-        owner = s.get("owner")
-        if owner and strategy and strategy != owner:
-            log.info(f"[SIM:{symbol}] COVER ignored — strategy '{strategy}' is not owner "
-                     f"'{owner}'; leaving holder's position untouched")
-            return jsonify({"status": "ignored", "reason": "not position owner",
-                            "owner": owner, "strategy": strategy, "mode": "sim"}), 200
-
-        # DOUBLE-BUY GUARD (see real /webhook)
-        if not sim_try_begin_cover(symbol):
-            log.info(f"[SIM:{symbol}] COVER ignored — cover already in progress")
-            return jsonify({"status": "ignored", "reason": "cover in progress", "mode": "sim"}), 200
-
-        try:
-            position = sim_get_position(symbol)
-        except Exception as e:
-            log.error(f"[SIM:{symbol}] COVER position lookup failed: {e}")
-            sim_set_state(symbol, state="ACTIVE", reason="cover lookup failed")  # un-claim
-            return jsonify({"error": str(e), "mode": "sim"}), 500
-
-        if position is None:
-            log.warning(f"[SIM:{symbol}] COVER: no sim position found")
-            sim_block(symbol, "COVER received but no sim position found")
-            return jsonify({"status": "ok", "note": "no position found — blocked", "mode": "sim"}), 200
-
-        shares = float(position.get("shares", 0))
-        if shares >= 0:
-            log.warning(f"[SIM:{symbol}] COVER: not a short (shares={shares})")
-            sim_block(symbol, f"COVER but position is not short (shares={shares})")
-            return jsonify({"status": "ok", "note": "not a short position", "mode": "sim"}), 200
-
-        cover_qty    = abs(int(shares))
-        cover_limit  = float(price)
-        phantom_cost = s.get("phantom_locate_cost", 0)
-
-        log.info(f"[SIM:{symbol}] Covering {cover_qty}sh | limit=${cover_limit} | "
-                 f"phantom_locate_cost=${phantom_cost:.2f}")
-
-        # Cancel armed sim broker SL stop before placing the cover
-        stop_id = s.get("sl_client_order_id")
-        if stop_id:
-            cancel_sim_stop(symbol, stop_id)
-            sim_set_state(symbol, sl_client_order_id=None)
-
-        try:
-            result = sim_place_order("Buy", symbol, cover_qty, cover_limit, "SIM_COVER_ORDER")
-            sim_set_state(symbol, state="FLAT", reason="covered", owner=None)
-            log.info(f"[SIM:{symbol}] COVER PLACED | qty={cover_qty} | limit=${cover_limit} | "
-                     f"clientOrderId={result.get('clientOrderId')} | "
-                     f"status={result.get('orderStatus')} | "
-                     f"phantom_locate_cost=${phantom_cost:.2f}")
-            threading.Thread(
-                target=sim_monitor_cover_fill,
-                args=(symbol, result.get("clientOrderId"), COVER_FILL_TIMEOUT),
-                daemon=True,
-            ).start()
-            return jsonify({
-                "status":              "ok",
-                "action":              "COVER",
-                "symbol":              symbol,
-                "mode":                "sim",
-                "quantity":            cover_qty,
-                "limit_price":         cover_limit,
-                "clientOrderId":       result.get("clientOrderId"),
-                "orderStatus":         result.get("orderStatus"),
-                "phantom_locate_cost": round(phantom_cost, 4),
-            }), 200
-        except Exception as e:
-            log.error(f"[SIM:{symbol}] Cover order failed: {e}")
-            sim_set_state(symbol, state="ACTIVE", reason="cover failed")  # un-claim so a retry can proceed
-            return jsonify({"error": str(e), "mode": "sim"}), 500
+        body_out, code = handle_cover(SIM, symbol, price, strategy)
+        body_out["mode"] = "sim"
+        return jsonify(body_out), code
 
     # ── CANCEL ───────────────────────────────────────────────────────────────
     elif action == "CANCEL":
