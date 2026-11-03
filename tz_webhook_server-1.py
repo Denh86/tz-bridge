@@ -1,0 +1,3381 @@
+""" 
+TradeZero Webhook Execution Server — EOD Short Strategy 
+=======================================================
+Receives SHORT / COVER / CANCEL signals from QuantConnect.
+Manages the full locate → short → cover lifecycle with state machine.
+
+SIGNAL FORMAT (from QC):
+  {"action": "SHORT",  "symbol": "LRMR", "quantity": 500, "price": 5.70}
+  {"action": "COVER",  "symbol": "LRMR", "quantity": 500, "price": 5.50}
+  {"action": "CANCEL", "symbol": "LRMR"}
+
+SYMBOL STATES:
+  FLAT      → ready, will accept SHORT
+  LOCATING  → locate request in progress
+  ACTIVE    → short position placed, waiting for COVER (carried=True: still short
+              from an earlier session, waiting for QC's 04:00 / 09:30 COVER)
+  COVERING  → cover working; retried every COVER_FILL_TIMEOUT min until TZ shows no short
+  BLOCKED   → dead for the day, SHORT signals ignored (a COVER still closes a real short)
+
+DAILY CYCLE (America/New_York):
+  03:50  reset: clear FLAT/BLOCKED states (ACTIVE/COVERING/LOCATING kept);
+         cancel leftover bridge stops (SL_*) on tickers with no short
+  09:35  check: log MANUAL ACTION for any short that is carried or that the
+         bridge has no record of (logging only)
+  16:01  re-arm: ACTIVE shorts whose RTH Stop (Day TIF) expired at 16:00 get a
+         GTC_Plus StopLimit (active 04:00-20:00, carries into the next premarket)
+
+ENDPOINTS:
+  POST /webhook          ← real account: SHORT / COVER / CANCEL
+  POST /sim/webhook      ← sim account:  SHORT / COVER / CANCEL
+  GET  /health           ← server + TZ API status (real + sim states)
+  GET  /state            ← real account symbol states
+  GET  /sim/state        ← sim account symbol states
+  POST /reset/<symbol>   ← manually reset real symbol to FLAT
+  POST /sim/reset/<symbol> ← manually reset sim symbol to FLAT
+
+HOW TO RUN:
+  pip install flask requests python-dotenv
+  .env:
+    TZ_API_KEY=...
+    TZ_API_SECRET=...
+    TZ_SIM_API_KEY=...
+    TZ_SIM_API_SECRET=...
+    SIM_ACCOUNT_ID=...
+    STOP_LOSS_ENABLED=true     # set false to skip broker SL and rely on QC cover
+  python tz_webhook_server.py
+"""
+
+import os, json, uuid, logging, threading, time
+from datetime import date
+from zoneinfo import ZoneInfo
+import requests
+from flask import Flask, request, jsonify
+from dotenv import load_dotenv
+
+load_dotenv()
+
+from locate_logger import log_locate, log_rename
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CONFIG — adjust these without touching any other code
+# ══════════════════════════════════════════════════════════════════════════════
+BASE_URL             = "https://webapi.tradezero.com"
+ACCOUNT_ID           = "DHA41998"
+MAX_LOCATE_COST_PCT  = 0.02    # 2%   — REAL account: reject if locatePrice / entryPrice > this
+# SIM account only (phantom locate quote). Set env var SIM_MAX_LOCATE_COST_PCT in Render
+# to change it without a code edit, e.g. 0.05 = 5%. The real-account limit is unaffected.
+SIM_MAX_LOCATE_COST_PCT = float(os.getenv("SIM_MAX_LOCATE_COST_PCT", "0.05"))
+MIN_LOCATE_QUANTITY  = 100     # TZ minimum locate size
+MIN_SHORT_QUANTITY   = 1       # TZ minimum short order size (any size accepted)
+LOCATE_POLL_INTERVAL = 2       # seconds between locate status polls
+LOCATE_POLL_TIMEOUT  = 30      # seconds before giving up on locate
+LOCATE_ACCEPT_SLEEP  = 3       # seconds to wait after locate accept before placing order
+                               # TZ sends "locateAcceptSent:true" before fully registering
+                               # the locate — placing the order too fast causes R43 rejection
+# QC strategies send already-buffered limit prices in webhooks — server uses them directly
+SHORT_FILL_TIMEOUT   = 5       # minutes to wait for short entry to fill before cancelling
+PARTIAL_FILL_PATIENCE = 30     # seconds to wait for the rest after first partial fill
+                               # then cancel leftover and arm stop on what filled
+STOP_FILL_POLL_INTERVAL = 5    # seconds between fill-status polls during entry monitoring
+COVER_FILL_TIMEOUT   = 3       # minutes between cover retries while the short is still open
+COVER_RETRY_BUFFER   = 0.005   # (legacy) 0.5% above live price — cancel/cleanup cover
+# Cover retries OUTSIDE RTH: limit = max(price x (1 + step), QC's cover limit), stepping
+# through these and then repeating the last. RTH retries are market orders.
+# price = TZ's own mark (/pnl exposure / shares); Yahoo/Twelve Data if unavailable.
+COVER_RETRY_STEPS    = (0.005, 0.02, 0.05)
+# Day_Plus orders live 04:00-20:00 ET. After this time an unfilled cover is handed
+# back to QC (state ACTIVE, carried=True) and QC's 04:00 COVER restarts it.
+COVER_LAST_RETRY_ET  = (19, 58)
+RESET_TIME_ET        = (3, 50)     # daily state reset (New York time)
+# Which QC strategies may trade through the bridge. Comma list in the Render env var
+# ALLOWED_STRATEGIES, e.g. "vol,ema,bgs" (webhooks with no strategy field = "legacy").
+# Unset or empty = everything allowed. Webhooks from others get 200 "ignored".
+ALLOWED_STRATEGIES   = {x.strip().lower() for x in (os.getenv("ALLOWED_STRATEGIES") or "").split(",") if x.strip()}
+CARRY_CHECK_ET       = (9, 35)     # MANUAL ACTION check for carried / unknown shorts
+STOP_REARM_ET        = (16, 1)     # re-arm expired RTH stops as GTC_Plus StopLimit
+
+# ── BROKER STOP-LOSS (server-side protection against QC dead zones) ─────────
+# QC strategies emit 1-minute bars, so price can move 5-15% between bars on
+# halt resumption or fast gap moves. To protect live capital, the bridge fires
+# a TZ-side stop order immediately after each short fill. When QC's TP/SL/EOD
+# cover signal arrives, the stop is cancelled before the cover is placed.
+#
+# QC strategies send an `sl_pct` field in the SHORT webhook (VOL/EMA 0.12, BGS 0.20).
+# The bridge falls back to DEFAULT_SL_PCT only when a payload has no sl_pct.
+DEFAULT_SL_PCT  = 0.22    # 22% adverse move on short positions (price up) — fallback only
+SL_LIMIT_SLACK  = 0.02    # 2% slack on StopLimit ETH orders so they actually fill
+# Stop type by session: RTH uses Stop (market on trigger), ETH uses StopLimit
+# because TZ doesn't accept market orders outside RTH.
+
+# ── BROKER STOP-LOSS TOGGLE ─────────────────────────────────────────────────
+# True  → arm a TZ stop/stoplimit after each short fill (server-side protection)
+# False → place only the limit short; rely entirely on QC's TP/SL/EOD cover
+#         webhook (QC strategy already monitors the stop-loss condition).
+# Flip via env var STOP_LOSS_ENABLED ("false"/"0"/"no"/"off") without code edits.
+STOP_LOSS_ENABLED = (os.getenv("STOP_LOSS_ENABLED", "true").strip().lower()
+                     not in ("0", "false", "no", "off"))
+
+# ── LOCATE BUYING-POWER SIZING ──────────────────────────────────────────────
+# TZ evaluates LOCATE requests against ~1:1 buying power (notional <= BP), NOT
+# the leveraged margin used at order placement (same finding the SIM phantom
+# locate probe relies on). Size the fresh locate request so its notional stays
+# under LOCATE_BP_USAGE × usable BP, or it gets R35'd before any order is placed.
+# NOTE: this cap is applied ONLY to fresh locate requests — reuse of an already
+# secured existing locate stays bound by the leveraged order margin.
+LOCATE_BP_USAGE        = 0.85   # max 85% of 1:1 BP for fresh locate notional
+LOCATE_STEPDOWN_FACTOR = 0.6    # on R35/R57 (start >= 1000sh): retry at 60% of previous qty
+LOCATE_MAX_ATTEMPTS    = 6      # ceiling on geometric-ladder attempts (incl. final 100sh try)
+# Stepdown rule on a BP/size rejection:
+#   start  < 1000sh  → cycle DOWN by 100 each retry, to MIN_LOCATE_QUANTITY
+#   start >= 1000sh  → geometric LOCATE_STEPDOWN_FACTOR ladder, capped, to MIN_LOCATE_QUANTITY
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CREDENTIALS — REAL ACCOUNT
+# ══════════════════════════════════════════════════════════════════════════════
+API_KEY            = (os.getenv("TZ_API_KEY")          or "").strip()
+API_SECRET         = (os.getenv("TZ_API_SECRET")       or "").strip()
+TWELVEDATA_API_KEY = (os.getenv("TWELVEDATA_API_KEY")  or "").strip()
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CREDENTIALS — SIM ACCOUNT
+# ══════════════════════════════════════════════════════════════════════════════
+SIM_API_KEY    = (os.getenv("TZ_SIM_API_KEY")   or "").strip()
+SIM_API_SECRET = (os.getenv("TZ_SIM_API_SECRET") or "").strip()
+SIM_ACCOUNT_ID = (os.getenv("SIM_ACCOUNT_ID")    or "").strip()
+
+# ══════════════════════════════════════════════════════════════════════════════
+# LOGGING
+# ══════════════════════════════════════════════════════════════════════════════
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s  %(levelname)-8s  %(message)s",
+    datefmt="%H:%M:%S",
+    handlers=[logging.StreamHandler()]
+)
+log = logging.getLogger("tz_server")
+log.info("=== tz_webhook_server module loading ===")
+
+# Suppress gunicorn access log spam from Render's health check pings.
+class _HealthCheckFilter(logging.Filter):
+    def filter(self, record):
+        msg = record.getMessage()
+        return "GET /health" not in msg
+
+for _gunicorn_logger in ("gunicorn.access", "gunicorn.error", "werkzeug"):
+    logging.getLogger(_gunicorn_logger).addFilter(_HealthCheckFilter())
+
+# ══════════════════════════════════════════════════════════════════════════════
+# REAL ACCOUNT STATE MACHINE  (reset daily at 03:50 New York time — see ny_scheduler_thread)
+# ══════════════════════════════════════════════════════════════════════════════
+symbol_state = {}
+state_lock   = threading.Lock()
+reset_date   = date.today()
+
+
+def get_state(symbol):
+    with state_lock:
+        return symbol_state.get(symbol, {}).copy()
+
+
+def set_state(symbol, **kwargs):
+    with state_lock:
+        if symbol not in symbol_state:
+            symbol_state[symbol] = {"state": "FLAT"}
+        symbol_state[symbol].update(kwargs)
+    log.info(f"[{symbol}] STATE → {symbol_state[symbol]['state']}"
+             + (f" ({kwargs.get('reason', '')})" if kwargs.get("reason") else ""))
+
+
+def block(symbol, reason):
+    last_cycle = symbol_state.get(symbol, {}).get("cycle", 0)
+    set_state(symbol, state="BLOCKED", reason=reason, cycle=last_cycle)
+    log.warning(f"[{symbol}] BLOCKED: {reason}")
+
+
+def try_begin_cover(symbol):
+    """Atomically claim the cover for `symbol` under the state lock.
+
+    Returns True if this caller won the claim (proceed to place the buy),
+    False if a cover is already in progress (caller must bail). This is the
+    fix for the double-buy: when two COVER webhooks for the same symbol arrive
+    together (e.g. two RSI sleeves L74+L80 on one ticker), only the first wins
+    the COVERING claim; the second is ignored, so exactly one buy is placed and
+    the position can't be over-covered into a long. The check-and-set must be
+    atomic (same lock acquisition), or two simultaneous covers both pass a
+    separate get_state()/set_state() and the race survives.
+    """
+    with state_lock:
+        st = symbol_state.get(symbol, {}).get("state")
+        if st == "COVERING":
+            return False
+        if symbol not in symbol_state:
+            symbol_state[symbol] = {"state": "FLAT"}
+        symbol_state[symbol]["state"] = "COVERING"
+    log.info(f"[{symbol}] STATE → COVERING")
+    return True
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SIM ACCOUNT STATE MACHINE  (separate dict — never collides with real states)
+# ══════════════════════════════════════════════════════════════════════════════
+sim_symbol_state = {}
+sim_state_lock   = threading.Lock()
+
+
+def sim_get_state(symbol):
+    with sim_state_lock:
+        return sim_symbol_state.get(symbol, {}).copy()
+
+
+def sim_set_state(symbol, **kwargs):
+    with sim_state_lock:
+        if symbol not in sim_symbol_state:
+            sim_symbol_state[symbol] = {"state": "FLAT"}
+        sim_symbol_state[symbol].update(kwargs)
+    log.info(f"[SIM:{symbol}] STATE → {sim_symbol_state[symbol]['state']}"
+             + (f" ({kwargs.get('reason', '')})" if kwargs.get("reason") else ""))
+
+
+def sim_block(symbol, reason):
+    last_cycle = sim_symbol_state.get(symbol, {}).get("cycle", 0)
+    sim_set_state(symbol, state="BLOCKED", reason=reason, cycle=last_cycle)
+    log.warning(f"[SIM:{symbol}] BLOCKED: {reason}")
+
+
+def sim_try_begin_cover(symbol):
+    """Atomically claim the sim cover for `symbol` (see try_begin_cover)."""
+    with sim_state_lock:
+        st = sim_symbol_state.get(symbol, {}).get("state")
+        if st == "COVERING":
+            return False
+        if symbol not in sim_symbol_state:
+            sim_symbol_state[symbol] = {"state": "FLAT"}
+        sim_symbol_state[symbol]["state"] = "COVERING"
+    log.info(f"[SIM:{symbol}] STATE → COVERING")
+    return True
+
+
+def self_watchdog_thread():
+    """
+    Pings own /health endpoint every 90 seconds.
+    If 5 consecutive failures, forces gunicorn to recycle the worker.
+    Initial delay of 180s gives Render's port scanner time to confirm
+    the port is open before the watchdog starts pinging.
+    """
+    import signal as _signal, urllib.request as _req, os as _os
+    time.sleep(180)
+
+    port = int(_os.environ.get("PORT", 10000))
+    url  = f"http://127.0.0.1:{port}/health"
+    fails = 0
+    log.info("WATCHDOG: starting health monitoring")
+
+    while True:
+        time.sleep(90)
+        try:
+            with _req.urlopen(url, timeout=10) as r:
+                if r.status == 200:
+                    if fails > 0:
+                        log.info(f"WATCHDOG: /health recovered (was {fails} failures)")
+                    fails = 0
+                else:
+                    fails += 1
+                    log.warning(f"WATCHDOG: /health returned {r.status} ({fails}/5)")
+        except Exception as e:
+            fails += 1
+            log.warning(f"WATCHDOG: /health unreachable — {e} ({fails}/5)")
+
+        if fails >= 5:
+            log.error("WATCHDOG: 5 consecutive health failures — recycling worker")
+            _os.kill(_os.getpid(), _signal.SIGTERM)
+            return
+
+
+threading.Thread(target=self_watchdog_thread, daemon=True).start()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# REAL ACCOUNT — TZ API HELPERS
+# ══════════════════════════════════════════════════════════════════════════════
+def tz_headers():
+    return {
+        "TZ-API-KEY-ID":     API_KEY,
+        "TZ-API-SECRET-KEY": API_SECRET,
+        "Content-Type":      "application/json",
+        "Accept":            "application/json",
+    }
+
+
+# ── TZ API throttle + 429 retry ───────────────────────────────────────────────
+# 2 Nov 15:30: two strategies' force-closes hit the positions endpoint 70 ms apart
+# and TZ answered 429 (rate limited) to the second; the bridge read that as "no
+# position" and left BLZE short. Every TZ call now goes through _tz_call: calls are
+# spaced at least TZ_MIN_GAP_S apart, and a 429 is retried with backoff (Retry-After
+# honoured). A 429 means the request was not processed, so retrying is safe.
+TZ_MIN_GAP_S   = 0.25
+TZ_429_RETRIES = 4
+_tz_call_lock  = threading.Lock()
+_tz_last_call  = [0.0]
+
+
+def _tz_call(method, url, headers, **kw):
+    for attempt in range(TZ_429_RETRIES + 1):
+        with _tz_call_lock:
+            wait = TZ_MIN_GAP_S - (time.time() - _tz_last_call[0])
+            if wait > 0:
+                time.sleep(wait)
+            _tz_last_call[0] = time.time()
+        r = requests.request(method, url, headers=headers, timeout=15, **kw)
+        if r.status_code != 429 or attempt == TZ_429_RETRIES:
+            return r
+        try:
+            delay = float(r.headers.get("Retry-After") or 0)
+        except (TypeError, ValueError):
+            delay = 0
+        delay = max(delay, 1.0 * (2 ** attempt))      # 1, 2, 4, 8 s
+        log.warning(f"  TZ 429 rate limited on {method} {url.split('/v1/api')[-1]} — retry in {delay:.0f}s")
+        time.sleep(delay)
+    return r
+
+
+def tz_get(path, label="GET"):
+    url = f"{BASE_URL}{path}"
+    log.info(f"  → {label} GET {url}")
+    r = _tz_call("GET", url, tz_headers())
+    log.info(f"  ← status: {r.status_code}  body: {r.text[:600]}")
+    return r
+
+
+def tz_post(path, payload, label="POST"):
+    url = f"{BASE_URL}{path}"
+    log.info(f"  → {label} POST {url}")
+    log.info(f"    body: {json.dumps(payload)}")
+    r = _tz_call("POST", url, tz_headers(), json=payload)
+    log.info(f"  ← status: {r.status_code}  body: {r.text[:600]}")
+    return r
+
+
+def tz_delete(path, label="DELETE"):
+    url = f"{BASE_URL}{path}"
+    log.info(f"  → {label} DELETE {url}")
+    r = _tz_call("DELETE", url, tz_headers())
+    log.info(f"  ← status: {r.status_code}  body: {r.text[:200]}")
+    return r
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SIM ACCOUNT — TZ API HELPERS
+# ══════════════════════════════════════════════════════════════════════════════
+def sim_headers():
+    return {
+        "TZ-API-KEY-ID":     SIM_API_KEY,
+        "TZ-API-SECRET-KEY": SIM_API_SECRET,
+        "Content-Type":      "application/json",
+        "Accept":            "application/json",
+    }
+
+
+def sim_tz_get(path, label="GET"):
+    url = f"{BASE_URL}{path}"
+    log.info(f"  → [SIM] {label} GET {url}")
+    r = _tz_call("GET", url, sim_headers())
+    log.info(f"  ← [SIM] status: {r.status_code}  body: {r.text[:600]}")
+    return r
+
+
+def sim_tz_post(path, payload, label="POST"):
+    url = f"{BASE_URL}{path}"
+    log.info(f"  → [SIM] {label} POST {url}")
+    log.info(f"    body: {json.dumps(payload)}")
+    r = _tz_call("POST", url, sim_headers(), json=payload)
+    log.info(f"  ← [SIM] status: {r.status_code}  body: {r.text[:600]}")
+    return r
+
+
+def sim_tz_delete(path, label="DELETE"):
+    url = f"{BASE_URL}{path}"
+    log.info(f"  → [SIM] {label} DELETE {url}")
+    r = _tz_call("DELETE", url, sim_headers())
+    log.info(f"  ← [SIM] status: {r.status_code}  body: {r.text[:200]}")
+    return r
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# REAL ACCOUNT — ACCOUNT / POSITION / ORDER HELPERS
+# ══════════════════════════════════════════════════════════════════════════════
+def get_account_details():
+    r = tz_get(f"/v1/api/account/{ACCOUNT_ID}", "ACCOUNT")
+    if r.status_code == 200:
+        return r.json()
+    log.error(f"  Failed to get account details: {r.status_code}")
+    return None
+
+
+def _pick_position(rows, symbol):
+    """TZ keeps a row per position lifecycle for the day: a closed one stays listed with
+    shares 0 (seen 2 Nov: three CLRO rows). Return the open row (shares != 0), or a closed
+    one if that's all there is, so a closed row listed first never hides an open short."""
+    mine = [p for p in rows if str(p.get("symbol", "")).upper() == symbol.upper()]
+    if not mine:
+        return None
+    open_rows = [p for p in mine if float(p.get("shares", 0) or 0) != 0]
+    if len(open_rows) > 1:   # shouldn't happen; merge so the full size is covered
+        merged = dict(open_rows[0])
+        merged["shares"] = sum(float(p.get("shares", 0) or 0) for p in open_rows)
+        return merged
+    return open_rows[0] if open_rows else mine[0]
+
+
+def get_position(symbol):
+    r = tz_get(f"/v1/api/accounts/{ACCOUNT_ID}/positions", "POSITIONS")
+    if r.status_code != 200:
+        log.error(f"  Failed to get positions: {r.status_code}")
+        return None
+    positions = r.json()
+    if not isinstance(positions, list):
+        positions = positions.get("positions", [])
+    p = _pick_position(positions, symbol)
+    if p is not None:
+        log.info(f"  Found position for {symbol}: {json.dumps(p)}")
+        return p
+    log.info(f"  No open position found for {symbol}")
+    return None
+
+
+def cancel_all_open_orders(symbol):
+    r = tz_get(f"/v1/api/accounts/{ACCOUNT_ID}/orders", "ORDERS")
+    if r.status_code != 200:
+        log.error(f"  Failed to fetch orders: {r.status_code}")
+        return 0
+    orders = r.json()
+    if not isinstance(orders, list):
+        orders = orders.get("orders", [])
+    open_statuses = {"PendingNew", "New", "PartiallyFilled", "Submitted"}
+    open_orders = [
+        o for o in orders
+        if o.get("symbol", "").upper() == symbol.upper()
+        and o.get("orderStatus", "") in open_statuses
+    ]
+    log.info(f"  Found {len(open_orders)} open order(s) for {symbol}")
+    cancelled = 0
+    for o in open_orders:
+        oid = o.get("clientOrderId")
+        if oid:
+            rc = tz_delete(f"/v1/api/accounts/{ACCOUNT_ID}/orders/{oid}", "CANCEL_ORDER")
+            if rc.status_code in (200, 204):
+                cancelled += 1
+            else:
+                log.warning(f"  Failed to cancel order {oid}: {rc.status_code}")
+    return cancelled
+
+
+def place_order(side, symbol, quantity, limit_price, label="ORDER", decimals=2):
+    client_id = f"QC_{side[:1].upper()}_{uuid.uuid4().hex[:8].upper()}"
+    side_str = "Sell" if side.lower() == "sell" else "Buy"
+    payload = {
+        "clientOrderId": client_id,
+        "symbol":        symbol,
+        "orderQuantity": int(quantity),
+        "side":          side_str,
+        "orderType":     "Limit",
+        "securityType":  "Stock",
+        "limitPrice":    round(limit_price, decimals),
+        "timeInForce":   "Day_Plus",
+        "route":         "SMART",
+    }
+    r = tz_post(f"/v1/api/accounts/{ACCOUNT_ID}/order", payload, label)
+    if not r.ok:
+        log.error(f"  [{symbol}] Order FAILED {r.status_code} — raw body: {r.text[:500]}")
+        r.raise_for_status()
+    data = r.json()
+    log.info(f"  [{symbol}] Order placed: clientOrderId={data.get('clientOrderId')} "
+             f"status={data.get('orderStatus')}")
+    return data
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SIM ACCOUNT — ACCOUNT / POSITION / ORDER HELPERS
+# ══════════════════════════════════════════════════════════════════════════════
+def sim_get_account_details():
+    r = sim_tz_get(f"/v1/api/account/{SIM_ACCOUNT_ID}", "SIM_ACCOUNT")
+    if r.status_code == 200:
+        return r.json()
+    log.error(f"  [SIM] Failed to get account details: {r.status_code}")
+    return None
+
+
+def sim_get_position(symbol):
+    r = sim_tz_get(f"/v1/api/accounts/{SIM_ACCOUNT_ID}/positions", "SIM_POSITIONS")
+    if r.status_code != 200:
+        log.error(f"  [SIM] Failed to get positions: {r.status_code}")
+        return None
+    positions = r.json()
+    if not isinstance(positions, list):
+        positions = positions.get("positions", [])
+    p = _pick_position(positions, symbol)
+    if p is not None:
+        log.info(f"  [SIM] Found position for {symbol}: {json.dumps(p)}")
+        return p
+    log.info(f"  [SIM] No open position found for {symbol}")
+    return None
+
+
+def sim_cancel_all_open_orders(symbol):
+    r = sim_tz_get(f"/v1/api/accounts/{SIM_ACCOUNT_ID}/orders", "SIM_ORDERS")
+    if r.status_code != 200:
+        log.error(f"  [SIM] Failed to fetch orders: {r.status_code}")
+        return 0
+    orders = r.json()
+    if not isinstance(orders, list):
+        orders = orders.get("orders", [])
+    open_statuses = {"PendingNew", "New", "PartiallyFilled", "Submitted"}
+    open_orders = [
+        o for o in orders
+        if o.get("symbol", "").upper() == symbol.upper()
+        and o.get("orderStatus", "") in open_statuses
+    ]
+    log.info(f"  [SIM] Found {len(open_orders)} open order(s) for {symbol}")
+    cancelled = 0
+    for o in open_orders:
+        oid = o.get("clientOrderId")
+        if oid:
+            rc = sim_tz_delete(
+                f"/v1/api/accounts/{SIM_ACCOUNT_ID}/orders/{oid}", "SIM_CANCEL_ORDER"
+            )
+            if rc.status_code in (200, 204):
+                cancelled += 1
+            else:
+                log.warning(f"  [SIM] Failed to cancel {oid}: {rc.status_code}")
+    return cancelled
+
+
+def sim_place_order(side, symbol, quantity, limit_price, label="SIM_ORDER", decimals=2):
+    client_id = f"SIM_{side[:1].upper()}_{uuid.uuid4().hex[:8].upper()}"
+    side_str  = "Sell" if side.lower() == "sell" else "Buy"
+    payload = {
+        "clientOrderId": client_id,
+        "symbol":        symbol,
+        "orderQuantity": int(quantity),
+        "side":          side_str,
+        "orderType":     "Limit",
+        "securityType":  "Stock",
+        "limitPrice":    round(limit_price, decimals),
+        "timeInForce":   "Day_Plus",
+        "route":         "SMART",
+    }
+    r = sim_tz_post(f"/v1/api/accounts/{SIM_ACCOUNT_ID}/order", payload, label)
+    if not r.ok:
+        log.error(f"  [SIM:{symbol}] Order FAILED {r.status_code} — body: {r.text[:500]}")
+        r.raise_for_status()
+    data = r.json()
+    log.info(f"  [SIM:{symbol}] Order placed: clientOrderId={data.get('clientOrderId')} "
+             f"status={data.get('orderStatus')}")
+    return data
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# REAL ACCOUNT — GRACEFUL ORDER STEPDOWN
+# ══════════════════════════════════════════════════════════════════════════════
+def place_order_with_stepdown(symbol, initial_quantity, limit_price, label="SHORT_ORDER"):
+    """
+    Attempt to place a short order at fixed percentage tiers of the located
+    quantity. Steps: 100% → 80% → 60% → 40% → 20%.
+    """
+    tiers    = [1.0, 0.8, 0.6, 0.4, 0.2]
+    last_exc = None
+    for attempt, pct in enumerate(tiers, 1):
+        qty = max(1, int(initial_quantity * pct))
+        try:
+            result = place_order("Sell", symbol, qty, limit_price, label)
+            if attempt > 1:
+                log.info(f"[{symbol}] Order accepted on attempt {attempt} "
+                         f"at {int(pct*100)}%: placed {qty}sh "
+                         f"(located {initial_quantity}sh)")
+            return result
+        except Exception as e:
+            last_exc = e
+            if attempt < len(tiers):
+                next_pct = int(tiers[attempt] * 100)
+                log.warning(f"[{symbol}] Order rejected at {qty}sh "
+                            f"({int(pct*100)}%): {e} — "
+                            f"stepping down to {next_pct}%")
+            else:
+                log.warning(f"[{symbol}] Order rejected at {qty}sh "
+                            f"(20% minimum): {e} — giving up")
+    raise last_exc or Exception(f"[{symbol}] All stepdown tiers failed "
+                                f"(located {initial_quantity}sh)")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# LOCATE QUANTITY LADDER  (R35/R57 stepdown for fresh locate requests)
+# ══════════════════════════════════════════════════════════════════════════════
+def _build_locate_ladder(start_qty):
+    """Descending list of locate quantities to try on R35/R57 (BP/size) rejections,
+    always ending at MIN_LOCATE_QUANTITY.
+
+      • start <  1000sh → cycle DOWN by 100 each retry (fine-grained, small sizes)
+      • start >= 1000sh → multiply by LOCATE_STEPDOWN_FACTOR each retry, floored to
+                          100s, capped at LOCATE_MAX_ATTEMPTS entries
+
+    Consecutive duplicates are removed. Used only for FRESH locate requests
+    (not order placement, not existing-locate reuse).
+    """
+    start = max(MIN_LOCATE_QUANTITY, int(start_qty / 100) * 100)
+
+    if start < 1000:
+        ladder = list(range(start, MIN_LOCATE_QUANTITY - 1, -100))
+        if not ladder or ladder[-1] != MIN_LOCATE_QUANTITY:
+            ladder.append(MIN_LOCATE_QUANTITY)
+    else:
+        ladder = []
+        q = start
+        while q > MIN_LOCATE_QUANTITY and len(ladder) < LOCATE_MAX_ATTEMPTS - 1:
+            ladder.append(q)
+            q = max(MIN_LOCATE_QUANTITY, int(q * LOCATE_STEPDOWN_FACTOR / 100) * 100)
+        ladder.append(MIN_LOCATE_QUANTITY)
+
+    out = []
+    for x in ladder:                       # drop consecutive duplicates
+        if not out or out[-1] != x:
+            out.append(x)
+    return out
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SIM ACCOUNT — GRACEFUL ORDER STEPDOWN
+# ══════════════════════════════════════════════════════════════════════════════
+def sim_place_order_with_stepdown(symbol, initial_quantity, limit_price, label="SIM_SHORT_ORDER"):
+    """Same 100%→80%→60%→40%→20% stepdown as real account."""
+    tiers    = [1.0, 0.8, 0.6, 0.4, 0.2]
+    last_exc = None
+    for attempt, pct in enumerate(tiers, 1):
+        qty = max(1, int(initial_quantity * pct))
+        try:
+            result = sim_place_order("Sell", symbol, qty, limit_price, label)
+            if attempt > 1:
+                log.info(f"[SIM:{symbol}] Order accepted attempt {attempt} "
+                         f"at {int(pct*100)}%: {qty}sh")
+            return result
+        except Exception as e:
+            last_exc = e
+            if attempt < len(tiers):
+                log.warning(f"[SIM:{symbol}] Rejected at {qty}sh ({int(pct*100)}%): "
+                            f"{e} — stepping down")
+            else:
+                log.warning(f"[SIM:{symbol}] Rejected at {qty}sh (20% min): {e} — giving up")
+    raise last_exc or Exception(f"[SIM:{symbol}] All stepdown tiers failed")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# BROKER STOP-LOSS HELPERS  (real + sim — server-side capital protection)
+# ══════════════════════════════════════════════════════════════════════════════
+def _is_rth_now():
+    """Return True if current ET time is in regular trading hours (9:30-16:00)."""
+    from datetime import datetime as _dt, time as _t
+    now_et = _dt.now(ZoneInfo("America/New_York")).time()
+    return _t(9, 30) <= now_et < _t(16, 0)
+
+
+def _compute_sl_prices(entry_fill, sl_pct):
+    """Given an entry fill price and stop-loss percent (e.g. 0.10), return
+    (trigger_price, limit_price) for a short stop order.
+
+    For shorts, the SL fires when price goes UP — so trigger = entry × (1+sl_pct).
+    The limit (for StopLimit in ETH) is set slightly above the trigger so the
+    order actually fills in a fast-moving market.
+    """
+    trigger = round(entry_fill * (1.0 + sl_pct), 2)
+    limit   = round(trigger * (1.0 + SL_LIMIT_SLACK), 2)
+    return trigger, limit
+
+
+def place_stop_order(account_id, headers_fn, symbol, quantity, trigger_price,
+                     limit_price=None, label="STOP_ORDER", route="SMART", tif=None):
+    """Place a Buy Stop or StopLimit order to cover a short on adverse move.
+    
+    - If limit_price is None: places a Stop (market on trigger), only valid in RTH.
+    - If limit_price is set: places a StopLimit (limit on trigger), valid in ETH and RTH.
+    
+    Returns the order response dict, or None on failure. Failures here are LOGGED
+    but do not propagate — losing SL protection should not kill the active trade.
+    """
+    client_id = f"SL_{uuid.uuid4().hex[:8].upper()}"
+    payload = {
+        "clientOrderId": client_id,
+        "symbol":        symbol,
+        "orderQuantity": int(quantity),
+        "side":          "Buy",
+        "securityType":  "Stock",
+        "stopPrice":     round(trigger_price, 2),
+        "route":         route,
+    }
+    if limit_price is not None:
+        payload["orderType"]   = "StopLimit"
+        payload["limitPrice"]  = round(limit_price, 2)
+        # GTC_Plus: active 04:00-20:00 ET and carries into the next session, so a
+        # short held overnight is protected from the premarket open. Cancelled by the
+        # cover path; leftovers on flat tickers are swept at the 03:50 reset.
+        payload["timeInForce"] = tif or "GTC_Plus"
+    else:
+        payload["orderType"]   = "Stop"
+        payload["timeInForce"] = "Day"         # R135: a plain market Stop is NOT Day+ eligible (RTH only)
+
+    url = f"{BASE_URL}/v1/api/accounts/{account_id}/order"
+    log.info(f"  → {label} POST {url}")
+    log.info(f"    body: {json.dumps(payload)}")
+    try:
+        r = _tz_call("POST", url, headers_fn(), json=payload)
+        log.info(f"  ← {label} status: {r.status_code}  body: {r.text[:400]}")
+        if not r.ok:
+            log.error(f"  [{symbol}] Stop order FAILED {r.status_code} — body: {r.text[:300]}")
+            return None
+        data = r.json()
+        log.info(f"  [{symbol}] Stop order placed: clientOrderId={data.get('clientOrderId')} "
+                 f"status={data.get('orderStatus')} type={payload.get('orderType', '?')} "
+                 f"trigger=${payload.get('stopPrice', '?')}"
+                 + (f" limit=${payload['limitPrice']}" if 'limitPrice' in payload else ""))
+        return data
+    except Exception as e:
+        log.error(f"  [{symbol}] Stop order EXCEPTION: {e}")
+        return None
+
+
+def cancel_stop_order(account_id, headers_fn, symbol, stop_client_order_id, label="STOP_CANCEL"):
+    """Cancel a previously-placed stop order. Returns True on success.
+    Failures are LOGGED but do not propagate — the cover will still be placed.
+    """
+    if not stop_client_order_id:
+        return True  # no stop to cancel
+    url = f"{BASE_URL}/v1/api/accounts/{account_id}/orders/{stop_client_order_id}"
+    log.info(f"  → {label} DELETE {url}")
+    try:
+        r = _tz_call("DELETE", url, headers_fn())
+        log.info(f"  ← {label} status: {r.status_code}  body: {r.text[:200]}")
+        if r.status_code in (200, 204):
+            log.info(f"  [{symbol}] Stop order {stop_client_order_id} cancelled")
+            return True
+        log.warning(f"  [{symbol}] Stop cancel returned {r.status_code} — "
+                    f"order may have already filled or been cancelled")
+        return False
+    except Exception as e:
+        log.error(f"  [{symbol}] Stop cancel EXCEPTION: {e}")
+        return False
+
+
+def place_real_stop(symbol, quantity, entry_fill, sl_pct):
+    """Place a stop order on the REAL account. Returns clientOrderId or None."""
+    trigger, limit = _compute_sl_prices(entry_fill, sl_pct)
+    use_limit = None if _is_rth_now() else limit
+    session   = "RTH (Stop)" if use_limit is None else "ETH (StopLimit)"
+    log.info(f"[{symbol}] Placing REAL stop | session={session} | qty={quantity} | "
+             f"entry_fill=${entry_fill:.4f} | sl_pct={sl_pct*100:.1f}% | "
+             f"trigger=${trigger}" + (f" limit=${limit}" if use_limit else ""))
+    result = place_stop_order(ACCOUNT_ID, tz_headers, symbol, quantity, trigger,
+                              limit_price=use_limit, label="REAL_STOP")
+    return result.get("clientOrderId") if result else None
+
+
+def place_sim_stop(symbol, quantity, entry_fill, sl_pct):
+    """Place a stop order on the SIM account. Returns clientOrderId or None."""
+    trigger, limit = _compute_sl_prices(entry_fill, sl_pct)
+    use_limit = None if _is_rth_now() else limit
+    session   = "RTH (Stop)" if use_limit is None else "ETH (StopLimit)"
+    log.info(f"[SIM:{symbol}] Placing SIM stop | session={session} | qty={quantity} | "
+             f"entry_fill=${entry_fill:.4f} | sl_pct={sl_pct*100:.1f}% | "
+             f"trigger=${trigger}" + (f" limit=${limit}" if use_limit else ""))
+    result = place_stop_order(SIM_ACCOUNT_ID, sim_headers, symbol, quantity, trigger,
+                              limit_price=use_limit, label="SIM_STOP")
+    return result.get("clientOrderId") if result else None
+
+
+def cancel_real_stop(symbol, stop_client_order_id):
+    return cancel_stop_order(ACCOUNT_ID, tz_headers, symbol, stop_client_order_id, "REAL_STOP_CANCEL")
+
+
+def cancel_sim_stop(symbol, stop_client_order_id):
+    return cancel_stop_order(SIM_ACCOUNT_ID, sim_headers, symbol, stop_client_order_id, "SIM_STOP_CANCEL")
+
+
+def verify_stop_alive(account_id, headers_fn, symbol, stop_client_order_id,
+                      is_sim=False, delay_seconds=10):
+    """Wait briefly, then check whether the stop order is still alive on TZ.
+
+    TZ accepts stop orders synchronously as 'PendingNew' but may reject them
+    asynchronously a few seconds later (e.g. for malformed fields, BP issues,
+    or symbol restrictions). This function runs in a daemon thread, sleeps
+    briefly, then polls the order. If the order has been Rejected or Canceled,
+    it clears the sl_client_order_id from state so the position is flagged
+    as unprotected, and logs loudly.
+
+    Does NOT attempt to re-place the order — if a stop was rejected, the
+    cause is likely persistent (bad field, BP, etc.) and silent retry would
+    just keep failing.
+    """
+    prefix = f"[SIM:{symbol}]" if is_sim else f"[{symbol}]"
+    try:
+        time.sleep(delay_seconds)
+        r = _tz_call("GET", f"{BASE_URL}/v1/api/accounts/{account_id}/orders", headers_fn())
+        if not r.ok:
+            log.warning(f"{prefix} STOP VERIFY: orders fetch failed: {r.status_code}")
+            return
+        orders = r.json()
+        if not isinstance(orders, list):
+            orders = orders.get("orders", [])
+        order = next((o for o in orders if o.get("clientOrderId") == stop_client_order_id), None)
+        if not order:
+            log.warning(f"{prefix} STOP VERIFY: stop {stop_client_order_id} NOT FOUND on TZ — "
+                        f"may have been rejected and dropped | position is UNPROTECTED")
+            if is_sim:
+                sim_set_state(symbol, sl_client_order_id=None)
+            else:
+                set_state(symbol, sl_client_order_id=None)
+            return
+
+        status = order.get("orderStatus", "")
+        reason = order.get("text") or order.get("rejectReason") or ""
+        stop_px = order.get("priceStop")
+        limit_px = order.get("limitPrice")
+        log.info(f"{prefix} STOP VERIFY: status={status} stopPrice={stop_px} limitPrice={limit_px} text={reason[:80]}")
+        if status in ("Rejected", "Canceled"):
+            log.error(f"{prefix} STOP VERIFY: stop {stop_client_order_id} is {status} | "
+                      f"reason: {reason} | position is UNPROTECTED — QC-side SL only")
+            if is_sim:
+                sim_set_state(symbol, sl_client_order_id=None)
+            else:
+                set_state(symbol, sl_client_order_id=None)
+        elif status in ("PendingNew", "New", "Submitted"):
+            log.info(f"{prefix} STOP VERIFY: stop is live and armed ✓")
+        else:
+            log.warning(f"{prefix} STOP VERIFY: unexpected status={status} — leaving state as-is")
+    except Exception as e:
+        log.error(f"{prefix} STOP VERIFY exception: {e}")
+
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# LOCATE HELPERS  (real account — used by both real flow and phantom locate)
+# ══════════════════════════════════════════════════════════════════════════════
+def request_locate_quote(symbol, quantity, quote_req_id):
+    payload = {
+        "account":    ACCOUNT_ID,
+        "symbol":     symbol,
+        "quantity":   int(quantity),
+        "quoteReqID": quote_req_id,
+    }
+    return tz_post("/v1/api/accounts/locates/quote", payload, "LOCATE_REQUEST")
+
+
+def poll_locate_status(symbol, quote_req_id):
+    """
+    Poll locate history every LOCATE_POLL_INTERVAL seconds.
+    Returns locate dict on actionable status, None on timeout.
+    Status 65=Offered, 56=Rejected, 67=Expired, 52=Canceled
+    """
+    su_id = f"{quote_req_id}.SU"
+    deadline = time.time() + LOCATE_POLL_TIMEOUT
+    while time.time() < deadline:
+        url = f"{BASE_URL}/v1/api/accounts/{ACCOUNT_ID}/locates/history"
+        log.info(f"  → LOCATE_POLL GET {url}")
+        r = _tz_call("GET", url, tz_headers())
+        log.info(f"  ← status: {r.status_code}  body: {r.text}")
+        if r.status_code == 200:
+            history = r.json().get("locateHistory", [])
+            log.info(f"  [{symbol}] {len(history)} history entries — "
+                     f"searching for {quote_req_id} or {su_id}")
+
+            primary_item = None
+            su_item      = None
+            for item in history:
+                qid = item.get("quoteReqID")
+                if qid == quote_req_id:
+                    primary_item = item
+                elif qid == su_id:
+                    su_item = item
+
+            for label, item in (("PRIMARY", primary_item), ("SU", su_item)):
+                if item:
+                    log.info(f"  [{symbol}] {label} ({item.get('quoteReqID')}): "
+                             f"status={item.get('locateStatus')} | "
+                             f"shares={item.get('locateShares')} | "
+                             f"price=${item.get('locatePrice')} | "
+                             f"type={item.get('locateType')} | "
+                             f"error={item.get('locateError')} | "
+                             f"text={item.get('text', '')}")
+
+            # Decision logic — pick the cheapest available offer.
+            #
+            # For Reg SHO threshold symbols, TZ returns two parallel rows:
+            #   - primary quoteReqID → PreBorrow side (locateType=3, reusable, pricier)
+            #   - <quoteReqID>.SU    → SingleUse side (locateType=4, one-shot, cheaper)
+            # Per TZ docs: SU is typically 3-5x cheaper. Default is to prefer SU
+            # unless we need PB's reusable-through-day behavior. For one-direction
+            # short strategies (this code's use case), SU is always preferred.
+            #
+            # Non-threshold names get only one row (standard Locate, type 1 or 2),
+            # in which case SU sibling won't exist and we return the primary.
+            primary_offered = (primary_item is not None
+                               and primary_item.get("locateStatus") == 65)
+            su_offered      = (su_item is not None
+                               and su_item.get("locateStatus") == 65)
+
+            if primary_offered and su_offered:
+                # Both pools priced — pick cheaper (typically SU)
+                primary_price = float(primary_item.get("locatePrice", 0))
+                su_price      = float(su_item.get("locatePrice", 0))
+                if su_price > 0 and (primary_price == 0 or su_price <= primary_price):
+                    log.info(f"  [{symbol}] Both pools offered — choosing SU "
+                             f"@ ${su_price}/sh (vs PB @ ${primary_price}/sh, "
+                             f"saving ${primary_price - su_price:.4f}/sh, "
+                             f"{((primary_price - su_price) / primary_price * 100) if primary_price else 0:.0f}%)")
+                    return su_item
+                else:
+                    log.info(f"  [{symbol}] Both pools offered — choosing PB "
+                             f"@ ${primary_price}/sh (SU @ ${su_price}/sh not cheaper)")
+                    return primary_item
+
+            if primary_offered:
+                # Only primary is offered (non-threshold name, or SU still pending/never appeared)
+                return primary_item
+
+            if su_offered:
+                # SU offered but primary is not yet at 65 — could be Pending or Rejected
+                # Per docs: for threshold names where only SU has inventory, primary
+                # stays at status 54 (Pending) or transitions to 56 (Rejected with err 11).
+                # Either way, SU is our only choice and we should take it.
+                primary_status = primary_item.get("locateStatus") if primary_item else None
+                log.info(f"  [{symbol}] Only SU offered (primary status={primary_status}) — "
+                         f"using SU @ ${su_item.get('locatePrice')}/sh")
+                return su_item
+
+            # No offered row yet — check for terminal rejections on primary
+            if primary_item and primary_item.get("locateStatus") in (56, 67, 52):
+                # Primary terminally rejected and no SU offer — give up
+                if su_item and su_item.get("locateStatus") in (56, 67, 52):
+                    log.info(f"  [{symbol}] Both pools terminally rejected — giving up")
+                return primary_item
+
+            log.info(f"  [{symbol}] {quote_req_id} not yet actionable — polling again")
+        else:
+            log.warning(f"  [{symbol}] Locate poll failed: {r.status_code}")
+        time.sleep(LOCATE_POLL_INTERVAL)
+    log.warning(f"  [{symbol}] Locate poll timed out after {LOCATE_POLL_TIMEOUT}s")
+    return None
+
+
+def accept_locate(quote_req_id):
+    payload = {"accountId": ACCOUNT_ID, "quoteReqID": quote_req_id}
+    return tz_post("/v1/api/accounts/locates/accept", payload, "LOCATE_ACCEPT")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# REAL ACCOUNT — LOCATE + SHORT BACKGROUND THREAD
+# ══════════════════════════════════════════════════════════════════════════════
+def check_existing_locate(symbol, required_quantity):
+    """
+    Check the inventory endpoint for currently available locate shares.
+    Returns (True, available_qty) if usable, (False, 0) otherwise.
+    """
+    r = tz_get(f"/v1/api/accounts/{ACCOUNT_ID}/locates/inventory", "LOCATE_INVENTORY")
+    if r.status_code != 200:
+        log.warning(f"[{symbol}] Could not check locate inventory: {r.status_code}")
+        return False, 0
+    inventory = r.json().get("locateInventory", [])
+    for item in inventory:
+        if item.get("symbol", "").upper() != symbol.upper():
+            continue
+        available = int(item.get("available", 0))
+        sold      = int(item.get("sold", 0))
+        log.info(f"[{symbol}] Inventory: available={available} sold={sold} "
+                 f"unavailable={item.get('unavailable',0)} toBeSold={item.get('toBeSold',0)}")
+        if available >= required_quantity:
+            log.info(f"[{symbol}] Existing locate usable: {available} shares available in inventory")
+            return True, available
+        elif available > 0:
+            log.info(f"[{symbol}] Locate inventory insufficient: {available} available < {required_quantity} required — requesting fresh locate")
+        else:
+            log.info(f"[{symbol}] No available inventory for {symbol} — requesting fresh locate")
+        return False, 0
+    log.info(f"[{symbol}] Symbol not found in locate inventory — requesting fresh locate")
+    return False, 0
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PRICE SANITY  (Yahoo Finance / Twelve Data)
+# ══════════════════════════════════════════════════════════════════════════════
+PRICE_SANITY_PCT = 0.15
+
+TICKER_ALIASES = {
+    "FPGP": "ALTO",
+    "AGE":  "SER",
+    "HAPP": "PAVS",
+    "GTNR": "CLRO",
+    "IINN": "QTEX",
+    "SYTA": "CHAI",
+    "PHH":  "BYAH",
+    "DFFN": "CRVO",
+    "RMED": "VTAK",
+    "AGBA": "ILLR",
+}
+
+POLYGON_API_KEY = (os.getenv("POLYGON_API_KEY") or "").strip()
+
+_polygon_rename_cache = {}
+_polygon_cache_lock   = threading.Lock()
+
+
+def resolve_symbol(qc_symbol):
+    if qc_symbol in TICKER_ALIASES:
+        resolved = TICKER_ALIASES[qc_symbol]
+        log.info(f"[{qc_symbol}] Alias map → {resolved}")
+        return resolved
+
+    with _polygon_cache_lock:
+        if qc_symbol in _polygon_rename_cache:
+            resolved = _polygon_rename_cache[qc_symbol]
+            log.info(f"[{qc_symbol}] Runtime cache → {resolved}")
+            return resolved
+
+    if not POLYGON_API_KEY:
+        log.info(f"[{qc_symbol}] POLYGON_API_KEY not set — skipping rename check")
+        return qc_symbol
+
+    try:
+        base = "https://api.polygon.io/v3/reference/tickers"
+
+        r1 = requests.get(
+            base,
+            params={"ticker": qc_symbol, "active": "false", "apiKey": POLYGON_API_KEY},
+            timeout=8,
+        )
+        if not r1.ok or not r1.json().get("results"):
+            log.info(f"[{qc_symbol}] Polygon: ticker not found in delisted list — no rename")
+            return qc_symbol
+
+        cik = r1.json()["results"][0].get("cik")
+        if not cik:
+            log.info(f"[{qc_symbol}] Polygon: no CIK returned — cannot resolve rename")
+            return qc_symbol
+
+        r2 = requests.get(
+            base,
+            params={"cik": cik, "active": "true", "apiKey": POLYGON_API_KEY},
+            timeout=8,
+        )
+        if not r2.ok or not r2.json().get("results"):
+            log.info(f"[{qc_symbol}] Polygon: no active ticker found for CIK {cik}")
+            return qc_symbol
+
+        current_ticker = r2.json()["results"][0].get("ticker", "").upper()
+        if not current_ticker or current_ticker == qc_symbol:
+            log.info(f"[{qc_symbol}] Polygon: no rename detected (CIK={cik})")
+            return qc_symbol
+
+        with _polygon_cache_lock:
+            _polygon_rename_cache[qc_symbol] = current_ticker
+
+        log.warning(
+            f"\n"
+            f"╔══════════════════════════════════════════════════════════╗\n"
+            f"║  TICKER RENAME DETECTED via Polygon                      ║\n"
+            f"║  QC ticker : {qc_symbol:<10}  →  Current : {current_ticker:<10}       ║\n"
+            f"║  CIK       : {cik:<46} ║\n"
+            f"║  ACTION    : add to TICKER_ALIASES in server code:       ║\n"
+            f'║    "{qc_symbol}": "{current_ticker}",{" " * max(0, 43 - len(qc_symbol) - len(current_ticker))}║\n'
+            f"╚══════════════════════════════════════════════════════════╝"
+        )
+        # Persist to sheet renames tab for periodic review and TICKER_ALIASES updates
+        log_rename(qc_ticker=qc_symbol, resolved_ticker=current_ticker,
+                   cik=cik, source="polygon",
+                   notes=f"detected at runtime; add to TICKER_ALIASES")
+        return current_ticker
+
+    except Exception as e:
+        log.warning(f"[{qc_symbol}] Polygon rename lookup failed: {e} — using QC symbol as-is")
+        return qc_symbol
+
+
+def _get_twelvedata_price(symbol):
+    if not TWELVEDATA_API_KEY:
+        return None, None
+    import urllib.request as _req
+    url = f"https://api.twelvedata.com/price?symbol={symbol}&apikey={TWELVEDATA_API_KEY}"
+    try:
+        req = _req.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with _req.urlopen(req, timeout=5) as resp:
+            data = __import__('json').loads(resp.read())
+        if "price" not in data:
+            log.warning(f"Twelve Data error for {symbol}: {data.get('message', data)}")
+            return None, None
+        price = float(data["price"])
+        if price > 0:
+            return price, "twelvedata"
+        return None, None
+    except Exception as e:
+        log.warning(f"Twelve Data price lookup failed for {symbol}: {e}")
+        return None, None
+
+
+def _get_yahoo_price(symbol):
+    import urllib.request as _req, datetime as _dt, json as _json
+
+    utc_now   = _dt.datetime.now(_dt.timezone.utc)
+    year      = utc_now.year
+    dst_start = _dt.datetime(year, 3, 1) + _dt.timedelta(
+        days=(6 - _dt.datetime(year, 3, 1).weekday()) % 7 + 7)
+    dst_end   = _dt.datetime(year, 11, 1) + _dt.timedelta(
+        days=(6 - _dt.datetime(year, 11, 1).weekday()) % 7)
+    is_dst    = dst_start <= utc_now.replace(tzinfo=None) < dst_end
+    offset    = -4 if is_dst else -5
+    et_now    = utc_now + _dt.timedelta(hours=offset)
+    et_time   = et_now.hour * 60 + et_now.minute
+    rth_open  = 9 * 60 + 30
+    rth_close = 16 * 60
+    pre_open  = 4 * 60
+    is_pre    = pre_open <= et_time < rth_open
+    is_rth    = rth_open <= et_time < rth_close
+    is_ah     = rth_close <= et_time < 20 * 60
+
+    try:
+        url = (f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
+               f"?interval=1m&range=2d&includePrePost=true")
+        req = _req.Request(url, headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+        })
+        with _req.urlopen(req, timeout=5) as resp:
+            raw   = _json.loads(resp.read())
+        result    = raw["chart"]["result"][0]
+        meta      = result["meta"]
+        closes    = result["indicators"]["quote"][0].get("close", [])
+        timestamps = result.get("timestamp", [])
+
+        if is_rth:
+            price = meta.get("regularMarketPrice")
+            label = "yahoo_v8(regular)" if price else None
+        else:
+            now_ts     = utc_now.timestamp()
+            lookback_s = 4 * 3600 if is_ah else 13 * 3600
+            price  = None
+            label  = None
+            for i in range(len(closes) - 1, -1, -1):
+                c = closes[i]
+                if c is None:
+                    continue
+                ts = timestamps[i] if i < len(timestamps) else 0
+                if now_ts - ts > lookback_s:
+                    break
+                price = float(c)
+                label = "yahoo_v8(postMarket)" if is_ah else "yahoo_v8(preMarket)"
+                break
+
+            if price is None:
+                price = meta.get("regularMarketPrice")
+                label = "yahoo_v8(lastClose)" if price else None
+                if price:
+                    log.warning(f"Yahoo: no session bars found within {lookback_s//3600}h — "
+                                f"using lastClose ${price:.4f} (may be stale)")
+                total_bars   = len(closes)
+                last_ts      = timestamps[-1] if timestamps else 0
+                last_ts_age  = int(now_ts - last_ts)
+                last_nonnull = next((closes[i] for i in range(len(closes)-1, -1, -1) if closes[i] is not None), None)
+                last_nonnull_ts = 0
+                for i in range(len(closes)-1, -1, -1):
+                    if closes[i] is not None:
+                        last_nonnull_ts = timestamps[i] if i < len(timestamps) else 0
+                        break
+                log.warning(f"Yahoo diagnostic: total_bars={total_bars} | "
+                            f"last_ts={last_ts} (age={last_ts_age}s) | "
+                            f"last_nonnull_close=${last_nonnull} @ ts={last_nonnull_ts} "
+                            f"(age={int(now_ts - last_nonnull_ts)}s) | "
+                            f"lookback={lookback_s}s | "
+                            f"url=?interval=1m&range=2d&includePrePost=true")
+
+        if price and label:
+            log.info(f"[{symbol}] Yahoo price: {label} = ${price:.4f}")
+            return float(price), label
+        return None, None
+    except Exception as e:
+        log.warning(f"[{symbol}] Yahoo v8 chart failed: {e}")
+        return None, None
+
+
+def get_live_price(symbol):
+    import datetime as _dt
+    now_et = _dt.datetime.now(ZoneInfo("America/New_York"))
+    t = now_et.time()
+
+    rth_start = _dt.time(9, 30)
+    rth_end   = _dt.time(16, 0)
+
+    if rth_start <= t < rth_end:
+        price, label = _get_twelvedata_price(symbol)
+        if price:
+            return price, label
+        log.info(f"[{symbol}] Twelve Data unavailable — trying Yahoo fallback")
+        return _get_yahoo_price(symbol)
+    else:
+        log.info(f"[{symbol}] Outside RTH ({t.strftime('%H:%M')} ET) — using Yahoo session price directly")
+        return _get_yahoo_price(symbol)
+
+
+def get_yahoo_price(symbol):
+    return get_live_price(symbol)
+
+
+def locate_and_short(symbol, qc_quantity, entry_price):
+    log.info(f"[{symbol}] ── LOCATE THREAD STARTED ──────────────────────")
+    log.info(f"[{symbol}] QC requested: qty={qc_quantity} entry_price=${entry_price}")
+
+    # ── Step 0: Price sanity check ─────────────────────────────────────────
+    log.info(f"[{symbol}] Step 0: Price sanity check (QC=${entry_price:.4f})")
+    live_price, live_session = get_live_price(symbol)
+    if live_price is not None:
+        deviation = abs(entry_price - live_price) / live_price
+        log.info(f"[{symbol}] Price check: {live_session}=${live_price:.4f} | QC=${entry_price:.4f} | "
+                 f"deviation={deviation*100:.2f}% (limit={PRICE_SANITY_PCT*100:.0f}%)")
+
+        if live_session == "yahoo_v8(lastClose)":
+            log.info(f"[{symbol}] Price sanity SKIPPED — {live_session} is yesterday's close")
+        elif deviation > PRICE_SANITY_PCT:
+            log_locate(symbol=symbol, entry_price=entry_price,
+                       outcome='REJECTED_BY_PRICE_SANITY',
+                       trade_outcome='BLOCKED_NO_TRADE',
+                       notes=f"REAL | QC=${entry_price} vs {live_session}=${live_price:.4f} "
+                             f"({deviation*100:.1f}%)")
+            block(symbol, f"price sanity FAILED: QC=${entry_price} vs {live_session}=${live_price:.4f} "
+                          f"({deviation*100:.1f}% > {PRICE_SANITY_PCT*100:.0f}% limit)")
+            return
+        else:
+            log.info(f"[{symbol}] Price sanity OK ✓")
+    else:
+        log.warning(f"[{symbol}] All price sources exhausted — proceeding unvalidated")
+
+    # ── Step 1: Check buying power ─────────────────────────────────────────
+    log.info(f"[{symbol}] Step 1: Checking buying power and margin")
+    account = get_account_details()
+    if account is None:
+        block(symbol, "failed to retrieve account details")
+        return
+
+    available_cash   = float(account.get("buyingPower",     account.get("availableCash", 0)))
+    margin_available = float(account.get("marginAvailable", available_cash))
+    log.info(f"[{symbol}] buyingPower=${available_cash:,.2f} | marginAvailable=${margin_available:,.2f}")
+
+    usable_capital = min(available_cash, margin_available)
+
+    HIGH_RISK_BUFFER = 1.25
+
+    from datetime import datetime as _datetime, time as _time
+    now_et = _datetime.now(ZoneInfo("America/New_York"))
+    et_time = now_et.time()
+    rth_open  = _time(4,  0)
+    rth_close = _time(16, 0)
+    ah_close  = _time(20, 0)
+    in_premarket_or_rth = rth_open <= et_time < rth_close
+    in_ah               = rth_close <= et_time < ah_close
+
+    if in_premarket_or_rth:
+        if entry_price < 2.50:
+            margin_per_share = 2.50
+        elif entry_price < 5.00:
+            margin_per_share = entry_price / 6.0
+        else:
+            margin_per_share = (entry_price / 6.0) * HIGH_RISK_BUFFER
+    elif in_ah:
+        if entry_price < 2.50:
+            margin_per_share = 5.00
+        elif entry_price < 5.00:
+            margin_per_share = 5.00
+        else:
+            margin_per_share = (entry_price / 2.0) * HIGH_RISK_BUFFER
+    else:
+        margin_per_share = max(5.0, (entry_price / 2.0) * HIGH_RISK_BUFFER)
+
+    max_affordable = int(usable_capital / margin_per_share)
+    session_label = 'pre/RTH' if in_premarket_or_rth else 'AH' if in_ah else 'closed'
+    buffer_note   = f" (incl {int((HIGH_RISK_BUFFER-1)*100)}% safety buffer)" if entry_price >= 5.0 else ""
+    log.info(f"[{symbol}] session={session_label} | "
+             f"margin_per_share=${margin_per_share:.4f}{buffer_note} | "
+             f"max_affordable={max_affordable}")
+
+    # ─── R57 CAP ──────────────────────────────────────────────────────────
+    # TZ rule R57: a single position cannot exceed 50% of Start-Of-Day BP.
+    # The R35 margin math above respects current BP but not the SOD-BP cap,
+    # so positions that fit margin-wise can still get R57'd at locate or
+    # order time. We pre-emptively cap at 45% (5% safety buffer below the
+    # actual 50% ceiling) so we get a smaller successful trade rather than
+    # an outright rejection on bigger positions.
+    sod_equity        = float(account.get("sodEquity", available_cash))
+    sod_bp_estimate   = sod_equity * 6.0   # margin account leverage
+    if entry_price > 0:
+        r57_cap_shares = int((sod_bp_estimate * 0.45) / entry_price)
+        if r57_cap_shares < max_affordable:
+            log.info(f"[{symbol}] R57 cap binding: SOD_BP=${sod_bp_estimate:,.0f} × 45% / ${entry_price} "
+                     f"= {r57_cap_shares}sh < margin_max {max_affordable}sh — using R57 cap")
+            max_affordable = r57_cap_shares
+
+    if max_affordable < MIN_LOCATE_QUANTITY:
+        block(symbol, f"cannot afford minimum {MIN_LOCATE_QUANTITY} shares — "
+                      f"max_affordable={max_affordable} at ${entry_price}")
+        return
+
+    raw_quantity = min(qc_quantity, max_affordable)
+    request_quantity = max(MIN_LOCATE_QUANTITY, int(raw_quantity / 100) * 100)
+    if request_quantity > max_affordable:
+        request_quantity = int(max_affordable / 100) * 100
+    if request_quantity < MIN_LOCATE_QUANTITY:
+        block(symbol, f"cannot afford minimum {MIN_LOCATE_QUANTITY} shares after rounding")
+        return
+    log.info(f"[{symbol}] request_quantity={request_quantity} "
+             f"(floored to 100s | qc={qc_quantity}, raw={raw_quantity}, max_affordable={max_affordable})")
+
+    # ── LOCATE 1:1 BP CAP ──────────────────────────────────────────────────
+    # TZ evaluates fresh LOCATE requests at ~1:1 notional (not leveraged margin).
+    # Cap the fresh locate request size so its notional stays under
+    # LOCATE_BP_USAGE × usable BP — otherwise TZ R35's the locate before any
+    # order is placed. This cap applies ONLY to the fresh locate request size;
+    # order affordability and reuse of an existing locate stay on max_affordable
+    # (leveraged), since a secured locate carries no R35 risk.
+    locate_request_quantity = request_quantity
+    if entry_price > 0:
+        locate_bp_cap = max(
+            MIN_LOCATE_QUANTITY,
+            int((usable_capital * LOCATE_BP_USAGE) / entry_price / 100) * 100
+        )
+        if locate_bp_cap < locate_request_quantity:
+            log.info(f"[{symbol}] Locate 1:1 BP cap: {LOCATE_BP_USAGE*100:.0f}% × "
+                     f"${usable_capital:,.0f} / ${entry_price} = {locate_bp_cap}sh "
+                     f"< request {locate_request_quantity}sh — capping fresh locate size "
+                     f"(TZ locates are ~1:1, not leveraged)")
+            locate_request_quantity = locate_bp_cap
+
+    # ── Step 3b: Check existing locate ────────────────────────────────────
+    log.info(f"[{symbol}] Step 3b: Checking for existing locate today")
+    has_locate, located_qty = check_existing_locate(symbol, locate_request_quantity)
+    if has_locate:
+        log.info(f"[{symbol}] Skipping locate request — using existing locate "
+                 f"({located_qty} shares already accepted today)")
+
+        # Existing locate is already secured → bound by leveraged order margin,
+        # NOT the 1:1 locate cap.
+        affordable_qty = min(located_qty, max_affordable)
+        if affordable_qty < MIN_SHORT_QUANTITY:
+            block(symbol, f"existing locate ({located_qty}sh) but cannot afford "
+                          f"even 1sh at ${entry_price}")
+            return
+        if affordable_qty < located_qty:
+            log.info(f"[{symbol}] Capping existing locate from {located_qty}sh to "
+                     f"{affordable_qty}sh — max_affordable={max_affordable}")
+        final_quantity = affordable_qty
+
+        log.info(f"[{symbol}] Step 11: Placing short | qty={final_quantity} | "
+                 f"limit=${entry_price} (QC pre-buffered)")
+        try:
+            limit_price = entry_price
+            result = place_order_with_stepdown(symbol, final_quantity, limit_price, "SHORT_ORDER")
+            placed_qty = result.get("orderQuantity", final_quantity)
+            set_state(symbol, state="ACTIVE", client_order_id=result.get("clientOrderId"))
+            log.info(f"[{symbol}] STATE → ACTIVE")
+            log.info(f"[{symbol}] SHORT PLACED (existing locate) | qty={placed_qty} | "
+                     f"limit=${limit_price} | clientOrderId={result.get('clientOrderId')}")
+            threading.Thread(
+                target=monitor_short_fill,
+                args=(symbol, result.get("clientOrderId"), SHORT_FILL_TIMEOUT),
+                daemon=True
+            ).start()
+        except Exception as e:
+            block(symbol, f"order placement failed after all stepdown attempts: {e}")
+        return
+
+    # ── Step 4+5: Request locate + poll, with R35/R57 stepdown ─────────────
+    # TZ can R35/R57 a fresh locate even after the 1:1 pre-sizing (intraday BP
+    # drift; locate notional is ~1:1). On those BP/size rejections ONLY, retry
+    # at a smaller quantity via the ladder, down to MIN_LOCATE_QUANTITY.
+    #   start  < 1000sh → cycle down by 100 each retry
+    #   start >= 1000sh → geometric LOCATE_STEPDOWN_FACTOR ladder (capped)
+    # "No shares" (other err), expired, cancelled, and timeout are terminal and
+    # handled by the status block below.
+    ladder = _build_locate_ladder(locate_request_quantity)
+    log.info(f"[{symbol}] Locate stepdown ladder: {ladder}")
+    locate       = None
+    quote_req_id = None
+    for attempt, attempt_qty in enumerate(ladder, 1):
+        if get_state(symbol).get("state") != "LOCATING":
+            log.warning(f"[{symbol}] State changed during locate stepdown — aborting")
+            return
+
+        quote_req_id     = f"Q{int(time.time() * 1000)}"
+        request_quantity = attempt_qty          # downstream final_quantity = min(request_quantity, offered)
+        set_state(symbol, quote_req_id=quote_req_id)
+        log.info(f"[{symbol}] Step 4 (attempt {attempt}/{len(ladder)}): "
+                 f"Requesting locate | qty={attempt_qty} | quoteReqID={quote_req_id}")
+
+        r = request_locate_quote(symbol, attempt_qty, quote_req_id)
+        if r.status_code not in (200, 201, 202):
+            body  = r.text
+            is_bp = ("R35" in body or "R57" in body or "buying power" in body.lower())
+            if is_bp and attempt < len(ladder):
+                log.warning(f"[{symbol}] Locate HTTP rejection at {attempt_qty}sh "
+                            f"({r.status_code}: {body[:120]}) — stepping down")
+                continue
+            if "insufficient" in body.lower() or "inventory" in body.lower():
+                block(symbol, f"locate request failed — insufficient inventory: {body[:200]}")
+            else:
+                block(symbol, f"locate request failed: {r.status_code} | {body[:200]}")
+            return
+
+        log.info(f"[{symbol}] Step 5: Polling locate status (max {LOCATE_POLL_TIMEOUT}s)")
+        locate = poll_locate_status(symbol, quote_req_id)
+
+        if get_state(symbol).get("state") != "LOCATING":
+            log.warning(f"[{symbol}] State changed during locate poll — aborting")
+            return
+
+        if locate is None:
+            break  # timeout — terminal, handled below
+
+        # R35/R57 on the poll result → step down and retry
+        if (locate.get("locateStatus") == 56
+                and int(locate.get("locateError", 0) or 0) in (35, 57)
+                and attempt < len(ladder)):
+            log.warning(f"[{symbol}] Locate R{locate.get('locateError')} at {attempt_qty}sh "
+                        f"(text: {locate.get('text','')[:80]}) — stepping down")
+            continue
+
+        # Offered (65) or any non-BP terminal status — stop retrying
+        break
+
+    if locate is None:
+        log_locate(symbol=symbol, entry_price=entry_price,
+                   outcome='TIMEOUT', trade_outcome='BLOCKED_NO_TRADE',
+                   notes=f"REAL | no actionable status after {LOCATE_POLL_TIMEOUT}s")
+        block(symbol, f"locate timed out after {LOCATE_POLL_TIMEOUT}s")
+        return
+
+    status = locate.get("locateStatus")
+
+    if status == 56:
+        log_locate(symbol=symbol, entry_price=entry_price,
+                   outcome='REJECTED_BY_TZ_NO_SHARES',
+                   trade_outcome='BLOCKED_NO_TRADE',
+                   notes=f"REAL | status=56 text={locate.get('text', '')}")
+        block(symbol, f"locate rejected by TZ | text: {locate.get('text', '')}")
+        return
+    if status == 67:
+        log_locate(symbol=symbol, entry_price=entry_price,
+                   outcome='OTHER', trade_outcome='BLOCKED_NO_TRADE',
+                   notes="REAL | status=67 quote expired")
+        block(symbol, "locate quote expired")
+        return
+    if status == 52:
+        log_locate(symbol=symbol, entry_price=entry_price,
+                   outcome='OTHER', trade_outcome='BLOCKED_NO_TRADE',
+                   notes="REAL | status=52 cancelled")
+        block(symbol, "locate cancelled")
+        return
+    if status != 65:
+        log_locate(symbol=symbol, entry_price=entry_price,
+                   outcome='OTHER', trade_outcome='BLOCKED_NO_TRADE',
+                   notes=f"REAL | unexpected status={status}")
+        block(symbol, f"unexpected locate status: {status}")
+        return
+
+    locate_price     = float(locate.get("locatePrice", 0))
+    offered_quantity = int(locate.get("locateShares", 0))
+    locate_type      = locate.get("locateType", "")
+    locate_error     = locate.get("locateError", 0)
+    locate_text      = locate.get("text", "")
+
+    log.info(f"[{symbol}] Locate OFFERED: {offered_quantity} shares @ "
+             f"${locate_price}/share | type={locate_type} | "
+             f"error={locate_error} | text={locate_text}")
+
+    if locate_error == 1:
+        block(symbol, f"locate offered with error flag | text: {locate_text}")
+        return
+
+    if "insufficient" in locate_text.lower() or "inventory" in locate_text.lower():
+        block(symbol, f"insufficient inventory in locate response: {locate_text}")
+        return
+
+    final_quantity = min(request_quantity, offered_quantity) if offered_quantity > 0 else request_quantity
+    log.info(f"[{symbol}] final_quantity={final_quantity}")
+
+    if final_quantity < MIN_LOCATE_QUANTITY:
+        block(symbol, f"final quantity {final_quantity} below minimum {MIN_LOCATE_QUANTITY}")
+        return
+
+    if entry_price > 0 and locate_price > 0:
+        locate_cost_pct   = locate_price / entry_price
+        total_locate_cost = locate_price * final_quantity
+        log.info(f"[{symbol}] Locate cost: ${locate_price}/share x {final_quantity} = "
+                 f"${total_locate_cost:.2f} total | "
+                 f"{locate_cost_pct*100:.3f}% of entry ${entry_price}")
+        if locate_cost_pct > MAX_LOCATE_COST_PCT:
+            _route_for_log = 'SU_SECONDARY' if locate.get("quoteReqID", quote_req_id) != quote_req_id else 'PRIMARY'
+            log_locate(symbol=symbol, entry_price=entry_price,
+                       shares_offered=final_quantity,
+                       locate_cost_per_share=locate_price,
+                       route=_route_for_log,
+                       outcome='REJECTED_BY_COST',
+                       trade_outcome='BLOCKED_NO_TRADE',
+                       notes=f"REAL | {locate_cost_pct*100:.2f}% > {MAX_LOCATE_COST_PCT*100:.1f}%",
+                       locate_type=locate.get("locateType"),
+                       pre_borrow=locate.get("preBorrow"))
+            block(symbol, f"locate too expensive: {locate_cost_pct*100:.3f}% > "
+                          f"{MAX_LOCATE_COST_PCT*100:.1f}% threshold")
+            return
+    else:
+        log.warning(f"[{symbol}] Cannot calculate locate cost — proceeding")
+
+    accept_id = locate.get("quoteReqID", quote_req_id)
+    if accept_id != quote_req_id:
+        log.info(f"[{symbol}] Step 10: Accepting SU locate quoteReqID={accept_id}")
+    else:
+        log.info(f"[{symbol}] Step 10: Accepting locate quoteReqID={accept_id}")
+    r_accept = accept_locate(accept_id)
+    if r_accept.status_code not in (200, 201, 202):
+        block(symbol, f"locate accept failed: {r_accept.status_code} | {r_accept.text[:200]}")
+        return
+    log.info(f"[{symbol}] Locate accepted successfully")
+
+    # ── Poll inventory until locate is registered (fixes R43) ─────────────
+    log.info(f"[{symbol}] Step 10b: Polling inventory to confirm locate registered...")
+    inventory_confirmed = False
+    poll_deadline = time.time() + 15
+    poll_attempt  = 0
+    while time.time() < poll_deadline:
+        poll_attempt += 1
+        time.sleep(1)
+        r_inv = tz_get(f"/v1/api/accounts/{ACCOUNT_ID}/locates/inventory", "LOCATE_CONFIRM")
+        if r_inv.status_code == 200:
+            inventory = r_inv.json().get("locateInventory", [])
+            for item in inventory:
+                if item.get("symbol", "").upper() == symbol.upper():
+                    available = int(item.get("available", 0))
+                    if available >= final_quantity:
+                        log.info(f"[{symbol}] Inventory confirmed: {available} shares available "
+                                 f"(attempt {poll_attempt})")
+                        inventory_confirmed = True
+                        break
+        if inventory_confirmed:
+            break
+        log.info(f"[{symbol}] Locate not yet in inventory — retrying (attempt {poll_attempt})")
+
+    if not inventory_confirmed:
+        block(symbol, f"locate inventory not confirmed after 15s — R43 risk too high, aborting")
+        return
+
+    if get_state(symbol).get("state") != "LOCATING":
+        log.warning(f"[{symbol}] State changed after accept — aborting order")
+        return
+
+    # ── Step 11: Place short limit order ───────────────────────────────────
+    limit_price = entry_price
+    log.info(f"[{symbol}] Step 11: Placing short | qty={final_quantity} | "
+             f"entry/limit=${limit_price} (QC pre-buffered)")
+    try:
+        result = place_order_with_stepdown(symbol, final_quantity, limit_price, "SHORT_ORDER")
+        placed_qty = result.get("orderQuantity", final_quantity)
+        set_state(
+            symbol,
+            state="ACTIVE",
+            entry_price=entry_price,
+            quantity=placed_qty,
+            client_order_id=result.get("clientOrderId"),
+            locate_cost_per_share=locate_price,
+        )
+        log_locate(symbol=symbol, entry_price=entry_price,
+                   shares_offered=placed_qty,
+                   locate_cost_per_share=locate_price,
+                   route='SU_SECONDARY' if accept_id != quote_req_id else 'PRIMARY',
+                   outcome='ACCEPTED_TRADED',
+                   trade_outcome='UNKNOWN_PENDING',
+                   notes='REAL',
+                   locate_type=locate.get("locateType"),
+                   pre_borrow=locate.get("preBorrow"))
+        log.info(f"[{symbol}] SHORT PLACED | qty={placed_qty} | "
+                 f"limit=${limit_price} | clientOrderId={result.get('clientOrderId')}")
+        threading.Thread(
+            target=monitor_short_fill,
+            args=(symbol, result.get("clientOrderId"), SHORT_FILL_TIMEOUT),
+            daemon=True
+        ).start()
+    except Exception as e:
+        block(symbol, f"order placement failed after all stepdown attempts: {e}")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SIM ACCOUNT — PHANTOM LOCATE + SIM SHORT
+# ══════════════════════════════════════════════════════════════════════════════
+def locate_and_short_sim(symbol, qc_quantity, entry_price):
+    """
+    Sim-mode equivalent of locate_and_short().
+
+    Phantom locate flow (using REAL account credentials):
+      ┌─ Request locate quote on real account
+      ├─ Poll until offered / rejected / timeout
+      │    Offered  → record cost, log it, DO NOT accept (expires at status 67)
+      │    Rejected → block in sim state (realistic — TZ genuinely can't locate)
+      │    Timeout  → log warning, proceed anyway (don't punish sim for API lag)
+      └─ Place short order on SIM account (no locate required in sim)
+
+    The phantom locate is NEVER accepted so no inventory is consumed on the real
+    account and no locate fees are charged. The quote expires automatically.
+    """
+    log.info(f"[SIM:{symbol}] ── SIM LOCATE THREAD STARTED ─────────────────")
+    log.info(f"[SIM:{symbol}] QC requested: qty={qc_quantity} entry_price=${entry_price}")
+
+    # ── Step 0: Price sanity check ─────────────────────────────────────────
+    log.info(f"[SIM:{symbol}] Step 0: Price sanity check (QC=${entry_price:.4f})")
+    live_price, live_session = get_live_price(symbol)
+    if live_price is not None:
+        deviation = abs(entry_price - live_price) / live_price
+        log.info(f"[SIM:{symbol}] Price check: {live_session}=${live_price:.4f} | "
+                 f"QC=${entry_price:.4f} | deviation={deviation*100:.2f}%")
+        if live_session == "yahoo_v8(lastClose)":
+            log.info(f"[SIM:{symbol}] Price sanity SKIPPED — lastClose is stale reference")
+        elif deviation > PRICE_SANITY_PCT:
+            log_locate(symbol=symbol, entry_price=entry_price,
+                       outcome='REJECTED_BY_PRICE_SANITY',
+                       trade_outcome='BLOCKED_NO_TRADE',
+                       notes=f"SIM | QC=${entry_price} vs {live_session}=${live_price:.4f} "
+                             f"({deviation*100:.1f}%)")
+            sim_block(symbol, f"price sanity FAILED: QC=${entry_price} vs "
+                              f"{live_session}=${live_price:.4f} ({deviation*100:.1f}%)")
+            return
+        else:
+            log.info(f"[SIM:{symbol}] Price sanity OK ✓")
+    else:
+        log.warning(f"[SIM:{symbol}] All price sources exhausted — proceeding unvalidated")
+
+    # ── Step 1: Buying power check against SIM account ─────────────────────
+    log.info(f"[SIM:{symbol}] Step 1: Checking SIM account buying power")
+    account = sim_get_account_details()
+    if account is None:
+        sim_block(symbol, "failed to retrieve SIM account details")
+        return
+
+    available_cash   = float(account.get("buyingPower", account.get("availableCash", 0)))
+    margin_available = float(account.get("marginAvailable", available_cash))
+    log.info(f"[SIM:{symbol}] SIM buyingPower=${available_cash:,.2f} | "
+             f"marginAvailable=${margin_available:,.2f}")
+    usable_capital = min(available_cash, margin_available)
+
+    from datetime import datetime as _datetime, time as _time
+    now_et = _datetime.now(ZoneInfo("America/New_York"))
+    et_time = now_et.time()
+    in_premarket_or_rth = _time(4, 0)  <= et_time < _time(16, 0)
+    in_ah               = _time(16, 0) <= et_time < _time(20, 0)
+
+    HIGH_RISK_BUFFER = 1.25
+    if in_premarket_or_rth:
+        if entry_price < 2.50:    margin_per_share = 2.50
+        elif entry_price < 5.00:  margin_per_share = entry_price / 6.0
+        else:                     margin_per_share = (entry_price / 6.0) * HIGH_RISK_BUFFER
+    elif in_ah:
+        if entry_price < 5.00:    margin_per_share = 5.00
+        else:                     margin_per_share = (entry_price / 2.0) * HIGH_RISK_BUFFER
+    else:
+        margin_per_share = max(5.0, (entry_price / 2.0) * HIGH_RISK_BUFFER)
+
+    max_affordable = int(usable_capital / margin_per_share)
+    log.info(f"[SIM:{symbol}] max_affordable={max_affordable} "
+             f"(usable=${usable_capital:,.2f} / margin=${margin_per_share:.4f}/share)")
+
+    if max_affordable < MIN_LOCATE_QUANTITY:
+        sim_block(symbol, f"SIM cannot afford minimum {MIN_LOCATE_QUANTITY} shares "
+                          f"(max_affordable={max_affordable} at ${entry_price})")
+        return
+
+    raw_quantity     = min(qc_quantity, max_affordable)
+    request_quantity = max(MIN_LOCATE_QUANTITY, int(raw_quantity / 100) * 100)
+    if request_quantity > max_affordable:
+        request_quantity = int(max_affordable / 100) * 100
+    if request_quantity < MIN_LOCATE_QUANTITY:
+        sim_block(symbol, f"SIM cannot afford minimum {MIN_LOCATE_QUANTITY} shares after rounding")
+        return
+
+    log.info(f"[SIM:{symbol}] request_quantity={request_quantity} "
+             f"(qc={qc_quantity} raw={raw_quantity} max_affordable={max_affordable})")
+
+    # ── Step 1b: Compute probe quantity for phantom locate ─────────────────
+    # The real account is smaller than the sim account, so locating the full
+    # sim quantity often fails with R35/R57. To still get a per-share cost
+    # quote we probe at the largest quantity the real account can afford,
+    # then extrapolate the cost up to the sim quantity.
+    #
+    # IMPORTANT: TZ enforces R35 on locate requests using ~1:1 buying power
+    # (notional <= available BP), NOT the leveraged margin used for orders.
+    # Empirically, locate requests at notional > BP fail with R35 even though
+    # the real account has 6x leverage available at order placement.
+    PROBE_BP_USAGE = 0.85  # use at most 85% of real BP for probe notional (safety buffer)
+    probe_quantity = request_quantity
+    skip_probe = False
+    try:
+        real_account = get_account_details()
+        if real_account is not None:
+            real_cash   = float(real_account.get("buyingPower", real_account.get("availableCash", 0)))
+            real_margin = float(real_account.get("marginAvailable", real_cash))
+            real_usable = min(real_cash, real_margin)
+            # Locate uses 1:1 margin (notional == cost), not leveraged margin
+            real_max_affordable = int(real_usable * PROBE_BP_USAGE / entry_price) if entry_price > 0 else 0
+            # R57: position notional <= 50% of SOD BP. Approximate from sodEquity * 6.
+            sod_equity          = float(real_account.get("sodEquity", real_cash))
+            sod_bp_estimate     = sod_equity * 6.0
+            r57_cap_shares      = int((sod_bp_estimate * 0.45) / entry_price) if entry_price > 0 else real_max_affordable
+            real_safe_qty       = min(real_max_affordable, r57_cap_shares)
+            real_safe_qty       = max(MIN_LOCATE_QUANTITY, int(real_safe_qty / 100) * 100)
+            probe_quantity      = min(request_quantity, real_safe_qty)
+            # If even 100 shares is over BP (high-priced stock + small account),
+            # we can't safely probe — skip the locate and proceed with sim order.
+            probe_notional = probe_quantity * entry_price
+            if probe_notional > real_usable * PROBE_BP_USAGE:
+                log.warning(f"[SIM:{symbol}] Cannot probe: even {probe_quantity}sh @ ${entry_price:.2f} "
+                            f"= ${probe_notional:.2f} > {PROBE_BP_USAGE*100:.0f}% of real BP ${real_usable:,.2f} — "
+                            f"skipping phantom locate")
+                skip_probe = True
+            else:
+                log.info(f"[SIM:{symbol}] PROBE SIZING: real_bp=${real_usable:,.2f} "
+                         f"real_safe_qty={real_safe_qty} sim_qty={request_quantity} "
+                         f"→ probe_quantity={probe_quantity} (notional ${probe_notional:.2f})")
+        else:
+            log.warning(f"[SIM:{symbol}] Could not get real account details — probing at sim_quantity={request_quantity}")
+    except Exception as e:
+        log.warning(f"[SIM:{symbol}] Probe sizing failed: {e} — probing at sim_quantity={request_quantity}")
+
+    # ── Step 2: Phantom locate on REAL account ─────────────────────────────
+    locate_cost_per_share = 0.0
+    total_phantom_cost    = 0.0
+    locate_check_ok       = False
+    locate_type_code      = None
+    pre_borrow_flag       = None
+
+    if skip_probe:
+        log_locate(symbol=symbol, entry_price=entry_price,
+                   outcome='OTHER', trade_outcome='UNKNOWN_PENDING',
+                   notes=f"SIM | sim wants {request_quantity}sh but real BP cannot support even {probe_quantity}sh probe — "
+                         f"phantom skipped, proceeding with sim order")
+    else:
+        # Retry loop: if probe fails with R35/R57 (BP/size issue, not "no shares"),
+        # halve the probe and try again. Max 3 attempts, floor at MIN_LOCATE_QUANTITY.
+        MAX_PROBE_ATTEMPTS = 3
+        probe_attempt = 0
+        locate = None
+        r = None
+        while probe_attempt < MAX_PROBE_ATTEMPTS:
+            probe_attempt += 1
+            quote_req_id = f"SIM{int(time.time() * 1000)}_{probe_attempt}"
+            log.info(f"[SIM:{symbol}] Step 2 attempt {probe_attempt}/{MAX_PROBE_ATTEMPTS}: "
+                     f"Phantom locate on REAL account | "
+                     f"quoteReqID={quote_req_id} (probe_qty={probe_quantity}, will NOT be accepted)")
+            try:
+                r = request_locate_quote(symbol, probe_quantity, quote_req_id)
+            except Exception as e:
+                log.warning(f"[SIM:{symbol}] Phantom locate request exception: {e}")
+                break
+
+            if r.status_code not in (200, 201, 202):
+                log.warning(f"[SIM:{symbol}] Phantom locate HTTP error: {r.status_code} | {r.text[:200]}")
+                break
+
+            locate = poll_locate_status(symbol, quote_req_id)
+            if locate is None:
+                # timeout — don't retry, treat as terminal
+                break
+
+            # Check if this is a BP/size rejection we should retry on
+            err = locate.get("locateError", 0)
+            if locate.get("locateStatus") == 56 and err in (35, 57):
+                # BP/size rejection → halve and retry
+                new_probe = max(MIN_LOCATE_QUANTITY, int(probe_quantity / 2 / 100) * 100)
+                if new_probe < MIN_LOCATE_QUANTITY or new_probe == probe_quantity:
+                    log.warning(f"[SIM:{symbol}] Probe at {probe_quantity}sh got R{err}, "
+                                f"cannot scale down further (already at minimum)")
+                    break
+                log.warning(f"[SIM:{symbol}] Probe at {probe_quantity}sh got R{err} — "
+                            f"scaling down to {new_probe}sh and retrying")
+                probe_quantity = new_probe
+                continue
+            else:
+                # Got an actionable status (65 offered, 56 with other error, 67 expired, 52 cancelled)
+                break
+
+        # Now process the final locate result
+        try:
+            if r is None or r.status_code not in (200, 201, 202):
+                log.warning(f"[SIM:{symbol}] Phantom locate request failed after {probe_attempt} attempt(s) — "
+                            f"proceeding without cost data")
+            else:
+                # locate result already obtained by retry loop above
+
+                if locate is None:
+                    log_locate(symbol=symbol, entry_price=entry_price,
+                               outcome='TIMEOUT', trade_outcome='UNKNOWN_PENDING',
+                               notes=f"SIM | probed {probe_quantity}sh (sim wants {request_quantity}sh) | "
+                                     f"phantom locate no status after {LOCATE_POLL_TIMEOUT}s — proceeding with sim order")
+                    log.warning(f"[SIM:{symbol}] Phantom locate timed out — "
+                                f"proceeding without cost data")
+    
+                elif locate.get("locateStatus") == 56:
+                    reason = locate.get("text", "no reason given")
+                    err = locate.get("locateError", 0)
+                    # Did we exhaust retries on a BP-related error?
+                    if err in (35, 57):
+                        log_locate(symbol=symbol, entry_price=entry_price,
+                                   outcome='OTHER', trade_outcome='UNKNOWN_PENDING',
+                                   notes=f"SIM | sim wants {request_quantity}sh | probe exhausted at {probe_quantity}sh "
+                                         f"with R{err} after {probe_attempt} attempts — phantom skipped, proceeding with sim order")
+                        log.warning(f"[SIM:{symbol}] Probe retries exhausted — R{err} at {probe_quantity}sh — "
+                                    f"proceeding without cost data")
+                    else:
+                        log_locate(symbol=symbol, entry_price=entry_price,
+                                   outcome='REJECTED_BY_TZ_NO_SHARES',
+                                   trade_outcome='UNKNOWN_PENDING',
+                                   notes=f"SIM | probed {probe_quantity}sh (sim wants {request_quantity}sh) | "
+                                         f"phantom status=56 err={err} text={reason} — proceeding with sim order")
+                        log.warning(f"[SIM:{symbol}] Phantom locate REJECTED by TZ: {reason} — "
+                                    f"logging only, proceeding with sim order (cost data: $0.00)")
+    
+                elif locate.get("locateStatus") in (67, 52):
+                    log_locate(symbol=symbol, entry_price=entry_price,
+                               outcome='OTHER', trade_outcome='UNKNOWN_PENDING',
+                               notes=f"SIM | probed {probe_quantity}sh (sim wants {request_quantity}sh) | "
+                                     f"phantom status={locate.get('locateStatus')} expired/cancelled — proceeding with sim order")
+                    log.warning(f"[SIM:{symbol}] Phantom locate expired/cancelled — "
+                                f"proceeding without cost data")
+    
+                elif locate.get("locateStatus") == 65:
+                    # Offered — record cost per share, extrapolate to sim quantity, DO NOT accept
+                    locate_cost_per_share = float(locate.get("locatePrice", 0))
+                    offered_qty           = int(locate.get("locateShares", 0))
+                    locate_type_code      = locate.get("locateType")
+                    pre_borrow_flag       = locate.get("preBorrow")
+                    # Sim trade will execute at request_quantity; extrapolate cost from
+                    # probe rate. Note this may underestimate true cost if inventory is
+                    # thin (desk would quote higher for larger quantity).
+                    total_phantom_cost    = locate_cost_per_share * request_quantity
+                    cost_pct              = (locate_cost_per_share / entry_price * 100) if entry_price > 0 else 0
+                    locate_check_ok       = True
+    
+                    # Human-readable type label for log output
+                    type_label = {1: "Locate", 2: "Locate", 3: "PreBorrow", 4: "SingleUse"}.get(
+                        locate_type_code, f"unknown({locate_type_code})")
+                    log.info(
+                        f"\n[SIM:{symbol}] ╔══ PHANTOM LOCATE RESULT ═════════════════════╗\n"
+                        f"[SIM:{symbol}] ║  Probed qty  :  {probe_quantity} shares (real BP limited)\n"
+                        f"[SIM:{symbol}] ║  Offered qty :  {offered_qty} shares\n"
+                        f"[SIM:{symbol}] ║  Locate type :  {type_label} (code={locate_type_code}, preBorrow={pre_borrow_flag})\n"
+                        f"[SIM:{symbol}] ║  Cost/share  :  ${locate_cost_per_share:.4f}  ({cost_pct:.3f}% of entry)\n"
+                        f"[SIM:{symbol}] ║  Sim qty     :  {request_quantity} shares\n"
+                        f"[SIM:{symbol}] ║  Extrap cost :  ${total_phantom_cost:.2f}  (cost/share × sim_qty)\n"
+                        f"[SIM:{symbol}] ║  Threshold   :  {SIM_MAX_LOCATE_COST_PCT*100:.1f}%  "
+                        f"→ {'✓ WITHIN' if cost_pct/100 <= SIM_MAX_LOCATE_COST_PCT else '✗ WOULD BLOCK'}"
+                        f"{'  (REAL limit ' + format(MAX_LOCATE_COST_PCT*100, '.1f') + '% would BLOCK)' if cost_pct/100 > MAX_LOCATE_COST_PCT else ''}\n"
+                        f"[SIM:{symbol}] ║  Action      :  NOT accepted (sim mode — expires naturally)\n"
+                        f"[SIM:{symbol}] ╚══════════════════════════════════════════════════╝"
+                    )
+    
+                    if entry_price > 0 and locate_cost_per_share > 0:
+                        if locate_cost_per_share / entry_price > SIM_MAX_LOCATE_COST_PCT:
+                            log_locate(symbol=symbol, entry_price=entry_price,
+                                       shares_offered=request_quantity,
+                                       locate_cost_per_share=locate_cost_per_share,
+                                       route='PRIMARY',
+                                       outcome='REJECTED_BY_COST',
+                                       trade_outcome='BLOCKED_NO_TRADE',
+                                       notes=f"SIM | probed {probe_quantity}sh, extrap to sim {request_quantity}sh | "
+                                             f"{locate_cost_per_share / entry_price * 100:.2f}% > {SIM_MAX_LOCATE_COST_PCT * 100:.1f}%",
+                                       locate_type=locate_type_code,
+                                       pre_borrow=pre_borrow_flag)
+                            sim_block(
+                                symbol,
+                                f"phantom locate too expensive: "
+                                f"{locate_cost_per_share / entry_price * 100:.3f}% > "
+                                f"{SIM_MAX_LOCATE_COST_PCT * 100:.1f}% threshold"
+                            )
+                            return
+                else:
+                    log.warning(f"[SIM:{symbol}] Unexpected phantom locate status: "
+                                f"{locate.get('locateStatus')} — proceeding")
+    
+        except Exception as e:
+            log.warning(f"[SIM:{symbol}] Phantom locate exception: {e} — proceeding without cost data")
+
+    if not locate_check_ok:
+        log.info(f"[SIM:{symbol}] Locate check inconclusive — proceeding with sim order "
+                 f"(phantom cost logged as $0.00)")
+
+    if sim_get_state(symbol).get("state") != "LOCATING":
+        log.warning(f"[SIM:{symbol}] State changed during phantom locate — aborting")
+        return
+
+    # ── Step 3: Place short on SIM account ────────────────────────────────
+    limit_price    = entry_price
+    final_quantity = request_quantity
+    log.info(f"[SIM:{symbol}] Step 3: Placing SHORT on SIM account | "
+             f"qty={final_quantity} | limit=${limit_price}")
+    try:
+        result     = sim_place_order_with_stepdown(symbol, final_quantity, limit_price)
+        placed_qty = result.get("orderQuantity", final_quantity)
+        sim_set_state(
+            symbol,
+            state="ACTIVE",
+            entry_price=entry_price,
+            quantity=placed_qty,
+            client_order_id=result.get("clientOrderId"),
+            phantom_locate_cost=total_phantom_cost,
+            phantom_locate_cost_per_share=locate_cost_per_share,
+        )
+        log_locate(symbol=symbol, entry_price=entry_price,
+                   shares_offered=placed_qty,
+                   locate_cost_per_share=locate_cost_per_share,
+                   route='PRIMARY',
+                   outcome='ACCEPTED_TRADED',
+                   trade_outcome='UNKNOWN_PENDING',
+                   notes=f'SIM | probed {probe_quantity}sh @ ${locate_cost_per_share:.4f}/sh, '
+                         f'extrap to sim {placed_qty}sh = ${total_phantom_cost:.2f} | '
+                         f'phantom locate cost recorded, not accepted',
+                   locate_type=locate_type_code,
+                   pre_borrow=pre_borrow_flag)
+        log.info(f"[SIM:{symbol}] SIM SHORT PLACED | qty={placed_qty} | limit=${limit_price} | "
+                 f"clientOrderId={result.get('clientOrderId')} | "
+                 f"status={result.get('orderStatus')} | "
+                 f"phantom_locate_cost=${total_phantom_cost:.2f}")
+        threading.Thread(
+            target=sim_monitor_short_fill,
+            args=(symbol, result.get("clientOrderId"), SHORT_FILL_TIMEOUT),
+            daemon=True,
+        ).start()
+    except Exception as e:
+        sim_block(symbol, f"SIM order placement failed after all stepdown attempts: {e}")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# REAL ACCOUNT — CANCEL + CLEANUP HELPER
+# ══════════════════════════════════════════════════════════════════════════════
+def monitor_short_fill(symbol, client_order_id, timeout_minutes):
+    """Monitor a short entry order. Handles three outcomes:
+      1. Full fill (leaves=0) → arm stop on full quantity
+      2. Partial fill, no further progress within PARTIAL_FILL_PATIENCE →
+         cancel leftover, re-read, arm stop on what actually filled
+      3. No fill within timeout_minutes → cancel and block
+
+    Replaces the older "any partial fill = done" behavior that caused R41
+    rejections when the stop was placed while shares were still working.
+    """
+    import time as _time
+    deadline      = _time.time() + timeout_minutes * 60
+    poll_interval = STOP_FILL_POLL_INTERVAL
+    first_fill_time = None
+
+    log.info(f"[{symbol}] SHORT MONITOR started | order={client_order_id} | "
+             f"timeout={timeout_minutes}min | partial_patience={PARTIAL_FILL_PATIENCE}s")
+
+    while _time.time() < deadline:
+        _time.sleep(poll_interval)
+
+        state = get_state(symbol).get("state")
+        if state != "ACTIVE":
+            if state == "BLOCKED":
+                log.warning(f"[{symbol}] SHORT MONITOR: state=BLOCKED — cancelling orphaned order {client_order_id}")
+                try:
+                    cancelled = cancel_all_open_orders(symbol)
+                    log.info(f"[{symbol}] SHORT MONITOR: cancelled {cancelled} open order(s) after BLOCKED state")
+                    position = get_position(symbol)
+                    if position and float(position.get("shares", 0)) < 0:
+                        log.warning(f"[{symbol}] SHORT MONITOR: order filled BEFORE cancel — short position exists! "
+                                    f"Manual action required or wait for COVER webhook.")
+                except Exception as e:
+                    log.error(f"[{symbol}] SHORT MONITOR: error cancelling order after BLOCKED: {e}")
+            else:
+                log.info(f"[{symbol}] SHORT MONITOR: state={state} — stopping monitor")
+            return
+
+        try:
+            r = tz_get(f"/v1/api/accounts/{ACCOUNT_ID}/orders", "SHORT_MONITOR_ORDERS")
+            orders = r.json() if r.ok else []
+            if not isinstance(orders, list):
+                orders = orders.get("orders", [])
+            order = next((o for o in orders if o.get("clientOrderId") == client_order_id), None)
+            if not order:
+                continue
+
+            status   = order.get("orderStatus", "")
+            executed = int(order.get("executed", 0))
+            leaves   = int(order.get("leavesQuantity", 0))
+            log.info(f"[{symbol}] SHORT MONITOR: status={status} executed={executed} leaves={leaves}")
+
+            # ─── Path 1: Full fill — clean entry, arm stop on full quantity ──
+            if status == "Filled" and leaves == 0 and executed > 0:
+                entry_fill = float(order.get("priceAvg") or order.get("lastPrice") or 0)
+                _arm_real_stop_after_fill(symbol, executed, entry_fill, source="full fill")
+                return
+
+            # ─── Path 2: Partial fill — wait, then cancel leftover ──
+            if executed > 0 and leaves > 0:
+                if first_fill_time is None:
+                    first_fill_time = _time.time()
+                    log.info(f"[{symbol}] SHORT MONITOR: PARTIAL fill detected at {executed}/{executed+leaves}sh — "
+                             f"waiting up to {PARTIAL_FILL_PATIENCE}s for rest")
+                elif _time.time() - first_fill_time > PARTIAL_FILL_PATIENCE:
+                    log.warning(f"[{symbol}] SHORT MONITOR: PARTIAL fill patience expired ({PARTIAL_FILL_PATIENCE}s) — "
+                                f"cancelling leftover {leaves}sh, keeping {executed}sh")
+                    # Cancel the working order; this kills the unfilled leaves
+                    try:
+                        rc = tz_delete(
+                            f"/v1/api/accounts/{ACCOUNT_ID}/orders/{client_order_id}",
+                            "SHORT_PARTIAL_CANCEL"
+                        )
+                        if rc.status_code not in (200, 204):
+                            log.warning(f"[{symbol}] SHORT MONITOR: cancel returned {rc.status_code} — "
+                                        f"order may have just filled; will re-read")
+                    except Exception as e:
+                        log.error(f"[{symbol}] SHORT MONITOR: cancel exception: {e}")
+
+                    # Give TZ ~3s to process the cancel and update the executed count
+                    _time.sleep(3)
+
+                    # Re-read the order to get the FINAL executed count (some shares
+                    # may have filled between our cancel call and TZ processing it)
+                    final_executed = executed
+                    final_entry_fill = float(order.get("priceAvg") or order.get("lastPrice") or 0)
+                    try:
+                        r2 = tz_get(f"/v1/api/accounts/{ACCOUNT_ID}/orders", "SHORT_FINAL_READ")
+                        orders2 = r2.json() if r2.ok else []
+                        if not isinstance(orders2, list):
+                            orders2 = orders2.get("orders", [])
+                        order2 = next((o for o in orders2 if o.get("clientOrderId") == client_order_id), None)
+                        if order2:
+                            final_executed   = int(order2.get("executed", executed))
+                            final_entry_fill = float(order2.get("priceAvg") or order2.get("lastPrice") or final_entry_fill)
+                            log.info(f"[{symbol}] SHORT MONITOR: final executed={final_executed} "
+                                     f"@ ${final_entry_fill:.4f} (was {executed} pre-cancel)")
+                    except Exception as e:
+                        log.warning(f"[{symbol}] SHORT MONITOR: final re-read failed: {e}")
+
+                    if final_executed > 0 and final_entry_fill > 0:
+                        _arm_real_stop_after_fill(symbol, final_executed, final_entry_fill,
+                                                  source="partial fill")
+                    else:
+                        log.warning(f"[{symbol}] SHORT MONITOR: no fills after cancel — blocking symbol")
+                        block(symbol, "partial fill cancel resulted in 0 shares")
+                    return
+                # else: still within patience window, keep polling
+
+            # ─── Path 3: Order Cancelled/Rejected before any fill ──
+            if status in ("Canceled", "Rejected") and executed == 0:
+                reject_text = order.get("text") or order.get("rejectReason") or "no reason given"
+                log.warning(f"[{symbol}] SHORT MONITOR: order {status} | reason: {reject_text}")
+
+                if "R35" in reject_text or "Buying Power" in reject_text:
+                    s = get_state(symbol)
+                    prev_qty  = int(s.get("quantity", 0))
+                    lp        = float(s.get("entry_price", 0))
+                    if prev_qty > 0 and lp > 0:
+                        next_qty = max(1, int(prev_qty * 0.8))
+                        log.warning(f"[{symbol}] R35 — stepping down from {prev_qty}sh to {next_qty}sh")
+                        set_state(symbol, state="LOCATING")
+                        try:
+                            result = place_order_with_stepdown(symbol, next_qty, lp, "SHORT_ORDER_RETRY")
+                            placed_qty = result.get("orderQuantity", next_qty)
+                            set_state(symbol, state="ACTIVE",
+                                      entry_price=lp, quantity=placed_qty,
+                                      client_order_id=result.get("clientOrderId"))
+                            log.info(f"[{symbol}] SHORT RETRY PLACED | qty={placed_qty}")
+                            threading.Thread(
+                                target=monitor_short_fill,
+                                args=(symbol, result.get("clientOrderId"), timeout_minutes),
+                                daemon=True
+                            ).start()
+                        except Exception as e:
+                            block(symbol, f"short order R35 retry failed: {e}")
+                        return
+                block(symbol, f"short order {status}: {reject_text}")
+                return
+
+            # ─── Path 4: Cancelled/Rejected WITH some executed (rare) — treat as partial ──
+            if status in ("Canceled", "Rejected") and executed > 0:
+                entry_fill = float(order.get("priceAvg") or order.get("lastPrice") or 0)
+                log.warning(f"[{symbol}] SHORT MONITOR: order {status} but {executed}sh filled @ ${entry_fill:.4f} — "
+                            f"arming stop on filled portion")
+                _arm_real_stop_after_fill(symbol, executed, entry_fill, source=f"{status} with partial")
+                return
+
+        except Exception as e:
+            log.warning(f"[{symbol}] SHORT MONITOR: poll error — {e}")
+
+    log.warning(f"[{symbol}] SHORT MONITOR: timeout after {timeout_minutes}min — cancelling and blocking")
+    cancel_and_cleanup(symbol, f"short entry did not fill within {timeout_minutes} minutes")
+
+
+def _arm_real_stop_after_fill(symbol, filled_qty, entry_fill, source="full fill"):
+    """Helper: store fill state, place broker SL stop, kick verify thread."""
+    if entry_fill <= 0 or filled_qty <= 0:
+        log.warning(f"[{symbol}] _arm_real_stop_after_fill: invalid inputs "
+                    f"(qty={filled_qty} fill=${entry_fill}) — skipping SL")
+        return
+    set_state(symbol, entry_fill_price=entry_fill, quantity=filled_qty)
+    log.info(f"[{symbol}] SHORT MONITOR: {source} — {filled_qty}sh @ ${entry_fill:.4f}")
+
+    # ── BROKER SL TOGGLE ──────────────────────────────────────────────────
+    # Entry fill state is recorded above (needed for cover-side PnL) BEFORE this
+    # check, so disabling the broker stop does not affect PnL accounting.
+    if not STOP_LOSS_ENABLED:
+        log.info(f"[{symbol}] STOP_LOSS_ENABLED=False — no broker SL; "
+                 f"relying on QC cover webhook ({filled_qty}sh @ ${entry_fill:.4f})")
+        return
+
+    s = get_state(symbol)
+    sl_pct = float(s.get("sl_pct") or DEFAULT_SL_PCT)
+    if sl_pct <= 0:
+        log.info(f"[{symbol}] sl_pct={sl_pct} — skipping broker SL")
+        return
+
+    stop_id = place_real_stop(symbol, filled_qty, entry_fill, sl_pct)
+    if stop_id:
+        set_state(symbol, sl_client_order_id=stop_id)
+        log.info(f"[{symbol}] BROKER SL armed | stop_order={stop_id}")
+        # TZ may async-reject the stop; verify in 10s and log the actual reason
+        threading.Thread(
+            target=verify_stop_alive,
+            args=(ACCOUNT_ID, tz_headers, symbol, stop_id),
+            kwargs={"is_sim": False, "delay_seconds": 10},
+            daemon=True,
+        ).start()
+    else:
+        log.warning(f"[{symbol}] BROKER SL FAILED to place — trade relies on QC-side SL only")
+
+
+def cancel_and_cleanup(symbol, reason):
+    log.info(f"[{symbol}] CANCEL+CLEANUP: {reason}")
+
+    cancelled = cancel_all_open_orders(symbol)  # this also cancels any armed SL stop
+    log.info(f"[{symbol}] Cancelled {cancelled} open order(s)")
+    set_state(symbol, sl_client_order_id=None)
+
+    position = get_position(symbol)
+    if position:
+        shares = float(position.get("shares", 0))
+        if _short_qty(position) > 0:
+            cover_qty   = _short_qty(position)
+            last_price, _src = _tz_mark_price(REAL, symbol, position)
+            last_price = last_price or 0
+            if last_price <= 0:
+                yahoo_price, yahoo_session = get_yahoo_price(symbol)
+                if yahoo_price:
+                    last_price = yahoo_price
+                    log.info(f"[{symbol}] TZ mark unavailable, using Yahoo ${last_price} ({yahoo_session})")
+                else:
+                    log.error(f"[{symbol}] Cannot determine cover price — MANUAL ACTION REQUIRED")
+                    block(symbol, "cleanup: no TZ mark and Yahoo unavailable — MANUAL ACTION REQUIRED")
+                    return
+            cover_limit = round(last_price * 1.005, 2)
+            log.info(f"[{symbol}] Found short position: {cover_qty} shares | "
+                     f"price=${last_price} | covering at ${cover_limit}")
+            try:
+                result = place_order("Buy", symbol, cover_qty, cover_limit, "COVER_ON_CANCEL")
+                log.info(f"[{symbol}] Cover placed: {result.get('clientOrderId')} "
+                         f"status={result.get('orderStatus')}")
+            except Exception as e:
+                log.error(f"[{symbol}] Cover order FAILED: {e} — MANUAL ACTION MAY BE REQUIRED")
+        elif shares > 0:
+            log.warning(f"[{symbol}] Found LONG position ({shares} shares) — not touching it")
+        else:
+            log.info(f"[{symbol}] Position shares=0 — nothing to cover")
+    else:
+        log.info(f"[{symbol}] No position found — nothing to cover")
+
+    block(symbol, reason)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SIM ACCOUNT — MONITOR + CLEANUP FUNCTIONS
+# ══════════════════════════════════════════════════════════════════════════════
+def sim_monitor_short_fill(symbol, client_order_id, timeout_minutes):
+    """Sim equivalent of monitor_short_fill — handles full/partial/timeout
+    the same way, but acts on the sim account."""
+    deadline        = time.time() + timeout_minutes * 60
+    poll_interval   = STOP_FILL_POLL_INTERVAL
+    first_fill_time = None
+
+    log.info(f"[SIM:{symbol}] SHORT MONITOR started | order={client_order_id} | "
+             f"timeout={timeout_minutes}min | partial_patience={PARTIAL_FILL_PATIENCE}s")
+
+    while time.time() < deadline:
+        time.sleep(poll_interval)
+
+        state = sim_get_state(symbol).get("state")
+        if state != "ACTIVE":
+            if state == "BLOCKED":
+                log.warning(f"[SIM:{symbol}] MONITOR: BLOCKED — cancelling orphaned sim order")
+                try:
+                    sim_cancel_all_open_orders(symbol)
+                except Exception as e:
+                    log.error(f"[SIM:{symbol}] MONITOR: cancel error: {e}")
+            else:
+                log.info(f"[SIM:{symbol}] MONITOR: state={state} — stopping")
+            return
+
+        try:
+            r = sim_tz_get(f"/v1/api/accounts/{SIM_ACCOUNT_ID}/orders", "SIM_MONITOR_ORDERS")
+            orders = r.json() if r.ok else []
+            if not isinstance(orders, list):
+                orders = orders.get("orders", [])
+            order = next(
+                (o for o in orders if o.get("clientOrderId") == client_order_id), None
+            )
+            if not order:
+                continue
+
+            status   = order.get("orderStatus", "")
+            executed = int(order.get("executed", 0))
+            leaves   = int(order.get("leavesQuantity", 0))
+            log.info(f"[SIM:{symbol}] MONITOR: status={status} executed={executed} leaves={leaves}")
+
+            # Path 1: Full fill
+            if status == "Filled" and leaves == 0 and executed > 0:
+                entry_fill = float(order.get("priceAvg") or order.get("lastPrice") or 0)
+                _arm_sim_stop_after_fill(symbol, executed, entry_fill, source="full fill")
+                return
+
+            # Path 2: Partial fill with patience timer
+            if executed > 0 and leaves > 0:
+                if first_fill_time is None:
+                    first_fill_time = time.time()
+                    log.info(f"[SIM:{symbol}] MONITOR: PARTIAL fill at {executed}/{executed+leaves}sh — "
+                             f"waiting up to {PARTIAL_FILL_PATIENCE}s for rest")
+                elif time.time() - first_fill_time > PARTIAL_FILL_PATIENCE:
+                    log.warning(f"[SIM:{symbol}] MONITOR: PARTIAL fill patience expired — "
+                                f"cancelling leftover {leaves}sh, keeping {executed}sh")
+                    try:
+                        rc = sim_tz_delete(
+                            f"/v1/api/accounts/{SIM_ACCOUNT_ID}/orders/{client_order_id}",
+                            "SIM_SHORT_PARTIAL_CANCEL"
+                        )
+                        if rc.status_code not in (200, 204):
+                            log.warning(f"[SIM:{symbol}] MONITOR: cancel returned {rc.status_code}")
+                    except Exception as e:
+                        log.error(f"[SIM:{symbol}] MONITOR: cancel exception: {e}")
+
+                    time.sleep(3)
+
+                    final_executed = executed
+                    final_entry_fill = float(order.get("priceAvg") or order.get("lastPrice") or 0)
+                    try:
+                        r2 = sim_tz_get(f"/v1/api/accounts/{SIM_ACCOUNT_ID}/orders", "SIM_SHORT_FINAL_READ")
+                        orders2 = r2.json() if r2.ok else []
+                        if not isinstance(orders2, list):
+                            orders2 = orders2.get("orders", [])
+                        order2 = next((o for o in orders2 if o.get("clientOrderId") == client_order_id), None)
+                        if order2:
+                            final_executed   = int(order2.get("executed", executed))
+                            final_entry_fill = float(order2.get("priceAvg") or order2.get("lastPrice") or final_entry_fill)
+                            log.info(f"[SIM:{symbol}] MONITOR: final executed={final_executed} "
+                                     f"@ ${final_entry_fill:.4f} (was {executed} pre-cancel)")
+                    except Exception as e:
+                        log.warning(f"[SIM:{symbol}] MONITOR: final re-read failed: {e}")
+
+                    if final_executed > 0 and final_entry_fill > 0:
+                        _arm_sim_stop_after_fill(symbol, final_executed, final_entry_fill,
+                                                 source="partial fill")
+                    else:
+                        log.warning(f"[SIM:{symbol}] MONITOR: no fills after cancel — blocking symbol")
+                        sim_block(symbol, "partial fill cancel resulted in 0 shares")
+                    return
+
+            # Path 3: Cancelled/Rejected, nothing filled
+            if status in ("Canceled", "Rejected") and executed == 0:
+                reject_text = order.get("text") or order.get("rejectReason") or "no reason"
+                sim_block(symbol, f"SIM short {status}: {reject_text}")
+                return
+
+            # Path 4: Cancelled/Rejected with partial fill (rare)
+            if status in ("Canceled", "Rejected") and executed > 0:
+                entry_fill = float(order.get("priceAvg") or order.get("lastPrice") or 0)
+                log.warning(f"[SIM:{symbol}] MONITOR: order {status} but {executed}sh filled "
+                            f"@ ${entry_fill:.4f} — arming stop on filled portion")
+                _arm_sim_stop_after_fill(symbol, executed, entry_fill, source=f"{status} with partial")
+                return
+
+        except Exception as e:
+            log.warning(f"[SIM:{symbol}] MONITOR: poll error — {e}")
+
+    log.warning(f"[SIM:{symbol}] MONITOR: timeout after {timeout_minutes}min — cancelling")
+    sim_cancel_and_cleanup(symbol, f"SIM short did not fill within {timeout_minutes}min")
+
+
+def _arm_sim_stop_after_fill(symbol, filled_qty, entry_fill, source="full fill"):
+    """Sim equivalent of _arm_real_stop_after_fill."""
+    if entry_fill <= 0 or filled_qty <= 0:
+        log.warning(f"[SIM:{symbol}] _arm_sim_stop_after_fill: invalid inputs "
+                    f"(qty={filled_qty} fill=${entry_fill}) — skipping SL")
+        return
+    sim_set_state(symbol, entry_fill_price=entry_fill, quantity=filled_qty)
+    log.info(f"[SIM:{symbol}] MONITOR: {source} — {filled_qty}sh @ ${entry_fill:.4f}")
+
+    # ── BROKER SL TOGGLE ──────────────────────────────────────────────────
+    # Entry fill state recorded above (for cover-side PnL) BEFORE this check.
+    if not STOP_LOSS_ENABLED:
+        log.info(f"[SIM:{symbol}] STOP_LOSS_ENABLED=False — no broker SL; "
+                 f"relying on QC cover webhook ({filled_qty}sh @ ${entry_fill:.4f})")
+        return
+
+    s = sim_get_state(symbol)
+    sl_pct = float(s.get("sl_pct") or DEFAULT_SL_PCT)
+    if sl_pct <= 0:
+        log.info(f"[SIM:{symbol}] sl_pct={sl_pct} — skipping broker SL")
+        return
+
+    stop_id = place_sim_stop(symbol, filled_qty, entry_fill, sl_pct)
+    if stop_id:
+        sim_set_state(symbol, sl_client_order_id=stop_id)
+        log.info(f"[SIM:{symbol}] BROKER SL armed | stop_order={stop_id}")
+        threading.Thread(
+            target=verify_stop_alive,
+            args=(SIM_ACCOUNT_ID, sim_headers, symbol, stop_id),
+            kwargs={"is_sim": True, "delay_seconds": 10},
+            daemon=True,
+        ).start()
+    else:
+        log.warning(f"[SIM:{symbol}] BROKER SL FAILED to place — sim trade relies on QC-side SL only")
+
+
+def sim_cancel_and_cleanup(symbol, reason):
+    log.info(f"[SIM:{symbol}] CANCEL+CLEANUP: {reason}")
+
+    cancelled = sim_cancel_all_open_orders(symbol)  # this also cancels any armed SL stop
+    log.info(f"[SIM:{symbol}] Cancelled {cancelled} open order(s)")
+    sim_set_state(symbol, sl_client_order_id=None)
+
+    position = sim_get_position(symbol)
+    if position:
+        shares = float(position.get("shares", 0))
+        if _short_qty(position) > 0:
+            cover_qty  = _short_qty(position)
+            last_price, _src = _tz_mark_price(SIM, symbol, position)
+            last_price = last_price or 0
+            if last_price <= 0:
+                yahoo_price, yahoo_session = get_yahoo_price(symbol)
+                if yahoo_price:
+                    last_price = yahoo_price
+                    log.info(f"[SIM:{symbol}] TZ mark unavailable, using Yahoo ${last_price}")
+                else:
+                    log.error(f"[SIM:{symbol}] Cannot determine cover price — MANUAL ACTION REQUIRED")
+                    sim_block(symbol, "SIM cleanup: no price source — MANUAL ACTION REQUIRED")
+                    return
+            cover_limit = round(last_price * 1.005, 2)
+            try:
+                result = sim_place_order("Buy", symbol, cover_qty, cover_limit, "SIM_COVER_ON_CANCEL")
+                log.info(f"[SIM:{symbol}] Cover placed: {result.get('clientOrderId')}")
+            except Exception as e:
+                log.error(f"[SIM:{symbol}] Cover FAILED: {e} — MANUAL ACTION MAY BE REQUIRED")
+        else:
+            log.info(f"[SIM:{symbol}] No short to cover (shares={shares})")
+    else:
+        log.info(f"[SIM:{symbol}] No sim position found")
+
+    sim_block(symbol, reason)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# COVER UNTIL FLAT + NEW YORK DAILY CYCLE  (real + sim share this code)
+# ══════════════════════════════════════════════════════════════════════════════
+import math as _math
+from datetime import datetime as _datetime, time as _dtime
+
+NY = ZoneInfo("America/New_York")
+
+
+class _Acct:
+    """Everything the shared cover / schedule code needs for one account."""
+    def __init__(self, name, is_sim, acct_id, headers, get_fn, post_fn,
+                 get_st, set_st, blk, claim, states, lock,
+                 position, cancel_all, place, place_stop):
+        self.name, self.is_sim = name, is_sim
+        self.acct_id, self.headers = acct_id, headers
+        self.get_fn, self.post_fn = get_fn, post_fn
+        self.get_state, self.set_state, self.block, self.claim = get_st, set_st, blk, claim
+        self.states, self.lock = states, lock
+        self.position, self.cancel_all, self.place, self.place_stop = position, cancel_all, place, place_stop
+        self.pfx = "SIM:" if is_sim else ""
+
+    def tag(self, symbol):
+        return f"[{self.pfx}{symbol}]"
+
+
+REAL = _Acct("REAL", False, lambda: ACCOUNT_ID, tz_headers, tz_get, tz_post,
+             get_state, set_state, block, try_begin_cover,
+             lambda: symbol_state, state_lock,
+             get_position, cancel_all_open_orders, place_order, place_real_stop)
+SIM = _Acct("SIM", True, lambda: SIM_ACCOUNT_ID, sim_headers, sim_tz_get, sim_tz_post,
+            sim_get_state, sim_set_state, sim_block, sim_try_begin_cover,
+            lambda: sim_symbol_state, sim_state_lock,
+            sim_get_position, sim_cancel_all_open_orders, sim_place_order, place_sim_stop)
+
+OPEN_ORDER_STATUSES = {"PendingNew", "New", "PartiallyFilled", "Submitted"}
+
+
+def _position_strict(A, symbol):
+    """Position row for `symbol`, None if TZ says there is none — and an EXCEPTION if
+    the lookup itself fails. get_position()/sim_get_position() return None for both,
+    so a failed request looked like 'no position' (BLZE, 2 Nov 15:30: the lookup failed,
+    the bridge marked the ticker FLAT, and the short was left open)."""
+    r = A.get_fn(f"/v1/api/accounts/{A.acct_id()}/positions", f"{A.name}_POSITIONS")
+    if not r.ok:
+        raise RuntimeError(f"positions HTTP {r.status_code}: {r.text[:120]}")
+    rows = r.json()
+    if not isinstance(rows, list):
+        rows = rows.get("positions", [])
+    p = _pick_position(rows, symbol)
+    log.info(f"{A.tag(symbol)} position: {'none' if p is None else p.get('shares')} sh")
+    return p
+
+
+REAL.position = lambda symbol: _position_strict(REAL, symbol)
+SIM.position = lambda symbol: _position_strict(SIM, symbol)
+
+
+def _now_et():
+    return _datetime.now(NY)
+
+
+def _short_qty(position):
+    """Shares short in a TZ position row (0 if none / long). Handles both a negative
+    share count and a positive count with side='Short'."""
+    if not position:
+        return 0
+    try:
+        sh = float(position.get("shares", 0) or 0)
+    except (TypeError, ValueError):
+        return 0
+    if sh < 0:
+        return int(abs(sh))
+    if sh > 0 and str(position.get("side", "")).lower() == "short":
+        return int(sh)
+    return 0
+
+
+def _cover_px(p):
+    """Buy limit in whole cents, rounded UP (never down), so rounding can't leave a
+    cover below the price it was meant to cross. Returns (price, decimals)."""
+    return _math.ceil(p * 100 - 1e-9) / 100, 2
+
+
+def _in_day_plus_window(now=None):
+    t = (now or _now_et()).time()
+    return _dtime(4, 0) <= t < _dtime(*COVER_LAST_RETRY_ET)
+
+
+def _tz_mark_price(A, symbol, position):
+    """TZ's own current price for a held position: /pnl exposure ÷ shares.
+    exposure = 'absolute market value of the position right now' (TZ docs).
+    Returns (price, source) or (None, None)."""
+    try:
+        qty = _short_qty(position) or abs(int(float((position or {}).get("shares", 0) or 0)))
+        if qty <= 0:
+            return None, None
+        r = A.get_fn(f"/v1/api/accounts/{A.acct_id()}/pnl", "PNL")
+        if not r.ok:
+            return None, None
+        rows = r.json().get("pnl", []) or []
+        pid = str((position or {}).get("positionId", "") or "")
+        row = next((x for x in rows if pid and str(x.get("positionId", "")) == pid), None)
+        if row is None:
+            row = next((x for x in rows if str(x.get("symbol", "")).upper() == symbol.upper()), None)
+        if row is None:
+            return None, None
+        exposure = abs(float(row.get("exposure") or 0))
+        if exposure <= 0:
+            return None, None
+        px = exposure / qty
+        log.info(f"{A.tag(symbol)} TZ mark: exposure=${exposure:,.2f} / {qty}sh = ${px:.4f}")
+        return px, "tz_pnl"
+    except Exception as e:
+        log.warning(f"{A.tag(symbol)} TZ mark price failed: {e}")
+        return None, None
+
+
+def _cover_ref_price(A, symbol, position):
+    """Price to step the cover limit from: TZ mark first, Yahoo/Twelve Data fallback."""
+    px, src = _tz_mark_price(A, symbol, position)
+    if px:
+        return px, src
+    px, src = get_live_price(symbol)
+    return (px, src) if px else (None, None)
+
+
+def place_market(A, symbol, quantity, label="COVER_MARKET"):
+    """Market buy (RTH only: TZ accepts Market with Day TIF 09:30-16:00 ET)."""
+    client_id = f"{'SIM' if A.is_sim else 'QC'}_B_{uuid.uuid4().hex[:8].upper()}"
+    payload = {
+        "clientOrderId": client_id,
+        "symbol":        symbol,
+        "orderQuantity": int(quantity),
+        "side":          "Buy",
+        "orderType":     "Market",
+        "securityType":  "Stock",
+        "timeInForce":   "Day",
+        "route":         "SMART",
+    }
+    r = A.post_fn(f"/v1/api/accounts/{A.acct_id()}/order", payload, label)
+    if not r.ok:
+        log.error(f"  {A.tag(symbol)} Market order FAILED {r.status_code} — body: {r.text[:500]}")
+        r.raise_for_status()
+    data = r.json()
+    log.info(f"  {A.tag(symbol)} Market order placed: clientOrderId={data.get('clientOrderId')} "
+             f"status={data.get('orderStatus')}")
+    return data
+
+
+def _place_cover(A, symbol, qty, ref_price, label):
+    """RTH → market. Otherwise a Day_Plus limit at ref_price (rounded up to a tick)."""
+    if _is_rth_now():
+        return place_market(A, symbol, qty, label + "_MKT"), "market"
+    if not ref_price or ref_price <= 0:
+        raise ValueError("no limit price outside RTH")
+    px, dec = _cover_px(ref_price)
+    return A.place("Buy", symbol, qty, px, label, decimals=dec), f"limit ${px}"
+
+
+def _list_orders(A):
+    r = A.get_fn(f"/v1/api/accounts/{A.acct_id()}/orders", "ORDERS")
+    if not r.ok:
+        return []
+    o = r.json()
+    return o if isinstance(o, list) else o.get("orders", [])
+
+
+def _cancel_and_wait(A, symbol, timeout=12):
+    """Cancel every open order on `symbol` (unfilled entry remainder, stop, old cover)
+    and wait until TZ shows none still open. Returns True when clear. Placing a new
+    cover while an old order is still live risks a double buy (→ long), and leaving an
+    entry order working after a cover can re-open the short later (CSTE, 2 Nov)."""
+    try:
+        A.cancel_all(symbol)
+    except Exception as e:
+        log.warning(f"{A.tag(symbol)} cancel failed: {e}")
+    deadline = time.time() + timeout
+    while True:
+        try:
+            still = [o for o in _list_orders(A)
+                     if str(o.get("symbol", "")).upper() == symbol.upper()
+                     and o.get("orderStatus", "") in OPEN_ORDER_STATUSES]
+        except Exception:
+            still = None
+        if still == []:
+            return True
+        if time.time() >= deadline:
+            log.warning(f"{A.tag(symbol)} {len(still or [])} order(s) still open after cancel "
+                        f"— not placing a new cover yet")
+            return False
+        time.sleep(2)
+
+
+def _list_positions(A):
+    r = A.get_fn(f"/v1/api/accounts/{A.acct_id()}/positions", "POSITIONS")
+    if not r.ok:
+        return None
+    p = r.json()
+    return p if isinstance(p, list) else p.get("positions", [])
+
+
+def _log_cover_fill(A, symbol, order_ids):
+    """Cover complete: log the realised P&L (same sheet fields as before)."""
+    try:
+        orders = [o for o in _list_orders(A) if o.get("clientOrderId") in set(order_ids)]
+        filled = [(int(o.get("executed", 0) or 0), float(o.get("priceAvg") or o.get("lastPrice") or 0),
+                   float(o.get("orderFee") or 0)) for o in orders]
+        filled = [f for f in filled if f[0] > 0 and f[1] > 0]
+        ex = sum(f[0] for f in filled)
+        cover_fill = sum(f[0] * f[1] for f in filled) / ex if ex else 0.0
+        fee = sum(f[2] for f in filled)
+        s = A.get_state(symbol)
+        entry_fill = float(s.get("entry_fill_price") or s.get("entry_price") or 0)
+        qty = int(s.get("quantity") or ex or 0)
+        if A.is_sim:
+            locate_cost = float(s.get("phantom_locate_cost") or 0)
+        else:
+            locate_cost = float(s.get("locate_cost_per_share") or 0) * qty
+        pnl_pct = None
+        if entry_fill > 0 and cover_fill > 0 and qty > 0:
+            net = (entry_fill - cover_fill) * qty - locate_cost - fee
+            pnl_pct = net / (entry_fill * qty) * 100.0
+        trade_oc = 'WIN' if (pnl_pct or 0) > 0 else 'LOSS' if (pnl_pct or 0) < 0 else 'UNKNOWN_PENDING'
+        log_locate(symbol=symbol, entry_price=entry_fill, shares_offered=qty, route='COVER',
+                   outcome='COVER_FILLED', trade_outcome=trade_oc, cover_fill_price=cover_fill,
+                   realized_pnl_pct=pnl_pct,
+                   notes=f"{A.name} | entry_fill=${entry_fill:.4f} cover_fill=${cover_fill:.4f} "
+                         f"fee=${fee:.2f} locate=${locate_cost:.2f} orders={len(filled)}")
+        log.info(f"{A.tag(symbol)} COVER DONE — flat @ avg ${cover_fill:.4f}"
+                 + (f" | pnl={pnl_pct:.2f}%" if pnl_pct is not None else ""))
+    except Exception as e:
+        log.warning(f"{A.tag(symbol)} cover fill logging failed: {e}")
+
+
+def _arm_carried_stop(A, symbol, qty):
+    """A short left open at 20:00: GTC_Plus StopLimit at the original stop level, so it
+    is protected from the 04:00 premarket even if QC's COVER doesn't arrive."""
+    if not STOP_LOSS_ENABLED or qty <= 0:
+        return
+    s = A.get_state(symbol)
+    entry = float(s.get("entry_fill_price") or s.get("entry_price") or 0)
+    sl_pct = float(s.get("sl_pct") or DEFAULT_SL_PCT)
+    if entry <= 0 or sl_pct <= 0:
+        return
+    trigger, limit = _compute_sl_prices(entry, sl_pct)
+    res = place_stop_order(A.acct_id(), A.headers, symbol, qty, trigger, limit_price=limit,
+                           label=f"{A.name}_CARRY_STOP", tif="GTC_Plus")
+    if res:
+        A.set_state(symbol, sl_client_order_id=res.get("clientOrderId"))
+        log.info(f"{A.tag(symbol)} CARRY STOP armed (GTC_Plus) trigger=${trigger} limit=${limit}")
+
+
+def handle_cover(A, symbol, qc_price, strategy):
+    """COVER webhook (any state except LOCATING, which the caller handles).
+    Returns (json_dict, http_code)."""
+    s = A.get_state(symbol)
+    current = s.get("state", "FLAT")
+
+    if current == "COVERING":
+        log.info(f"{A.tag(symbol)} COVER ignored — cover already working")
+        return {"status": "ignored", "reason": "cover in progress"}, 200
+
+    if current in ("FLAT", "BLOCKED"):
+        # The bridge has no live record (e.g. after a reset, or blocked) — trust TZ.
+        try:
+            pos = A.position(symbol)
+        except Exception as e:
+            log.error(f"{A.tag(symbol)} COVER position lookup failed: {e}")
+            return {"error": str(e)}, 500
+        if _short_qty(pos) <= 0:
+            log.info(f"{A.tag(symbol)} COVER ignored — state {current} and no TZ short (not blocking)")
+            return {"status": "ignored", "reason": "no short position"}, 200
+        log.warning(f"{A.tag(symbol)} COVER on state {current} but TZ shows {_short_qty(pos)}sh short — covering")
+    else:
+        # OWNERSHIP GUARD: only the strategy that opened the position may cover it.
+        owner = s.get("owner")
+        if owner and strategy and strategy != owner:
+            log.info(f"{A.tag(symbol)} COVER ignored — strategy '{strategy}' is not owner '{owner}'")
+            return {"status": "ignored", "reason": "not position owner",
+                    "owner": owner, "strategy": strategy}, 200
+
+    # DOUBLE-BUY GUARD: atomically claim the cover.
+    if not A.claim(symbol):
+        log.info(f"{A.tag(symbol)} COVER ignored — cover already in progress")
+        return {"status": "ignored", "reason": "cover in progress"}, 200
+
+    # Look first (nothing cancelled yet, so a failed lookup leaves the stop in place).
+    # If the bridge knows the entry filled, don't trust a single "no position" read.
+    expect_short = bool(s.get("entry_fill_price"))
+    try:
+        pos = A.position(symbol)
+        tries = 1
+        while expect_short and _short_qty(pos) <= 0 and tries < 4:
+            time.sleep(2)
+            pos = A.position(symbol)
+            tries += 1
+        if expect_short and _short_qty(pos) <= 0:
+            log.warning(f"{A.tag(symbol)} COVER: entry was filled but TZ shows no short after "
+                        f"{tries} reads — treating as flat")
+    except Exception as e:
+        # The lookup itself failed (TZ API error / rate limit). Retry a few times; if it
+        # still fails, keep the ticker COVERING and let the cover loop keep trying —
+        # QC sends each COVER only once, so giving up here would strand the short.
+        pos, err = None, e
+        for _ in range(3):
+            time.sleep(2)
+            try:
+                pos, err = A.position(symbol), None
+                break
+            except Exception as e2:
+                err = e2
+        if err is not None:
+            log.error(f"{A.tag(symbol)} COVER position lookup failing ({err}) — cover loop will keep trying")
+            A.set_state(symbol, state="COVERING", carried=False, reason="cover: position lookup failing")
+            threading.Thread(target=cover_until_flat,
+                             args=(A, symbol, [], float(qc_price or 0), _is_rth_now(), False),
+                             daemon=True).start()
+            return {"status": "ok", "note": "position lookup failing — cover loop retrying"}, 200
+
+    # Cancel any still-working entry (its unfilled remainder would re-open the short
+    # after we cover) and the broker stop, and wait for TZ to confirm, BEFORE sizing.
+    clear = _cancel_and_wait(A, symbol)
+    A.set_state(symbol, sl_client_order_id=None)
+    try:
+        pos = A.position(symbol)
+    except Exception as e:
+        log.warning(f"{A.tag(symbol)} COVER: re-read after cancel failed ({e}) — using first read")
+
+    qty = _short_qty(pos)
+    if qty <= 0 and not clear:
+        # an entry order may still be live — keep watching rather than declare FLAT
+        log.warning(f"{A.tag(symbol)} COVER: no short yet but orders still open — cover loop will watch")
+        A.set_state(symbol, state="COVERING", carried=False, reason="cover: waiting for cancels")
+        threading.Thread(target=cover_until_flat,
+                         args=(A, symbol, [], float(qc_price or 0), _is_rth_now(), False),
+                         daemon=True).start()
+        return {"status": "ok", "note": "waiting for open orders to cancel"}, 200
+    if qty <= 0:
+        log.warning(f"{A.tag(symbol)} COVER: no TZ short (entry cancelled/unfilled) — marking FLAT")
+        A.set_state(symbol, state="FLAT", reason="cover: no short found", owner=None, carried=False)
+        return {"status": "ok", "note": "no short position"}, 200
+
+    stop_id = A.get_state(symbol).get("sl_client_order_id")
+    if stop_id:
+        cancel_stop_order(A.acct_id(), A.headers, symbol, stop_id, f"{A.name}_STOP_CANCEL")
+        A.set_state(symbol, sl_client_order_id=None)
+
+    qc_price = float(qc_price or 0)
+    ref = qc_price
+    if ref <= 0:
+        ref, _src = _cover_ref_price(A, symbol, pos)
+        ref = (ref or 0) * (1 + COVER_RETRY_STEPS[0])
+    if ref <= 0:
+        log.error(f"{A.tag(symbol)} COVER: no price available — retry loop will keep trying")
+    try:
+        if ref > 0:
+            px, dec = _cover_px(ref)           # first cover: limit at QC's price (all sessions)
+            result = A.place("Buy", symbol, qty, px, "COVER_ORDER", decimals=dec)
+            how, cid = f"limit ${px}", result.get("clientOrderId")
+        else:
+            result, how, cid = {}, "deferred (no price)", None
+        A.set_state(symbol, state="COVERING", carried=False, reason="cover working",
+                    cover_started=time.time())
+        log.info(f"{A.tag(symbol)} COVER PLACED | qty={qty} | {how} | qc_price=${qc_price} | clientOrderId={cid}")
+        threading.Thread(target=cover_until_flat,
+                         args=(A, symbol, [cid] if cid else [], qc_price, _is_rth_now(), bool(cid)),
+                         daemon=True).start()
+        return {"status": "ok", "action": "COVER", "symbol": symbol, "quantity": qty,
+                "order": how, "clientOrderId": cid,
+                "orderStatus": result.get("orderStatus")}, 200
+    except Exception as e:
+        log.error(f"{A.tag(symbol)} Cover order failed: {e}")
+        A.set_state(symbol, state="ACTIVE", reason="cover failed")   # un-claim so QC's next COVER retries
+        return {"error": str(e)}, 500
+
+
+def cover_until_flat(A, symbol, order_ids, qc_price, placed_in_rth, placed=True):
+    """Keep covering until TZ shows no short.
+      * every 15 s: flat? → log fill, state FLAT, done.
+      * every COVER_FILL_TIMEOUT min (or at once when RTH opens): cancel and replace —
+        market in RTH; outside RTH a limit at max(price x (1+step), QC's limit),
+        stepping through COVER_RETRY_STEPS (price = TZ mark, Yahoo fallback).
+      * past COVER_LAST_RETRY_ET (Day_Plus ends 20:00): cancel, mark ACTIVE carried=True,
+        arm a GTC_Plus stop, and wait for QC's 04:00 COVER.
+    """
+    tag = A.tag(symbol)
+    step = 0
+    last_place = time.time() if placed else 0.0
+    last_rth = placed_in_rth
+    log.info(f"{tag} COVER LOOP started | orders={order_ids} | qc_price=${qc_price}")
+    while True:
+        time.sleep(15)
+        st = A.get_state(symbol).get("state")
+        if st != "COVERING":
+            log.info(f"{tag} COVER LOOP: state={st} — stopping")
+            return
+        try:
+            pos = A.position(symbol)
+        except Exception as e:
+            log.warning(f"{tag} COVER LOOP: position lookup failed: {e}")
+            continue
+        qty = _short_qty(pos)
+        if qty <= 0:
+            # flat — but make sure nothing (e.g. an entry remainder) is still working
+            if not _cancel_and_wait(A, symbol):
+                continue
+            try:
+                qty = _short_qty(A.position(symbol))
+            except Exception:
+                continue
+        if qty <= 0:
+            _log_cover_fill(A, symbol, order_ids)
+            A.set_state(symbol, state="FLAT", reason="cover filled", owner=None, carried=False)
+            return
+
+        now = _now_et()
+        rth = _is_rth_now()
+        if not rth and not _in_day_plus_window(now):
+            _cancel_and_wait(A, symbol)
+            # A cover can fill in the moments before the cancel lands. Re-read the
+            # position so the carry stop is sized to what is really still short (and
+            # not placed at all if the cover filled) — a buy stop on a flat ticker would
+            # open a LONG. Leftovers are also swept at the 03:50 reset.
+            time.sleep(5)
+            try:
+                qty = _short_qty(A.position(symbol))
+            except Exception as e:
+                log.warning(f"{tag} COVER LOOP: re-read failed ({e}) — no carry stop placed")
+                qty = -1
+            if qty == 0:
+                _log_cover_fill(A, symbol, order_ids)
+                A.set_state(symbol, state="FLAT", reason="cover filled at session end", owner=None, carried=False)
+                return
+            A.set_state(symbol, state="ACTIVE", carried=True,
+                        reason="cover unfilled at session end — carried; waiting for QC COVER")
+            log.warning(f"{tag} COVER LOOP: still {qty}sh short at {now.strftime('%H:%M')} ET — "
+                        f"CARRIED to next session (QC re-sends COVER at 04:00 / 09:30)")
+            if qty > 0:
+                _arm_carried_stop(A, symbol, qty)
+            return
+
+        due = (time.time() - last_place >= COVER_FILL_TIMEOUT * 60) or (rth and not last_rth)
+        if not due:
+            continue
+
+        try:
+            if not _cancel_and_wait(A, symbol):   # old cover / entry remainder / stop
+                last_place = time.time() - COVER_FILL_TIMEOUT * 60 + 30   # try again in ~30 s
+                continue
+            pos = A.position(symbol)
+            qty = _short_qty(pos)
+            if qty <= 0:
+                continue                  # filled while cancelling; next pass logs it
+            if rth:
+                res, how = _place_cover(A, symbol, qty, 0, "COVER_RETRY")
+            else:
+                px, src = _cover_ref_price(A, symbol, pos)
+                stepv = COVER_RETRY_STEPS[min(step, len(COVER_RETRY_STEPS) - 1)]
+                target = max((px or 0) * (1 + stepv), float(qc_price or 0))
+                if target <= 0:
+                    log.error(f"{tag} COVER LOOP: no price source — MANUAL ACTION REQUIRED (will retry)")
+                    last_place = time.time()
+                    continue
+                res, how = _place_cover(A, symbol, qty, target, "COVER_RETRY")
+                log.info(f"{tag} COVER RETRY {step + 1}: ref ${px or 0:.4f} ({src}) +{stepv*100:.1f}% "
+                         f"| QC floor ${float(qc_price or 0):.4f}")
+                step += 1
+            if res.get("clientOrderId"):
+                order_ids.append(res.get("clientOrderId"))
+            last_place, last_rth = time.time(), rth
+            log.info(f"{tag} COVER RETRY placed | {qty}sh | {how}")
+        except Exception as e:
+            log.error(f"{tag} COVER RETRY failed: {e} — will retry")
+            last_place = time.time()
+
+
+# ── scheduled jobs (New York time) ──────────────────────────────────────────
+def _daily_reset(A):
+    keep = {"ACTIVE", "COVERING", "LOCATING"}
+    with A.lock:
+        states = A.states()
+        dropped = [k for k, v in states.items() if v.get("state") not in keep]
+        for k in dropped:
+            states.pop(k, None)
+        kept = {k: v.get("state") for k, v in states.items()}
+    log.info(f"[{A.name}] DAILY RESET 03:50 ET: cleared {len(dropped)} | kept {kept}")
+    # leftover bridge stops (SL_*) on tickers with no short → cancel
+    try:
+        positions = _list_positions(A)
+        if positions is None:
+            log.warning(f"[{A.name}] RESET: positions unavailable — stop sweep skipped")
+            return
+        shorts = {str(p.get("symbol", "")).upper() for p in positions if _short_qty(p) > 0}
+        for o in _list_orders(A):
+            cid = str(o.get("clientOrderId", ""))
+            if (cid.startswith("SL_") and o.get("orderStatus", "") in OPEN_ORDER_STATUSES
+                    and str(o.get("symbol", "")).upper() not in shorts):
+                sym = str(o.get("symbol", "")).upper()
+                cancel_stop_order(A.acct_id(), A.headers, sym, cid, f"{A.name}_ORPHAN_STOP_CANCEL")
+                log.warning(f"[{A.name}] RESET: cancelled leftover stop {cid} on {sym} (no short)")
+    except Exception as e:
+        log.warning(f"[{A.name}] RESET stop sweep failed: {e}")
+
+
+def _carry_check(A):
+    """09:35 ET — logging only."""
+    try:
+        positions = _list_positions(A) or []
+    except Exception as e:
+        log.warning(f"[{A.name}] CARRY CHECK: positions unavailable: {e}")
+        return
+    with A.lock:
+        states = {k: dict(v) for k, v in A.states().items()}
+    for p in positions:
+        q = _short_qty(p)
+        if q <= 0:
+            continue
+        sym = str(p.get("symbol", "")).upper()
+        st = states.get(sym, {})
+        if st.get("carried"):
+            log.error(f"[{A.pfx}{sym}] MANUAL ACTION: {q}sh short carried from an earlier session "
+                      f"is still open at 09:35 ET (state={st.get('state')})")
+        elif st.get("state") not in ("ACTIVE", "COVERING", "LOCATING"):
+            log.error(f"[{A.pfx}{sym}] MANUAL ACTION: {q}sh short on TZ that the bridge has no "
+                      f"record of (state={st.get('state', 'none')})")
+
+
+def _rearm_stops(A):
+    """16:01 ET — RTH stops are Stop/Day and expired at 16:00. Re-arm every ACTIVE short
+    without a live stop as a GTC_Plus StopLimit at the original stop level."""
+    if not STOP_LOSS_ENABLED:
+        return
+    try:
+        open_ids = {str(o.get("clientOrderId")) for o in _list_orders(A)
+                    if o.get("orderStatus", "") in OPEN_ORDER_STATUSES}
+    except Exception as e:
+        log.warning(f"[{A.name}] STOP RE-ARM: orders unavailable: {e}")
+        return
+    with A.lock:
+        active = {k: dict(v) for k, v in A.states().items() if v.get("state") == "ACTIVE"}
+    for sym, st in active.items():
+        sid = st.get("sl_client_order_id")
+        if sid and str(sid) in open_ids:
+            continue                      # an ETH StopLimit (GTC_Plus) is still working
+        entry = float(st.get("entry_fill_price") or 0)
+        sl_pct = float(st.get("sl_pct") or DEFAULT_SL_PCT)
+        if entry <= 0 or sl_pct <= 0:
+            continue
+        try:
+            qty = _short_qty(A.position(sym))
+        except Exception:
+            qty = 0
+        if qty <= 0:
+            continue
+        trigger, limit = _compute_sl_prices(entry, sl_pct)
+        res = place_stop_order(A.acct_id(), A.headers, sym, qty, trigger, limit_price=limit,
+                               label=f"{A.name}_STOP_REARM", tif="GTC_Plus")
+        if res:
+            A.set_state(sym, sl_client_order_id=res.get("clientOrderId"))
+            log.info(f"[{A.pfx}{sym}] STOP RE-ARMED 16:01 (GTC_Plus) trigger=${trigger} limit=${limit}")
+        else:
+            log.warning(f"[{A.pfx}{sym}] STOP RE-ARM FAILED — position relies on QC-side SL")
+
+
+def ny_scheduler_thread():
+    """Runs the New York-time jobs once per day each (replaces the midnight-UTC reset)."""
+    jobs = [  # (name, (h, m), weekdays_only, fn)
+        ("reset",   RESET_TIME_ET,  False, _daily_reset),
+        ("check",   CARRY_CHECK_ET, True,  _carry_check),
+        ("rearm",   STOP_REARM_ET,  True,  _rearm_stops),
+    ]
+    now = _now_et()
+    # On startup, treat jobs whose time already passed today as done (no surprise reset).
+    done = {name: (now.date() if now.time() >= _dtime(*hm) else None) for name, hm, _w, _f in jobs}
+    log.info(f"NY SCHEDULER started at {now.strftime('%Y-%m-%d %H:%M')} ET | "
+             f"reset {RESET_TIME_ET} check {CARRY_CHECK_ET} rearm {STOP_REARM_ET}")
+    while True:
+        time.sleep(20)
+        now = _now_et()
+        for name, hm, weekdays_only, fn in jobs:
+            if done.get(name) == now.date() or now.time() < _dtime(*hm):
+                continue
+            done[name] = now.date()
+            if weekdays_only and now.weekday() >= 5:
+                continue
+            for A in ((REAL,) + ((SIM,) if SIM_API_KEY and SIM_ACCOUNT_ID else ())):
+                try:
+                    fn(A)
+                except Exception as e:
+                    log.error(f"[{A.name}] scheduled job '{name}' failed: {e}")
+
+
+threading.Thread(target=ny_scheduler_thread, daemon=True).start()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# FLASK APP
+# ══════════════════════════════════════════════════════════════════════════════
+app = Flask(__name__)
+
+
+@app.route("/", methods=["GET"])
+def root():
+    return jsonify({"status": "ok", "server": "tz-eod-short-webhook"}), 200
+
+
+_last_health_log = 0
+
+_tz_cache = {"ok": True, "detail": "startup", "routes": "", "account_bp": None}
+_tz_cache_lock = threading.Lock()
+_last_tz_check = 0
+
+def _refresh_tz_cache():
+    """Background thread: refresh TZ API status every 60s."""
+    global _last_tz_check
+    while True:
+        time.sleep(60)
+        try:
+            r = _tz_call("GET", f"{BASE_URL}/v1/api/accounts", tz_headers())
+            ok = r.status_code == 200
+            detail = f"http_{r.status_code}: {r.text[:200]}"
+            r2 = _tz_call("GET", f"{BASE_URL}/v1/api/account/{ACCOUNT_ID}", tz_headers())
+            bp = r2.json().get("bp") if r2.ok else None
+            try:
+                r3 = _tz_call("GET", f"{BASE_URL}/v1/api/accounts/{ACCOUNT_ID}/routes", tz_headers())
+                routes = r3.text[:300]
+            except Exception:
+                routes = _tz_cache.get("routes", "")
+            with _tz_cache_lock:
+                _tz_cache.update({"ok": ok, "detail": detail, "routes": routes, "account_bp": bp})
+            _last_tz_check = time.time()
+        except Exception as e:
+            with _tz_cache_lock:
+                _tz_cache["ok"] = False
+                _tz_cache["detail"] = f"error: {e}"
+
+threading.Thread(target=_refresh_tz_cache, daemon=True).start()
+
+
+@app.route("/health", methods=["GET", "HEAD"])
+def health():
+    with state_lock:
+        states = {k: v.get("state") for k, v in symbol_state.items()}
+    with sim_state_lock:
+        sim_states = {k: v.get("state") for k, v in sim_symbol_state.items()}
+    with _tz_cache_lock:
+        cache = dict(_tz_cache)
+
+    status = {
+        "server":            "ok",
+        "tz_api":            "ok" if cache["ok"] else "unreachable",
+        "tz_detail":         cache["detail"],
+        "account":           ACCOUNT_ID,
+        "key_preview":       API_KEY[:8] + "..." if API_KEY else "NOT SET",
+        "symbol_states":     states,
+        "sim_symbol_states": sim_states,
+        "sim_account":       SIM_ACCOUNT_ID or "NOT SET",
+        "sim_key_preview":   SIM_API_KEY[:8] + "..." if SIM_API_KEY else "NOT SET",
+        "routes":            cache["routes"],
+        "ticker_aliases":    TICKER_ALIASES,
+        "polygon_key":       POLYGON_API_KEY[:8] + "..." if POLYGON_API_KEY else "NOT SET",
+        "twelvedata_key":    TWELVEDATA_API_KEY[:8] + "..." if TWELVEDATA_API_KEY else "NOT SET",
+        "stop_loss_enabled": STOP_LOSS_ENABLED,
+        "config": {
+            "max_locate_cost_pct": MAX_LOCATE_COST_PCT,
+            "sim_max_locate_cost_pct": SIM_MAX_LOCATE_COST_PCT,
+            "allowed_strategies":  sorted(ALLOWED_STRATEGIES) or "all",
+            "min_locate_quantity": MIN_LOCATE_QUANTITY,
+            "locate_poll_timeout": LOCATE_POLL_TIMEOUT,
+            "locate_bp_usage":     LOCATE_BP_USAGE,
+            "locate_stepdown":     f"<1000sh: -100/step | >=1000sh: x{LOCATE_STEPDOWN_FACTOR} (max {LOCATE_MAX_ATTEMPTS})",
+            "stop_loss_enabled":   STOP_LOSS_ENABLED,
+            "default_sl_pct":      DEFAULT_SL_PCT,
+            "price_handling":      "QC pre-buffered — server uses received price directly",
+        },
+    }
+    global _last_health_log
+    import time as _t
+    now_ts = _t.time()
+    if now_ts - _last_health_log >= 300:
+        log.info(f"HEALTH: {status}")
+        _last_health_log = now_ts
+    return jsonify(status), 200
+
+
+@app.route("/state", methods=["GET"])
+def state_endpoint():
+    with state_lock:
+        return jsonify(dict(symbol_state)), 200
+
+
+@app.route("/sim/state", methods=["GET"])
+def sim_state_endpoint():
+    with sim_state_lock:
+        return jsonify(dict(sim_symbol_state)), 200
+
+
+@app.route("/reset/<symbol>", methods=["POST"])
+def reset_symbol(symbol):
+    """Emergency manual reset of a real symbol to FLAT."""
+    symbol = symbol.upper()
+    with state_lock:
+        symbol_state[symbol] = {"state": "FLAT"}
+    log.info(f"[{symbol}] MANUAL RESET to FLAT")
+    return jsonify({"status": "ok", "symbol": symbol, "state": "FLAT"}), 200
+
+
+@app.route("/sim/reset/<symbol>", methods=["POST"])
+def sim_reset_symbol(symbol):
+    """Emergency manual reset of a sim symbol to FLAT."""
+    symbol = symbol.upper()
+    with sim_state_lock:
+        sim_symbol_state[symbol] = {"state": "FLAT"}
+    log.info(f"[SIM:{symbol}] MANUAL RESET to FLAT")
+    return jsonify({"status": "ok", "symbol": symbol, "state": "FLAT", "mode": "sim"}), 200
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# REAL ACCOUNT — /webhook
+# ══════════════════════════════════════════════════════════════════════════════
+@app.route("/webhook", methods=["POST"])
+def webhook():
+    log.info("=" * 60)
+    log.info("WEBHOOK RECEIVED")
+    log.info(f"  headers: {dict(request.headers)}")
+    log.info(f"  raw body: {request.data.decode('utf-8', errors='replace')[:1000]}")
+
+    try:
+        body = request.get_json(force=True)
+        if isinstance(body, str):
+            body = json.loads(body)
+    except Exception as e:
+        log.error(f"  Parse error: {e}")
+        return jsonify({"error": "invalid JSON"}), 400
+
+    log.info(f"  parsed: {json.dumps(body)}")
+
+    action      = str(body.get("action", "")).upper()
+    qc_symbol   = str(body.get("symbol", "")).upper().strip().split()[0]
+    quantity    = int(body.get("quantity", 0))
+    price       = float(body.get("price", 0))
+    cycle       = int(body.get("cycle", 1))
+    # Optional SL pct from QC payload; falls back to DEFAULT_SL_PCT if absent.
+    sl_pct_raw  = body.get("sl_pct")
+    sl_pct      = float(sl_pct_raw) if sl_pct_raw is not None else DEFAULT_SL_PCT
+    # Ownership tag: which QC strategy sent this. Used to stamp owner on SHORT and
+    # to reject stray COVERs from a non-owning strategy. Empty → guards no-op.
+    # No strategy field (older QC algos) → "legacy", so the ownership guard still
+    # separates them from vol/ema/bgs (2 Nov: a legacy COVER closed a BGS short and a
+    # BGS COVER closed a legacy short, because an empty owner disabled the guard).
+    strategy    = str(body.get("strategy") or body.get("slot") or "legacy").lower()
+    if ALLOWED_STRATEGIES and strategy not in ALLOWED_STRATEGIES:
+        log.info(f"[{qc_symbol}] {action} ignored — strategy '{strategy}' not in ALLOWED_STRATEGIES")
+        return jsonify({"status": "ignored", "reason": "strategy not allowed", "strategy": strategy}), 200
+
+    if not qc_symbol:
+        return jsonify({"error": "missing symbol"}), 400
+
+    symbol = resolve_symbol(qc_symbol)
+    if symbol != qc_symbol:
+        log.info(f"[{qc_symbol}→{symbol}] Ticker resolved")
+
+    s             = get_state(symbol)
+    current_state = s.get("state", "FLAT")
+
+    log.info(f"[{symbol}] action={action} | state={current_state} | "
+             f"qty={quantity} | price=${price}")
+
+    # ── SHORT ────────────────────────────────────────────────────────────────
+    if action == "SHORT":
+        if current_state == "BLOCKED":
+            last_cycle = s.get("cycle", 0)
+            if cycle > last_cycle:
+                log.info(f"[{symbol}] BLOCKED lifted — new cycle {cycle} > last cycle {last_cycle}")
+                set_state(symbol, state="FLAT")
+                current_state = "FLAT"
+            else:
+                log.info(f"[{symbol}] SHORT ignored — blocked today (cycle={cycle}, last={last_cycle}): {s.get('reason', '')}")
+                return jsonify({"status": "ignored", "reason": "blocked", "cycle": cycle, "last_cycle": last_cycle}), 200
+
+        if current_state == "LOCATING":
+            log.warning(f"[{symbol}] SHORT ignored — locate already in progress")
+            return jsonify({"status": "ignored", "reason": "locate in progress"}), 200
+
+        if current_state == "COVERING":
+            log.info(f"[{symbol}] SHORT ignored — cover still working on this ticker")
+            return jsonify({"status": "ignored", "reason": "cover in progress"}), 200
+
+        if current_state == "ACTIVE":
+            # SOFT-IGNORE: do NOT block() here. block() poisons the symbol so the
+            # holder's own later COVER gets ignored → orphaned position. Just drop
+            # the duplicate and leave the existing position/state fully intact.
+            log.info(f"[{symbol}] SHORT ignored — symbol busy (already ACTIVE); "
+                     f"leaving holder's position untouched")
+            return jsonify({"status": "ignored", "reason": "symbol busy (already active)"}), 200
+
+        if quantity <= 0 or price <= 0:
+            return jsonify({"error": "quantity and price required for SHORT"}), 400
+
+        set_state(symbol, state="LOCATING", entry_price=price, quantity=quantity, cycle=cycle, sl_pct=sl_pct, owner=strategy)
+        threading.Thread(target=locate_and_short, args=(symbol, quantity, price), daemon=True).start()
+        log.info(f"[{symbol}] Locate thread launched — returning 200 immediately")
+        return jsonify({"status": "ok", "action": "SHORT", "symbol": symbol, "state": "LOCATING"}), 200
+
+    # ── COVER ────────────────────────────────────────────────────────────────
+    elif action == "COVER":
+        if current_state == "LOCATING":
+            log.warning(f"[{symbol}] COVER received during locate — cancelling and cleaning up")
+            threading.Thread(
+                target=cancel_and_cleanup,
+                args=(symbol, "COVER received while still locating"),
+                daemon=True
+            ).start()
+            return jsonify({"status": "ok", "action": "cleanup_on_cover_during_locate"}), 200
+        body_out, code = handle_cover(REAL, symbol, price, strategy)
+        return jsonify(body_out), code
+
+    # ── CANCEL ───────────────────────────────────────────────────────────────
+    elif action == "CANCEL":
+        log.info(f"[{symbol}] CANCEL received — cancelling orders and closing any position")
+        threading.Thread(
+            target=cancel_and_cleanup,
+            args=(symbol, "CANCEL signal received from QC"),
+            daemon=True
+        ).start()
+        return jsonify({"status": "ok", "action": "CANCEL", "symbol": symbol}), 200
+
+    else:
+        log.warning(f"[{symbol}] Unknown action: {action}")
+        return jsonify({"error": f"unknown action: {action}"}), 400
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SIM ACCOUNT — /sim/webhook
+# ══════════════════════════════════════════════════════════════════════════════
+@app.route("/sim/webhook", methods=["POST"])
+def sim_webhook():
+    log.info("=" * 60)
+    log.info("SIM WEBHOOK RECEIVED")
+    log.info(f"  raw body: {request.data.decode('utf-8', errors='replace')[:1000]}")
+
+    if not SIM_API_KEY or not SIM_API_SECRET or not SIM_ACCOUNT_ID:
+        log.error("SIM credentials not configured — set TZ_SIM_API_KEY, TZ_SIM_API_SECRET, SIM_ACCOUNT_ID")
+        return jsonify({"error": "sim credentials not configured — check Render env vars"}), 503
+
+    try:
+        body = request.get_json(force=True)
+        if isinstance(body, str):
+            body = json.loads(body)
+    except Exception as e:
+        log.error(f"  Parse error: {e}")
+        return jsonify({"error": "invalid JSON"}), 400
+
+    log.info(f"  parsed: {json.dumps(body)}")
+
+    action    = str(body.get("action", "")).upper()
+    qc_symbol = str(body.get("symbol", "")).upper().strip().split()[0]
+    quantity  = int(body.get("quantity", 0))
+    price     = float(body.get("price", 0))
+    cycle     = int(body.get("cycle", 1))
+    # Optional SL pct from QC payload; falls back to DEFAULT_SL_PCT if absent.
+    sl_pct_raw = body.get("sl_pct")
+    sl_pct     = float(sl_pct_raw) if sl_pct_raw is not None else DEFAULT_SL_PCT
+    # Ownership tag (see real /webhook). Empty → guards no-op.
+    strategy   = str(body.get("strategy") or body.get("slot") or "legacy").lower()
+    if ALLOWED_STRATEGIES and strategy not in ALLOWED_STRATEGIES:
+        log.info(f"[SIM:{qc_symbol}] {action} ignored — strategy '{strategy}' not in ALLOWED_STRATEGIES")
+        return jsonify({"status": "ignored", "reason": "strategy not allowed",
+                        "strategy": strategy, "mode": "sim"}), 200
+
+    if not qc_symbol:
+        return jsonify({"error": "missing symbol"}), 400
+
+    symbol = resolve_symbol(qc_symbol)
+    if symbol != qc_symbol:
+        log.info(f"[SIM:{qc_symbol}→{symbol}] Ticker resolved")
+
+    s             = sim_get_state(symbol)
+    current_state = s.get("state", "FLAT")
+
+    log.info(f"[SIM:{symbol}] action={action} | state={current_state} | "
+             f"qty={quantity} | price=${price} | cycle={cycle}")
+
+    # ── SHORT ────────────────────────────────────────────────────────────────
+    if action == "SHORT":
+        if current_state == "BLOCKED":
+            last_cycle = s.get("cycle", 0)
+            if cycle > last_cycle:
+                log.info(f"[SIM:{symbol}] BLOCKED lifted — new cycle {cycle} > last {last_cycle}")
+                sim_set_state(symbol, state="FLAT")
+                current_state = "FLAT"
+            else:
+                log.info(f"[SIM:{symbol}] SHORT ignored — blocked "
+                         f"(cycle={cycle} last={last_cycle}): {s.get('reason', '')}")
+                return jsonify({
+                    "status": "ignored", "reason": "blocked",
+                    "cycle": cycle, "last_cycle": last_cycle, "mode": "sim",
+                }), 200
+
+        if current_state == "LOCATING":
+            log.warning(f"[SIM:{symbol}] SHORT ignored — locate already in progress")
+            return jsonify({"status": "ignored", "reason": "locate in progress", "mode": "sim"}), 200
+
+        if current_state == "COVERING":
+            log.info(f"[SIM:{symbol}] SHORT ignored — cover still working on this ticker")
+            return jsonify({"status": "ignored", "reason": "cover in progress", "mode": "sim"}), 200
+
+        if current_state == "ACTIVE":
+            # SOFT-IGNORE (see real /webhook): never sim_block() on a duplicate —
+            # it would orphan the holder's position when its own COVER arrives.
+            log.info(f"[SIM:{symbol}] SHORT ignored — symbol busy (already ACTIVE); "
+                     f"leaving holder's position untouched")
+            return jsonify({"status": "ignored", "reason": "symbol busy (already active)", "mode": "sim"}), 200
+
+        if quantity <= 0 or price <= 0:
+            return jsonify({"error": "quantity and price required for SHORT"}), 400
+
+        sim_set_state(symbol, state="LOCATING", entry_price=price, quantity=quantity, cycle=cycle, sl_pct=sl_pct, owner=strategy)
+        threading.Thread(
+            target=locate_and_short_sim, args=(symbol, quantity, price), daemon=True
+        ).start()
+        return jsonify({
+            "status": "ok", "action": "SHORT", "symbol": symbol,
+            "state": "LOCATING", "mode": "sim",
+        }), 200
+
+    # ── COVER ────────────────────────────────────────────────────────────────
+    elif action == "COVER":
+        if current_state == "LOCATING":
+            log.warning(f"[SIM:{symbol}] COVER during locate — cancelling")
+            threading.Thread(
+                target=sim_cancel_and_cleanup,
+                args=(symbol, "COVER received while still locating"),
+                daemon=True,
+            ).start()
+            return jsonify({
+                "status": "ok", "action": "cleanup_on_cover_during_locate", "mode": "sim"
+            }), 200
+        body_out, code = handle_cover(SIM, symbol, price, strategy)
+        body_out["mode"] = "sim"
+        return jsonify(body_out), code
+
+    # ── CANCEL ───────────────────────────────────────────────────────────────
+    elif action == "CANCEL":
+        log.info(f"[SIM:{symbol}] CANCEL received")
+        threading.Thread(
+            target=sim_cancel_and_cleanup,
+            args=(symbol, "CANCEL signal from QC"),
+            daemon=True,
+        ).start()
+        return jsonify({"status": "ok", "action": "CANCEL", "symbol": symbol, "mode": "sim"}), 200
+
+    else:
+        log.warning(f"[SIM:{symbol}] Unknown action: {action}")
+        return jsonify({"error": f"unknown action: {action}"}), 400
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ENTRYPOINT
+# ══════════════════════════════════════════════════════════════════════════════
+if __name__ == "__main__":
+    if not API_KEY or not API_SECRET:
+        log.warning("TZ_API_KEY or TZ_API_SECRET not set — real account orders will fail")
+    if not SIM_API_KEY or not SIM_API_SECRET or not SIM_ACCOUNT_ID:
+        log.warning("SIM credentials not set — /sim/webhook will return 503")
+
+    port = int(os.environ.get("PORT", 5000))
+
+    log.info("")
+    log.info("╔══════════════════════════════════════════════════════════╗")
+    log.info("║  TradeZero EOD Short Webhook Server                      ║")
+    log.info("║                                                          ║")
+    log.info("║  REAL ACCOUNT                                            ║")
+    log.info("║  POST /webhook          ← SHORT / COVER / CANCEL        ║")
+    log.info("║  GET  /state            ← view real symbol states       ║")
+    log.info("║  POST /reset/<symbol>   ← manually reset symbol to FLAT ║")
+    log.info("║                                                          ║")
+    log.info("║  SIM ACCOUNT                                             ║")
+    log.info("║  POST /sim/webhook      ← SHORT / COVER / CANCEL        ║")
+    log.info("║  GET  /sim/state        ← view sim symbol states        ║")
+    log.info("║  POST /sim/reset/<sym>  ← manually reset sim to FLAT    ║")
+    log.info("║                                                          ║")
+    log.info("║  GET  /health           ← server + TZ API status        ║")
+    log.info("╚══════════════════════════════════════════════════════════╝")
+    log.info(f"  Real account:      {ACCOUNT_ID}")
+    log.info(f"  Real key:          {API_KEY[:8] + '...' if API_KEY else 'NOT SET'}")
+    log.info(f"  Sim account:       {SIM_ACCOUNT_ID or 'NOT SET'}")
+    log.info(f"  Sim key:           {SIM_API_KEY[:8] + '...' if SIM_API_KEY else 'NOT SET — /sim/webhook returns 503'}")
+    log.info(f"  Ticker aliases:    {TICKER_ALIASES}")
+    log.info(f"  Polygon key:       {POLYGON_API_KEY[:8] + '...' if POLYGON_API_KEY else 'NOT SET'}")
+    log.info(f"  Twelve Data key:   {TWELVEDATA_API_KEY[:8] + '...' if TWELVEDATA_API_KEY else 'NOT SET'}")
+    log.info(f"  Max locate cost:   {MAX_LOCATE_COST_PCT*100:.1f}% real | {SIM_MAX_LOCATE_COST_PCT*100:.1f}% sim")
+    log.info(f"  Min locate qty:    {MIN_LOCATE_QUANTITY}")
+    log.info(f"  Locate timeout:    {LOCATE_POLL_TIMEOUT}s")
+    log.info(f"  Locate BP usage:   {LOCATE_BP_USAGE*100:.0f}% of 1:1 BP (fresh locate sizing)")
+    log.info(f"  Locate stepdown:   <1000sh: -100/step | >=1000sh: x{LOCATE_STEPDOWN_FACTOR} (max {LOCATE_MAX_ATTEMPTS} attempts)")
+    log.info(f"  Stop-loss:         {'ENABLED — broker SL armed after each fill' if STOP_LOSS_ENABLED else 'DISABLED — relying on QC cover webhook only'}")
+    log.info(f"  Price handling:    QC pre-buffered — server uses received price directly")
+    log.info(f"  Listening on port: {port}")
+    log.info("")
+    app.run(host="0.0.0.0", port=port, debug=False)
