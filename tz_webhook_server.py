@@ -303,10 +303,42 @@ def tz_headers():
     }
 
 
+# ── TZ API throttle + 429 retry ───────────────────────────────────────────────
+# 2 Nov 15:30: two strategies' force-closes hit the positions endpoint 70 ms apart
+# and TZ answered 429 (rate limited) to the second; the bridge read that as "no
+# position" and left BLZE short. Every TZ call now goes through _tz_call: calls are
+# spaced at least TZ_MIN_GAP_S apart, and a 429 is retried with backoff (Retry-After
+# honoured). A 429 means the request was not processed, so retrying is safe.
+TZ_MIN_GAP_S   = 0.25
+TZ_429_RETRIES = 4
+_tz_call_lock  = threading.Lock()
+_tz_last_call  = [0.0]
+
+
+def _tz_call(method, url, headers, **kw):
+    for attempt in range(TZ_429_RETRIES + 1):
+        with _tz_call_lock:
+            wait = TZ_MIN_GAP_S - (time.time() - _tz_last_call[0])
+            if wait > 0:
+                time.sleep(wait)
+            _tz_last_call[0] = time.time()
+        r = requests.request(method, url, headers=headers, timeout=15, **kw)
+        if r.status_code != 429 or attempt == TZ_429_RETRIES:
+            return r
+        try:
+            delay = float(r.headers.get("Retry-After") or 0)
+        except (TypeError, ValueError):
+            delay = 0
+        delay = max(delay, 1.0 * (2 ** attempt))      # 1, 2, 4, 8 s
+        log.warning(f"  TZ 429 rate limited on {method} {url.split('/v1/api')[-1]} — retry in {delay:.0f}s")
+        time.sleep(delay)
+    return r
+
+
 def tz_get(path, label="GET"):
     url = f"{BASE_URL}{path}"
     log.info(f"  → {label} GET {url}")
-    r = requests.get(url, headers=tz_headers(), timeout=15)
+    r = _tz_call("GET", url, tz_headers())
     log.info(f"  ← status: {r.status_code}  body: {r.text[:600]}")
     return r
 
@@ -315,7 +347,7 @@ def tz_post(path, payload, label="POST"):
     url = f"{BASE_URL}{path}"
     log.info(f"  → {label} POST {url}")
     log.info(f"    body: {json.dumps(payload)}")
-    r = requests.post(url, headers=tz_headers(), json=payload, timeout=15)
+    r = _tz_call("POST", url, tz_headers(), json=payload)
     log.info(f"  ← status: {r.status_code}  body: {r.text[:600]}")
     return r
 
@@ -323,7 +355,7 @@ def tz_post(path, payload, label="POST"):
 def tz_delete(path, label="DELETE"):
     url = f"{BASE_URL}{path}"
     log.info(f"  → {label} DELETE {url}")
-    r = requests.delete(url, headers=tz_headers(), timeout=15)
+    r = _tz_call("DELETE", url, tz_headers())
     log.info(f"  ← status: {r.status_code}  body: {r.text[:200]}")
     return r
 
@@ -343,7 +375,7 @@ def sim_headers():
 def sim_tz_get(path, label="GET"):
     url = f"{BASE_URL}{path}"
     log.info(f"  → [SIM] {label} GET {url}")
-    r = requests.get(url, headers=sim_headers(), timeout=15)
+    r = _tz_call("GET", url, sim_headers())
     log.info(f"  ← [SIM] status: {r.status_code}  body: {r.text[:600]}")
     return r
 
@@ -352,7 +384,7 @@ def sim_tz_post(path, payload, label="POST"):
     url = f"{BASE_URL}{path}"
     log.info(f"  → [SIM] {label} POST {url}")
     log.info(f"    body: {json.dumps(payload)}")
-    r = requests.post(url, headers=sim_headers(), json=payload, timeout=15)
+    r = _tz_call("POST", url, sim_headers(), json=payload)
     log.info(f"  ← [SIM] status: {r.status_code}  body: {r.text[:600]}")
     return r
 
@@ -360,7 +392,7 @@ def sim_tz_post(path, payload, label="POST"):
 def sim_tz_delete(path, label="DELETE"):
     url = f"{BASE_URL}{path}"
     log.info(f"  → [SIM] {label} DELETE {url}")
-    r = requests.delete(url, headers=sim_headers(), timeout=15)
+    r = _tz_call("DELETE", url, sim_headers())
     log.info(f"  ← [SIM] status: {r.status_code}  body: {r.text[:200]}")
     return r
 
@@ -376,6 +408,21 @@ def get_account_details():
     return None
 
 
+def _pick_position(rows, symbol):
+    """TZ keeps a row per position lifecycle for the day: a closed one stays listed with
+    shares 0 (seen 2 Nov: three CLRO rows). Return the open row (shares != 0), or a closed
+    one if that's all there is, so a closed row listed first never hides an open short."""
+    mine = [p for p in rows if str(p.get("symbol", "")).upper() == symbol.upper()]
+    if not mine:
+        return None
+    open_rows = [p for p in mine if float(p.get("shares", 0) or 0) != 0]
+    if len(open_rows) > 1:   # shouldn't happen; merge so the full size is covered
+        merged = dict(open_rows[0])
+        merged["shares"] = sum(float(p.get("shares", 0) or 0) for p in open_rows)
+        return merged
+    return open_rows[0] if open_rows else mine[0]
+
+
 def get_position(symbol):
     r = tz_get(f"/v1/api/accounts/{ACCOUNT_ID}/positions", "POSITIONS")
     if r.status_code != 200:
@@ -384,10 +431,10 @@ def get_position(symbol):
     positions = r.json()
     if not isinstance(positions, list):
         positions = positions.get("positions", [])
-    for p in positions:
-        if p.get("symbol", "").upper() == symbol.upper():
-            log.info(f"  Found position for {symbol}: {json.dumps(p)}")
-            return p
+    p = _pick_position(positions, symbol)
+    if p is not None:
+        log.info(f"  Found position for {symbol}: {json.dumps(p)}")
+        return p
     log.info(f"  No open position found for {symbol}")
     return None
 
@@ -462,10 +509,10 @@ def sim_get_position(symbol):
     positions = r.json()
     if not isinstance(positions, list):
         positions = positions.get("positions", [])
-    for p in positions:
-        if p.get("symbol", "").upper() == symbol.upper():
-            log.info(f"  [SIM] Found position for {symbol}: {json.dumps(p)}")
-            return p
+    p = _pick_position(positions, symbol)
+    if p is not None:
+        log.info(f"  [SIM] Found position for {symbol}: {json.dumps(p)}")
+        return p
     log.info(f"  [SIM] No open position found for {symbol}")
     return None
 
@@ -674,7 +721,7 @@ def place_stop_order(account_id, headers_fn, symbol, quantity, trigger_price,
     log.info(f"  → {label} POST {url}")
     log.info(f"    body: {json.dumps(payload)}")
     try:
-        r = requests.post(url, headers=headers_fn(), json=payload, timeout=15)
+        r = _tz_call("POST", url, headers_fn(), json=payload)
         log.info(f"  ← {label} status: {r.status_code}  body: {r.text[:400]}")
         if not r.ok:
             log.error(f"  [{symbol}] Stop order FAILED {r.status_code} — body: {r.text[:300]}")
@@ -699,7 +746,7 @@ def cancel_stop_order(account_id, headers_fn, symbol, stop_client_order_id, labe
     url = f"{BASE_URL}/v1/api/accounts/{account_id}/orders/{stop_client_order_id}"
     log.info(f"  → {label} DELETE {url}")
     try:
-        r = requests.delete(url, headers=headers_fn(), timeout=10)
+        r = _tz_call("DELETE", url, headers_fn())
         log.info(f"  ← {label} status: {r.status_code}  body: {r.text[:200]}")
         if r.status_code in (200, 204):
             log.info(f"  [{symbol}] Stop order {stop_client_order_id} cancelled")
@@ -764,10 +811,7 @@ def verify_stop_alive(account_id, headers_fn, symbol, stop_client_order_id,
     prefix = f"[SIM:{symbol}]" if is_sim else f"[{symbol}]"
     try:
         time.sleep(delay_seconds)
-        r = requests.get(
-            f"{BASE_URL}/v1/api/accounts/{account_id}/orders",
-            headers=headers_fn(), timeout=10
-        )
+        r = _tz_call("GET", f"{BASE_URL}/v1/api/accounts/{account_id}/orders", headers_fn())
         if not r.ok:
             log.warning(f"{prefix} STOP VERIFY: orders fetch failed: {r.status_code}")
             return
@@ -829,7 +873,7 @@ def poll_locate_status(symbol, quote_req_id):
     while time.time() < deadline:
         url = f"{BASE_URL}/v1/api/accounts/{ACCOUNT_ID}/locates/history"
         log.info(f"  → LOCATE_POLL GET {url}")
-        r = requests.get(url, headers=tz_headers(), timeout=15)
+        r = _tz_call("GET", url, tz_headers())
         log.info(f"  ← status: {r.status_code}  body: {r.text}")
         if r.status_code == 200:
             history = r.json().get("locateHistory", [])
@@ -2367,6 +2411,26 @@ SIM = _Acct("SIM", True, lambda: SIM_ACCOUNT_ID, sim_headers, sim_tz_get, sim_tz
 OPEN_ORDER_STATUSES = {"PendingNew", "New", "PartiallyFilled", "Submitted"}
 
 
+def _position_strict(A, symbol):
+    """Position row for `symbol`, None if TZ says there is none — and an EXCEPTION if
+    the lookup itself fails. get_position()/sim_get_position() return None for both,
+    so a failed request looked like 'no position' (BLZE, 2 Nov 15:30: the lookup failed,
+    the bridge marked the ticker FLAT, and the short was left open)."""
+    r = A.get_fn(f"/v1/api/accounts/{A.acct_id()}/positions", f"{A.name}_POSITIONS")
+    if not r.ok:
+        raise RuntimeError(f"positions HTTP {r.status_code}: {r.text[:120]}")
+    rows = r.json()
+    if not isinstance(rows, list):
+        rows = rows.get("positions", [])
+    p = _pick_position(rows, symbol)
+    log.info(f"{A.tag(symbol)} position: {'none' if p is None else p.get('shares')} sh")
+    return p
+
+
+REAL.position = lambda symbol: _position_strict(REAL, symbol)
+SIM.position = lambda symbol: _position_strict(SIM, symbol)
+
+
 def _now_et():
     return _datetime.now(NY)
 
@@ -2477,6 +2541,32 @@ def _list_orders(A):
     return o if isinstance(o, list) else o.get("orders", [])
 
 
+def _cancel_and_wait(A, symbol, timeout=12):
+    """Cancel every open order on `symbol` (unfilled entry remainder, stop, old cover)
+    and wait until TZ shows none still open. Returns True when clear. Placing a new
+    cover while an old order is still live risks a double buy (→ long), and leaving an
+    entry order working after a cover can re-open the short later (CSTE, 2 Nov)."""
+    try:
+        A.cancel_all(symbol)
+    except Exception as e:
+        log.warning(f"{A.tag(symbol)} cancel failed: {e}")
+    deadline = time.time() + timeout
+    while True:
+        try:
+            still = [o for o in _list_orders(A)
+                     if str(o.get("symbol", "")).upper() == symbol.upper()
+                     and o.get("orderStatus", "") in OPEN_ORDER_STATUSES]
+        except Exception:
+            still = None
+        if still == []:
+            return True
+        if time.time() >= deadline:
+            log.warning(f"{A.tag(symbol)} {len(still or [])} order(s) still open after cancel "
+                        f"— not placing a new cover yet")
+            return False
+        time.sleep(2)
+
+
 def _list_positions(A):
     r = A.get_fn(f"/v1/api/accounts/{A.acct_id()}/positions", "POSITIONS")
     if not r.ok:
@@ -2570,16 +2660,59 @@ def handle_cover(A, symbol, qc_price, strategy):
         log.info(f"{A.tag(symbol)} COVER ignored — cover already in progress")
         return {"status": "ignored", "reason": "cover in progress"}, 200
 
+    # Look first (nothing cancelled yet, so a failed lookup leaves the stop in place).
+    # If the bridge knows the entry filled, don't trust a single "no position" read.
+    expect_short = bool(s.get("entry_fill_price"))
+    try:
+        pos = A.position(symbol)
+        tries = 1
+        while expect_short and _short_qty(pos) <= 0 and tries < 4:
+            time.sleep(2)
+            pos = A.position(symbol)
+            tries += 1
+        if expect_short and _short_qty(pos) <= 0:
+            log.warning(f"{A.tag(symbol)} COVER: entry was filled but TZ shows no short after "
+                        f"{tries} reads — treating as flat")
+    except Exception as e:
+        # The lookup itself failed (TZ API error / rate limit). Retry a few times; if it
+        # still fails, keep the ticker COVERING and let the cover loop keep trying —
+        # QC sends each COVER only once, so giving up here would strand the short.
+        pos, err = None, e
+        for _ in range(3):
+            time.sleep(2)
+            try:
+                pos, err = A.position(symbol), None
+                break
+            except Exception as e2:
+                err = e2
+        if err is not None:
+            log.error(f"{A.tag(symbol)} COVER position lookup failing ({err}) — cover loop will keep trying")
+            A.set_state(symbol, state="COVERING", carried=False, reason="cover: position lookup failing")
+            threading.Thread(target=cover_until_flat,
+                             args=(A, symbol, [], float(qc_price or 0), _is_rth_now(), False),
+                             daemon=True).start()
+            return {"status": "ok", "note": "position lookup failing — cover loop retrying"}, 200
+
+    # Cancel any still-working entry (its unfilled remainder would re-open the short
+    # after we cover) and the broker stop, and wait for TZ to confirm, BEFORE sizing.
+    clear = _cancel_and_wait(A, symbol)
+    A.set_state(symbol, sl_client_order_id=None)
     try:
         pos = A.position(symbol)
     except Exception as e:
-        log.error(f"{A.tag(symbol)} COVER position lookup failed: {e}")
-        A.set_state(symbol, state=current, reason="cover lookup failed")   # un-claim
-        return {"error": str(e)}, 500
+        log.warning(f"{A.tag(symbol)} COVER: re-read after cancel failed ({e}) — using first read")
 
     qty = _short_qty(pos)
+    if qty <= 0 and not clear:
+        # an entry order may still be live — keep watching rather than declare FLAT
+        log.warning(f"{A.tag(symbol)} COVER: no short yet but orders still open — cover loop will watch")
+        A.set_state(symbol, state="COVERING", carried=False, reason="cover: waiting for cancels")
+        threading.Thread(target=cover_until_flat,
+                         args=(A, symbol, [], float(qc_price or 0), _is_rth_now(), False),
+                         daemon=True).start()
+        return {"status": "ok", "note": "waiting for open orders to cancel"}, 200
     if qty <= 0:
-        log.warning(f"{A.tag(symbol)} COVER: no TZ short found — marking FLAT (not blocking)")
+        log.warning(f"{A.tag(symbol)} COVER: no TZ short (entry cancelled/unfilled) — marking FLAT")
         A.set_state(symbol, state="FLAT", reason="cover: no short found", owner=None, carried=False)
         return {"status": "ok", "note": "no short position"}, 200
 
@@ -2644,6 +2777,14 @@ def cover_until_flat(A, symbol, order_ids, qc_price, placed_in_rth, placed=True)
             continue
         qty = _short_qty(pos)
         if qty <= 0:
+            # flat — but make sure nothing (e.g. an entry remainder) is still working
+            if not _cancel_and_wait(A, symbol):
+                continue
+            try:
+                qty = _short_qty(A.position(symbol))
+            except Exception:
+                continue
+        if qty <= 0:
             _log_cover_fill(A, symbol, order_ids)
             A.set_state(symbol, state="FLAT", reason="cover filled", owner=None, carried=False)
             return
@@ -2651,10 +2792,7 @@ def cover_until_flat(A, symbol, order_ids, qc_price, placed_in_rth, placed=True)
         now = _now_et()
         rth = _is_rth_now()
         if not rth and not _in_day_plus_window(now):
-            try:
-                A.cancel_all(symbol)
-            except Exception as e:
-                log.warning(f"{tag} COVER LOOP: cancel failed: {e}")
+            _cancel_and_wait(A, symbol)
             # A cover can fill in the moments before the cancel lands. Re-read the
             # position so the carry stop is sized to what is really still short (and
             # not placed at all if the cover filled) — a buy stop on a flat ticker would
@@ -2682,8 +2820,9 @@ def cover_until_flat(A, symbol, order_ids, qc_price, placed_in_rth, placed=True)
             continue
 
         try:
-            A.cancel_all(symbol)          # the working cover (and any stop)
-            time.sleep(2)
+            if not _cancel_and_wait(A, symbol):   # old cover / entry remainder / stop
+                last_place = time.time() - COVER_FILL_TIMEOUT * 60 + 30   # try again in ~30 s
+                continue
             pos = A.position(symbol)
             qty = _short_qty(pos)
             if qty <= 0:
@@ -2853,13 +2992,13 @@ def _refresh_tz_cache():
     while True:
         time.sleep(60)
         try:
-            r = requests.get(f"{BASE_URL}/v1/api/accounts", headers=tz_headers(), timeout=8)
+            r = _tz_call("GET", f"{BASE_URL}/v1/api/accounts", tz_headers())
             ok = r.status_code == 200
             detail = f"http_{r.status_code}: {r.text[:200]}"
-            r2 = requests.get(f"{BASE_URL}/v1/api/account/{ACCOUNT_ID}", headers=tz_headers(), timeout=8)
+            r2 = _tz_call("GET", f"{BASE_URL}/v1/api/account/{ACCOUNT_ID}", tz_headers())
             bp = r2.json().get("bp") if r2.ok else None
             try:
-                r3 = requests.get(f"{BASE_URL}/v1/api/accounts/{ACCOUNT_ID}/routes", headers=tz_headers(), timeout=5)
+                r3 = _tz_call("GET", f"{BASE_URL}/v1/api/accounts/{ACCOUNT_ID}/routes", tz_headers())
                 routes = r3.text[:300]
             except Exception:
                 routes = _tz_cache.get("routes", "")
@@ -2981,7 +3120,10 @@ def webhook():
     sl_pct      = float(sl_pct_raw) if sl_pct_raw is not None else DEFAULT_SL_PCT
     # Ownership tag: which QC strategy sent this. Used to stamp owner on SHORT and
     # to reject stray COVERs from a non-owning strategy. Empty → guards no-op.
-    strategy    = str(body.get("strategy") or body.get("slot") or "").lower()
+    # No strategy field (older QC algos) → "legacy", so the ownership guard still
+    # separates them from vol/ema/bgs (2 Nov: a legacy COVER closed a BGS short and a
+    # BGS COVER closed a legacy short, because an empty owner disabled the guard).
+    strategy    = str(body.get("strategy") or body.get("slot") or "legacy").lower()
 
     if not qc_symbol:
         return jsonify({"error": "missing symbol"}), 400
@@ -3092,7 +3234,7 @@ def sim_webhook():
     sl_pct_raw = body.get("sl_pct")
     sl_pct     = float(sl_pct_raw) if sl_pct_raw is not None else DEFAULT_SL_PCT
     # Ownership tag (see real /webhook). Empty → guards no-op.
-    strategy   = str(body.get("strategy") or body.get("slot") or "").lower()
+    strategy   = str(body.get("strategy") or body.get("slot") or "legacy").lower()
 
     if not qc_symbol:
         return jsonify({"error": "missing symbol"}), 400
