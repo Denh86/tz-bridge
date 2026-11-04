@@ -88,6 +88,10 @@ COVER_RETRY_STEPS    = (0.005, 0.02, 0.05)
 # back to QC (state ACTIVE, carried=True) and QC's 04:00 COVER restarts it.
 COVER_LAST_RETRY_ET  = (19, 58)
 RESET_TIME_ET        = (3, 50)     # daily state reset (New York time)
+# Which QC strategies may trade through the bridge. Comma list in the Render env var
+# ALLOWED_STRATEGIES, e.g. "vol,ema,bgs" (webhooks with no strategy field = "legacy").
+# Unset or empty = everything allowed. Webhooks from others get 200 "ignored".
+ALLOWED_STRATEGIES   = {x.strip().lower() for x in (os.getenv("ALLOWED_STRATEGIES") or "").split(",") if x.strip()}
 CARRY_CHECK_ET       = (9, 35)     # MANUAL ACTION check for carried / unknown shorts
 STOP_REARM_ET        = (16, 1)     # re-arm expired RTH stops as GTC_Plus StopLimit
 
@@ -439,6 +443,27 @@ def get_position(symbol):
     return None
 
 
+# An order counts as OPEN unless TZ reports a terminal status (or nothing left to fill).
+# The old check only knew 4 "open" names, so an order in any other live state (e.g. a
+# GTC_Plus stop-limit waiting for its trigger) was treated as closed and never cancelled
+# — 3 Nov: SRTS's buy stop-limit stayed live after the position was covered.
+TERMINAL_ORDER_STATUSES = {"Filled", "Canceled", "Cancelled", "Rejected", "Expired",
+                           "DoneForDay", "Replaced", "Stopped", "Suspended"}
+
+
+def _order_is_open(o):
+    status = str(o.get("orderStatus", "") or "")
+    if not status or status in TERMINAL_ORDER_STATUSES:
+        return False
+    leaves = o.get("leavesQuantity")
+    try:
+        if leaves is not None and float(leaves) <= 0 and status != "PendingNew":
+            return False
+    except (TypeError, ValueError):
+        pass
+    return True
+
+
 def cancel_all_open_orders(symbol):
     r = tz_get(f"/v1/api/accounts/{ACCOUNT_ID}/orders", "ORDERS")
     if r.status_code != 200:
@@ -447,11 +472,10 @@ def cancel_all_open_orders(symbol):
     orders = r.json()
     if not isinstance(orders, list):
         orders = orders.get("orders", [])
-    open_statuses = {"PendingNew", "New", "PartiallyFilled", "Submitted"}
     open_orders = [
         o for o in orders
         if o.get("symbol", "").upper() == symbol.upper()
-        and o.get("orderStatus", "") in open_statuses
+        and _order_is_open(o)
     ]
     log.info(f"  Found {len(open_orders)} open order(s) for {symbol}")
     cancelled = 0
@@ -525,11 +549,10 @@ def sim_cancel_all_open_orders(symbol):
     orders = r.json()
     if not isinstance(orders, list):
         orders = orders.get("orders", [])
-    open_statuses = {"PendingNew", "New", "PartiallyFilled", "Submitted"}
     open_orders = [
         o for o in orders
         if o.get("symbol", "").upper() == symbol.upper()
-        and o.get("orderStatus", "") in open_statuses
+        and _order_is_open(o)
     ]
     log.info(f"  [SIM] Found {len(open_orders)} open order(s) for {symbol}")
     cancelled = 0
@@ -2555,7 +2578,7 @@ def _cancel_and_wait(A, symbol, timeout=12):
         try:
             still = [o for o in _list_orders(A)
                      if str(o.get("symbol", "")).upper() == symbol.upper()
-                     and o.get("orderStatus", "") in OPEN_ORDER_STATUSES]
+                     and _order_is_open(o)]
         except Exception:
             still = None
         if still == []:
@@ -2869,7 +2892,7 @@ def _daily_reset(A):
         shorts = {str(p.get("symbol", "")).upper() for p in positions if _short_qty(p) > 0}
         for o in _list_orders(A):
             cid = str(o.get("clientOrderId", ""))
-            if (cid.startswith("SL_") and o.get("orderStatus", "") in OPEN_ORDER_STATUSES
+            if (cid.startswith("SL_") and _order_is_open(o)
                     and str(o.get("symbol", "")).upper() not in shorts):
                 sym = str(o.get("symbol", "")).upper()
                 cancel_stop_order(A.acct_id(), A.headers, sym, cid, f"{A.name}_ORPHAN_STOP_CANCEL")
@@ -2907,26 +2930,44 @@ def _rearm_stops(A):
     if not STOP_LOSS_ENABLED:
         return
     try:
-        open_ids = {str(o.get("clientOrderId")) for o in _list_orders(A)
-                    if o.get("orderStatus", "") in OPEN_ORDER_STATUSES}
+        orders = {str(o.get("clientOrderId")): o for o in _list_orders(A)}
     except Exception as e:
         log.warning(f"[{A.name}] STOP RE-ARM: orders unavailable: {e}")
         return
     with A.lock:
         active = {k: dict(v) for k, v in A.states().items() if v.get("state") == "ACTIVE"}
     for sym, st in active.items():
-        sid = st.get("sl_client_order_id")
-        if sid and str(sid) in open_ids:
-            continue                      # an ETH StopLimit (GTC_Plus) is still working
+        sid = str(st.get("sl_client_order_id") or "")
+        cur = orders.get(sid) if sid else None
+        # Keep only a stop that is still working AND is a StopLimit (the ETH/GTC_Plus kind).
+        # A regular-hours Stop (Day) is replaced even if TZ still lists it as open: on
+        # 3 Nov the expired Day stops were still listed at 16:01, so BWEN was skipped and
+        # left with no broker stop overnight.
+        if (cur is not None and _order_is_open(cur)
+                and str(cur.get("orderType", "")).lower() == "stoplimit"):
+            log.info(f"[{A.pfx}{sym}] STOP RE-ARM: StopLimit {sid} already working — kept")
+            continue
         entry = float(st.get("entry_fill_price") or 0)
         sl_pct = float(st.get("sl_pct") or DEFAULT_SL_PCT)
         if entry <= 0 or sl_pct <= 0:
+            log.warning(f"[{A.pfx}{sym}] STOP RE-ARM: no entry fill/sl_pct on record — skipped")
             continue
-        try:
-            qty = _short_qty(A.position(sym))
-        except Exception:
-            qty = 0
+        if cur is not None and _order_is_open(cur):
+            cancel_stop_order(A.acct_id(), A.headers, sym, sid, f"{A.name}_DAYSTOP_CANCEL")
+        qty, err = None, None
+        for _ in range(3):
+            try:
+                qty, err = _short_qty(A.position(sym)), None
+                break
+            except Exception as e:
+                err = e
+                time.sleep(3)
+        if err is not None:
+            log.error(f"[{A.pfx}{sym}] STOP RE-ARM: position lookup failed ({err}) — "
+                      f"NO BROKER STOP; QC-side SL only")
+            continue
         if qty <= 0:
+            log.info(f"[{A.pfx}{sym}] STOP RE-ARM: no short on TZ — skipped")
             continue
         trigger, limit = _compute_sl_prices(entry, sl_pct)
         res = place_stop_order(A.acct_id(), A.headers, sym, qty, trigger, limit_price=limit,
@@ -2944,6 +2985,7 @@ def ny_scheduler_thread():
         ("reset",   RESET_TIME_ET,  False, _daily_reset),
         ("check",   CARRY_CHECK_ET, True,  _carry_check),
         ("rearm",   STOP_REARM_ET,  True,  _rearm_stops),
+        ("rearm2",  (STOP_REARM_ET[0], STOP_REARM_ET[1] + 5), True, _rearm_stops),   # backstop
     ]
     now = _now_et()
     # On startup, treat jobs whose time already passed today as done (no surprise reset).
@@ -3040,6 +3082,7 @@ def health():
         "config": {
             "max_locate_cost_pct": MAX_LOCATE_COST_PCT,
             "sim_max_locate_cost_pct": SIM_MAX_LOCATE_COST_PCT,
+            "allowed_strategies":  sorted(ALLOWED_STRATEGIES) or "all",
             "min_locate_quantity": MIN_LOCATE_QUANTITY,
             "locate_poll_timeout": LOCATE_POLL_TIMEOUT,
             "locate_bp_usage":     LOCATE_BP_USAGE,
@@ -3124,6 +3167,9 @@ def webhook():
     # separates them from vol/ema/bgs (2 Nov: a legacy COVER closed a BGS short and a
     # BGS COVER closed a legacy short, because an empty owner disabled the guard).
     strategy    = str(body.get("strategy") or body.get("slot") or "legacy").lower()
+    if ALLOWED_STRATEGIES and strategy not in ALLOWED_STRATEGIES:
+        log.info(f"[{qc_symbol}] {action} ignored — strategy '{strategy}' not in ALLOWED_STRATEGIES")
+        return jsonify({"status": "ignored", "reason": "strategy not allowed", "strategy": strategy}), 200
 
     if not qc_symbol:
         return jsonify({"error": "missing symbol"}), 400
@@ -3235,6 +3281,10 @@ def sim_webhook():
     sl_pct     = float(sl_pct_raw) if sl_pct_raw is not None else DEFAULT_SL_PCT
     # Ownership tag (see real /webhook). Empty → guards no-op.
     strategy   = str(body.get("strategy") or body.get("slot") or "legacy").lower()
+    if ALLOWED_STRATEGIES and strategy not in ALLOWED_STRATEGIES:
+        log.info(f"[SIM:{qc_symbol}] {action} ignored — strategy '{strategy}' not in ALLOWED_STRATEGIES")
+        return jsonify({"status": "ignored", "reason": "strategy not allowed",
+                        "strategy": strategy, "mode": "sim"}), 200
 
     if not qc_symbol:
         return jsonify({"error": "missing symbol"}), 400
