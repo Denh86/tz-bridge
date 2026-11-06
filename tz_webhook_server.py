@@ -292,7 +292,7 @@ def self_watchdog_thread():
             return
 
 
-threading.Thread(target=self_watchdog_thread, daemon=True).start()
+# (started per serving process — see _start_background)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -3008,7 +3008,7 @@ def ny_scheduler_thread():
                     log.error(f"[{A.name}] scheduled job '{name}' failed: {e}")
 
 
-threading.Thread(target=ny_scheduler_thread, daemon=True).start()
+# (started per serving process — see _start_background)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -3052,7 +3052,7 @@ def _refresh_tz_cache():
                 _tz_cache["ok"] = False
                 _tz_cache["detail"] = f"error: {e}"
 
-threading.Thread(target=_refresh_tz_cache, daemon=True).start()
+# (started per serving process — see _start_background)
 
 
 @app.route("/health", methods=["GET", "HEAD"])
@@ -3072,6 +3072,8 @@ def health():
         "key_preview":       API_KEY[:8] + "..." if API_KEY else "NOT SET",
         "symbol_states":     states,
         "sim_symbol_states": sim_states,
+        "pid":               os.getpid(),
+        "bg_pid":            _bg_pid,
         "sim_account":       SIM_ACCOUNT_ID or "NOT SET",
         "sim_key_preview":   SIM_API_KEY[:8] + "..." if SIM_API_KEY else "NOT SET",
         "routes":            cache["routes"],
@@ -3376,6 +3378,36 @@ def sim_webhook():
 # ══════════════════════════════════════════════════════════════════════════════
 # ENTRYPOINT
 # ══════════════════════════════════════════════════════════════════════════════
+# ─────────────────────────────────────────────────────────────────────────────
+# BACKGROUND THREADS — started inside the process that serves the webhooks.
+# Under gunicorn --preload the module is imported by the master process, and
+# threads started at import live there, not in the worker that holds the
+# ticker states. They are therefore started on the first request in each
+# serving process (UptimeRobot / the first webhook triggers it within minutes).
+# Run gunicorn with ONE worker: ticker states are kept in memory per process.
+# ─────────────────────────────────────────────────────────────────────────────
+_bg_pid  = None
+_bg_lock = threading.Lock()
+
+
+def _start_background():
+    global _bg_pid
+    with _bg_lock:
+        if _bg_pid == os.getpid():
+            return
+        _bg_pid = os.getpid()
+    log.info(f"BACKGROUND THREADS starting in pid {os.getpid()} "
+             f"(watchdog, NY scheduler, TZ status cache)")
+    for fn in (self_watchdog_thread, ny_scheduler_thread, _refresh_tz_cache):
+        threading.Thread(target=fn, daemon=True).start()
+
+
+@app.before_request
+def _ensure_background():
+    if _bg_pid != os.getpid():
+        _start_background()
+
+
 if __name__ == "__main__":
     if not API_KEY or not API_SECRET:
         log.warning("TZ_API_KEY or TZ_API_SECRET not set — real account orders will fail")
@@ -3416,4 +3448,5 @@ if __name__ == "__main__":
     log.info(f"  Price handling:    QC pre-buffered — server uses received price directly")
     log.info(f"  Listening on port: {port}")
     log.info("")
+    _start_background()
     app.run(host="0.0.0.0", port=port, debug=False)
