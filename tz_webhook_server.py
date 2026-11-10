@@ -68,6 +68,8 @@ MAX_LOCATE_COST_PCT  = 0.02    # 2%   — REAL account: reject if locatePrice / 
 SIM_MAX_LOCATE_COST_PCT = float(os.getenv("SIM_MAX_LOCATE_COST_PCT", "0.05"))
 MIN_LOCATE_QUANTITY  = 100     # TZ minimum locate size
 MIN_SHORT_QUANTITY   = 1       # TZ minimum short order size (any size accepted)
+STOP_PLACE_ATTEMPTS  = 3       # broker stop: tries before giving up (TZ API blips)
+STOP_RETRY_WAIT_S    = 3       # wait 3 s, then 6 s, between tries
 SUB_LOT_MIN          = 85      # 85-99sh: locate 100, short the smaller amount; <85 = skip
 
 
@@ -757,20 +759,58 @@ def place_stop_order(account_id, headers_fn, symbol, quantity, trigger_price,
     url = f"{BASE_URL}/v1/api/accounts/{account_id}/order"
     log.info(f"  → {label} POST {url}")
     log.info(f"    body: {json.dumps(payload)}")
+    for attempt in range(1, STOP_PLACE_ATTEMPTS + 1):
+        if attempt > 1:
+            # TZ blips (404/429/5xx) are usually gone in seconds. Same clientOrderId, and
+            # look first: if the earlier POST did land, don't place a second stop.
+            time.sleep(STOP_RETRY_WAIT_S * (attempt - 1))
+            existing = _find_order(account_id, headers_fn, client_id)
+            if existing is not None and existing.get("orderStatus") not in ("Rejected", "Canceled"):
+                log.warning(f"  [{symbol}] Stop {client_id} is on TZ despite the error — using it")
+                return existing
+            log.warning(f"  [{symbol}] Stop order retry {attempt}/{STOP_PLACE_ATTEMPTS}")
+        data = _post_stop(url, headers_fn, payload, label, symbol)
+        if data is not None:
+            break
+    else:
+        log.error(f"  [{symbol}] Stop order FAILED after {STOP_PLACE_ATTEMPTS} attempts — "
+                  f"position is UNPROTECTED (QC cover only)")
+        return None
+    try:
+        log.info(f"  [{symbol}] Stop order placed: clientOrderId={data.get('clientOrderId')} "
+                 f"status={data.get('orderStatus')} type={payload.get('orderType', '?')} "
+                 f"trigger=${payload.get('stopPrice', '?')}"
+                 + (f" limit=${payload['limitPrice']}" if 'limitPrice' in payload else ""))
+    except Exception:
+        pass
+    return data
+
+
+def _post_stop(url, headers_fn, payload, label, symbol):
+    """One stop POST. Returns the order dict, or None on any failure."""
     try:
         r = _tz_call("POST", url, headers_fn(), json=payload)
         log.info(f"  ← {label} status: {r.status_code}  body: {r.text[:400]}")
         if not r.ok:
             log.error(f"  [{symbol}] Stop order FAILED {r.status_code} — body: {r.text[:300]}")
             return None
-        data = r.json()
-        log.info(f"  [{symbol}] Stop order placed: clientOrderId={data.get('clientOrderId')} "
-                 f"status={data.get('orderStatus')} type={payload.get('orderType', '?')} "
-                 f"trigger=${payload.get('stopPrice', '?')}"
-                 + (f" limit=${payload['limitPrice']}" if 'limitPrice' in payload else ""))
-        return data
+        return r.json()
     except Exception as e:
         log.error(f"  [{symbol}] Stop order EXCEPTION: {e}")
+        return None
+
+
+def _find_order(account_id, headers_fn, client_id):
+    """The order with this clientOrderId from TZ's order list, or None (also on error)."""
+    try:
+        r = _tz_call("GET", f"{BASE_URL}/v1/api/accounts/{account_id}/orders", headers_fn())
+        if not r.ok:
+            return None
+        rows = r.json()
+        if not isinstance(rows, list):
+            rows = rows.get("orders", [])
+        return next((o for o in rows if o.get("clientOrderId") == client_id), None)
+    except Exception:
         return None
 
 
@@ -2172,6 +2212,30 @@ def _arm_real_stop_after_fill(symbol, filled_qty, entry_fill, source="full fill"
         log.warning(f"[{symbol}] BROKER SL FAILED to place — trade relies on QC-side SL only")
 
 
+def _cleanup_hand_off(A, symbol, reason):
+    """After an entry timeout/cancel: read the position STRICTLY (a failed read used to
+    look like 'no position', and the ticker was blocked with a possible unprotected
+    short). If the read keeps failing, or the entry filled before the cancel, hand the
+    ticker to the cover loop, which retries until TZ shows flat. Returns True if handed off."""
+    err = None
+    for i in range(3):
+        try:
+            pos = A.position(symbol)
+            err = None
+            break
+        except Exception as e:
+            err = e
+            time.sleep(2 * (i + 1))
+    if err is None and _short_qty(pos) <= 0:
+        return False                      # really flat → caller blocks as before
+    why = f"position read failing ({err})" if err else f"{_short_qty(pos)}sh filled before cancel"
+    log.warning(f"{A.tag(symbol)} CLEANUP: {why} — cover loop takes over ({reason})")
+    A.set_state(symbol, state="COVERING", carried=False, reason=f"cleanup: {why}")
+    threading.Thread(target=cover_until_flat,
+                     args=(A, symbol, [], 0.0, _is_rth_now(), False), daemon=True).start()
+    return True
+
+
 def cancel_and_cleanup(symbol, reason):
     log.info(f"[{symbol}] CANCEL+CLEANUP: {reason}")
 
@@ -2179,6 +2243,8 @@ def cancel_and_cleanup(symbol, reason):
     log.info(f"[{symbol}] Cancelled {cancelled} open order(s)")
     set_state(symbol, sl_client_order_id=None)
 
+    if _cleanup_hand_off(REAL, symbol, reason):
+        return
     position = get_position(symbol)
     if position:
         shares = float(position.get("shares", 0))
@@ -2373,6 +2439,8 @@ def sim_cancel_and_cleanup(symbol, reason):
     log.info(f"[SIM:{symbol}] Cancelled {cancelled} open order(s)")
     sim_set_state(symbol, sl_client_order_id=None)
 
+    if _cleanup_hand_off(SIM, symbol, reason):
+        return
     position = sim_get_position(symbol)
     if position:
         shares = float(position.get("shares", 0))
@@ -2765,8 +2833,14 @@ def handle_cover(A, symbol, qc_price, strategy):
         try:
             pos = A.position(symbol)
         except Exception as e:
-            log.error(f"{A.tag(symbol)} COVER position lookup failed: {e}")
-            return {"error": str(e)}, 500
+            # QC sends COVER once: don't drop it. The loop covers if a short exists and
+            # marks FLAT if not, retrying the lookup every 15 s.
+            log.error(f"{A.tag(symbol)} COVER position lookup failed: {e} — cover loop will keep trying")
+            A.set_state(symbol, state="COVERING", carried=False, reason="cover: position lookup failing")
+            threading.Thread(target=cover_until_flat,
+                             args=(A, symbol, [], float(qc_price or 0), _is_rth_now(), False),
+                             daemon=True).start()
+            return {"status": "ok", "note": "position lookup failing — cover loop retrying"}, 200
         if _short_qty(pos) <= 0:
             log.info(f"{A.tag(symbol)} COVER ignored — state {current} and no TZ short (not blocking)")
             return {"status": "ignored", "reason": "no short position"}, 200
@@ -2869,9 +2943,15 @@ def handle_cover(A, symbol, qc_price, strategy):
                 "order": how, "clientOrderId": cid,
                 "orderStatus": result.get("orderStatus")}, 200
     except Exception as e:
-        log.error(f"{A.tag(symbol)} Cover order failed: {e}")
-        A.set_state(symbol, state="ACTIVE", reason="cover failed")   # un-claim so QC's next COVER retries
-        return {"error": str(e)}, 500
+        # The stop is already cancelled, and QC won't resend this COVER — so don't fall
+        # back to ACTIVE (unprotected). The loop re-places the cover until flat.
+        log.error(f"{A.tag(symbol)} Cover order failed: {e} — cover loop will retry")
+        A.set_state(symbol, state="COVERING", carried=False, reason="cover failed — retrying",
+                    cover_started=time.time())
+        threading.Thread(target=cover_until_flat,
+                         args=(A, symbol, [], qc_price, _is_rth_now(), False),
+                         daemon=True).start()
+        return {"status": "ok", "note": "cover order failed — cover loop retrying"}, 200
 
 
 def cover_until_flat(A, symbol, order_ids, qc_price, placed_in_rth, placed=True):
