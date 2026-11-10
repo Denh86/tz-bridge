@@ -68,6 +68,20 @@ MAX_LOCATE_COST_PCT  = 0.02    # 2%   — REAL account: reject if locatePrice / 
 SIM_MAX_LOCATE_COST_PCT = float(os.getenv("SIM_MAX_LOCATE_COST_PCT", "0.05"))
 MIN_LOCATE_QUANTITY  = 100     # TZ minimum locate size
 MIN_SHORT_QUANTITY   = 1       # TZ minimum short order size (any size accepted)
+SUB_LOT_MIN          = 85      # 85-99sh: locate 100, short the smaller amount; <85 = skip
+
+
+def _lot_sizes(qc_quantity, max_affordable):
+    """(locate_qty, order_qty) or None. >=100: both floored to 100s. SUB_LOT_MIN-99:
+    locate the 100 minimum, short only what QC/BP allow. Below SUB_LOT_MIN: no trade.
+    QC's main.py (ROUND_LOTS) sizes the same way, so backtests match."""
+    raw = min(int(qc_quantity), int(max_affordable))
+    if raw >= MIN_LOCATE_QUANTITY:
+        q = (raw // 100) * 100
+        return q, q
+    if raw >= SUB_LOT_MIN:
+        return MIN_LOCATE_QUANTITY, raw
+    return None
 LOCATE_POLL_INTERVAL = 2       # seconds between locate status polls
 LOCATE_POLL_TIMEOUT  = 30      # seconds before giving up on locate
 LOCATE_ACCEPT_SLEEP  = 3       # seconds to wait after locate accept before placing order
@@ -1333,18 +1347,15 @@ def locate_and_short(symbol, qc_quantity, entry_price):
                      f"= {r57_cap_shares}sh < margin_max {max_affordable}sh — using R57 cap")
             max_affordable = r57_cap_shares
 
-    if max_affordable < MIN_LOCATE_QUANTITY:
-        block(symbol, f"cannot afford minimum {MIN_LOCATE_QUANTITY} shares — "
-                      f"max_affordable={max_affordable} at ${entry_price}")
-        return
-
     raw_quantity = min(qc_quantity, max_affordable)
-    request_quantity = max(MIN_LOCATE_QUANTITY, int(raw_quantity / 100) * 100)
-    if request_quantity > max_affordable:
-        request_quantity = int(max_affordable / 100) * 100
-    if request_quantity < MIN_LOCATE_QUANTITY:
-        block(symbol, f"cannot afford minimum {MIN_LOCATE_QUANTITY} shares after rounding")
+    lots = _lot_sizes(qc_quantity, max_affordable)
+    if lots is None:
+        block(symbol, f"size {raw_quantity}sh below {SUB_LOT_MIN} (qc={qc_quantity}, "
+                      f"max_affordable={max_affordable} at ${entry_price})")
         return
+    request_quantity, order_cap = lots
+    if order_cap < request_quantity:
+        log.info(f"[{symbol}] SUB-LOT: locate {request_quantity}sh, short {order_cap}sh")
     log.info(f"[{symbol}] request_quantity={request_quantity} "
              f"(floored to 100s | qc={qc_quantity}, raw={raw_quantity}, max_affordable={max_affordable})")
 
@@ -1385,7 +1396,7 @@ def locate_and_short(symbol, qc_quantity, entry_price):
         if affordable_qty < located_qty:
             log.info(f"[{symbol}] Capping existing locate from {located_qty}sh to "
                      f"{affordable_qty}sh — max_affordable={max_affordable}")
-        final_quantity = affordable_qty
+        final_quantity = min(affordable_qty, order_cap)
 
         log.info(f"[{symbol}] Step 11: Placing short | qty={final_quantity} | "
                  f"limit=${entry_price} (QC pre-buffered)")
@@ -1591,6 +1602,7 @@ def locate_and_short(symbol, qc_quantity, entry_price):
 
     # ── Step 11: Place short limit order ───────────────────────────────────
     limit_price = entry_price
+    final_quantity = min(final_quantity, order_cap)   # sub-lot: located 100, short fewer
     log.info(f"[{symbol}] Step 11: Placing short | qty={final_quantity} | "
              f"entry/limit=${limit_price} (QC pre-buffered)")
     try:
@@ -1702,18 +1714,13 @@ def locate_and_short_sim(symbol, qc_quantity, entry_price):
     log.info(f"[SIM:{symbol}] max_affordable={max_affordable} "
              f"(usable=${usable_capital:,.2f} / margin=${margin_per_share:.4f}/share)")
 
-    if max_affordable < MIN_LOCATE_QUANTITY:
-        sim_block(symbol, f"SIM cannot afford minimum {MIN_LOCATE_QUANTITY} shares "
-                          f"(max_affordable={max_affordable} at ${entry_price})")
-        return
-
     raw_quantity     = min(qc_quantity, max_affordable)
-    request_quantity = max(MIN_LOCATE_QUANTITY, int(raw_quantity / 100) * 100)
-    if request_quantity > max_affordable:
-        request_quantity = int(max_affordable / 100) * 100
-    if request_quantity < MIN_LOCATE_QUANTITY:
-        sim_block(symbol, f"SIM cannot afford minimum {MIN_LOCATE_QUANTITY} shares after rounding")
+    lots = _lot_sizes(qc_quantity, max_affordable)
+    if lots is None:
+        sim_block(symbol, f"SIM size {raw_quantity}sh below {SUB_LOT_MIN} "
+                          f"(qc={qc_quantity}, max_affordable={max_affordable} at ${entry_price})")
         return
+    request_quantity = lots[1]          # sim shorts the order size (locate is phantom)
 
     log.info(f"[SIM:{symbol}] request_quantity={request_quantity} "
              f"(qc={qc_quantity} raw={raw_quantity} max_affordable={max_affordable})")
@@ -1729,7 +1736,7 @@ def locate_and_short_sim(symbol, qc_quantity, entry_price):
     # Empirically, locate requests at notional > BP fail with R35 even though
     # the real account has 6x leverage available at order placement.
     PROBE_BP_USAGE = 0.85  # use at most 85% of real BP for probe notional (safety buffer)
-    probe_quantity = request_quantity
+    probe_quantity = max(MIN_LOCATE_QUANTITY, request_quantity)   # locates come in 100s
     skip_probe = False
     try:
         real_account = get_account_details()
@@ -1745,7 +1752,7 @@ def locate_and_short_sim(symbol, qc_quantity, entry_price):
             r57_cap_shares      = int((sod_bp_estimate * 0.45) / entry_price) if entry_price > 0 else real_max_affordable
             real_safe_qty       = min(real_max_affordable, r57_cap_shares)
             real_safe_qty       = max(MIN_LOCATE_QUANTITY, int(real_safe_qty / 100) * 100)
-            probe_quantity      = min(request_quantity, real_safe_qty)
+            probe_quantity      = max(MIN_LOCATE_QUANTITY, min(request_quantity, real_safe_qty))
             # If even 100 shares is over BP (high-priced stock + small account),
             # we can't safely probe — skip the locate and proceed with sim order.
             probe_notional = probe_quantity * entry_price
@@ -2649,6 +2656,100 @@ def _arm_carried_stop(A, symbol, qty):
         log.info(f"{A.tag(symbol)} CARRY STOP armed (GTC_Plus) trigger=${trigger} limit=${limit}")
 
 
+TRIM_FILL_TIMEOUT_S = 60
+
+
+def handle_trim(A, symbol, qty, qc_price, strategy):
+    """TRIM webhook: cover `qty` shares of an ACTIVE short and KEEP the rest.
+    QC's EMA book sends it at 15:40 when a short would break TradeZero's 16:00-20:00
+    short margin ($5.00/share under $5, 50% above). Runs in a thread; the stop is
+    re-armed for the shares that remain. Returns (json_dict, http_code)."""
+    s = A.get_state(symbol)
+    if s.get("state") != "ACTIVE":
+        log.info(f"{A.tag(symbol)} TRIM ignored — state {s.get('state', 'FLAT')} (not ACTIVE)")
+        return {"status": "ignored", "reason": "not active"}, 200
+    owner = s.get("owner")
+    if owner and strategy and strategy != owner:
+        log.info(f"{A.tag(symbol)} TRIM ignored — strategy '{strategy}' is not owner '{owner}'")
+        return {"status": "ignored", "reason": "not position owner"}, 200
+    if qty <= 0:
+        return {"error": "quantity required for TRIM"}, 400
+    threading.Thread(target=_trim_worker, args=(A, symbol, int(qty), qc_price, owner or strategy),
+                     daemon=True).start()
+    return {"status": "ok", "action": "TRIM", "symbol": symbol, "quantity": int(qty)}, 200
+
+
+def _trim_worker(A, symbol, qty, qc_price, strategy):
+    try:
+        pos = _position_strict(A, symbol)
+    except Exception as e:
+        log.error(f"{A.tag(symbol)} TRIM position lookup failed: {e} — not trimming")
+        return
+    have = _short_qty(pos)
+    if have <= 0:
+        log.info(f"{A.tag(symbol)} TRIM: no TZ short — nothing to do")
+        return
+    if qty >= have:
+        log.info(f"{A.tag(symbol)} TRIM {qty} >= TZ short {have} — covering in full")
+        handle_cover(A, symbol, qc_price, strategy)
+        return
+    keep = have - qty
+    log.info(f"{A.tag(symbol)} TRIM {qty} of {have}sh (keep {keep}) | qc_price=${qc_price}")
+    if not _cancel_and_wait(A, symbol):          # stop must go before the partial buy
+        log.warning(f"{A.tag(symbol)} TRIM aborted — orders would not cancel; re-arming stop")
+        _rearm_after_trim(A, symbol)
+        return
+    if A.get_state(symbol).get("state") != "ACTIVE":
+        log.info(f"{A.tag(symbol)} TRIM aborted — a cover took over")
+        return
+    try:
+        ref = qc_price
+        if not ref or ref <= 0:
+            ref, _src = _cover_ref_price(A, symbol, pos)
+        _place_cover(A, symbol, qty, ref, f"{A.name}_TRIM")
+    except Exception as e:
+        log.error(f"{A.tag(symbol)} TRIM order failed: {e} — re-arming stop for the full position")
+        _rearm_after_trim(A, symbol)
+        return
+    deadline = time.time() + TRIM_FILL_TIMEOUT_S
+    now_q = have
+    while time.time() < deadline:
+        time.sleep(3)
+        try:
+            now_q = _short_qty(_position_strict(A, symbol))
+        except Exception:
+            continue
+        if now_q <= keep:
+            break
+    if now_q > keep:
+        log.warning(f"{A.tag(symbol)} TRIM not fully filled in {TRIM_FILL_TIMEOUT_S}s "
+                    f"(short {now_q}, target {keep}) — cancelling the rest")
+        _cancel_and_wait(A, symbol)
+    log.info(f"{A.tag(symbol)} TRIM DONE — short now {now_q}sh")
+    _rearm_after_trim(A, symbol)
+
+
+def _rearm_after_trim(A, symbol):
+    """Stop for whatever is still short (skipped if a cover has taken over)."""
+    s = A.get_state(symbol)
+    if s.get("state") != "ACTIVE" or not STOP_LOSS_ENABLED:
+        return
+    try:
+        q = _short_qty(_position_strict(A, symbol))
+    except Exception as e:
+        log.error(f"{A.tag(symbol)} TRIM re-arm lookup failed: {e} — 16:01 re-arm will retry")
+        return
+    if q <= 0:
+        return
+    entry = float(s.get("entry_fill_price") or s.get("entry_price") or 0)
+    sl_pct = float(s.get("sl_pct") or DEFAULT_SL_PCT)
+    if entry <= 0 or sl_pct <= 0:
+        return
+    stop_id = A.place_stop(symbol, q, entry, sl_pct)
+    A.set_state(symbol, quantity=q, sl_client_order_id=stop_id)
+    log.info(f"{A.tag(symbol)} TRIM stop re-armed for {q}sh | stop_order={stop_id}")
+
+
 def handle_cover(A, symbol, qc_price, strategy):
     """COVER webhook (any state except LOCATING, which the caller handles).
     Returns (json_dict, http_code)."""
@@ -3235,6 +3336,11 @@ def webhook():
         body_out, code = handle_cover(REAL, symbol, price, strategy)
         return jsonify(body_out), code
 
+    # ── TRIM (partial cover, keep the rest) ──────────────────────────────────
+    elif action == "TRIM":
+        body_out, code = handle_trim(REAL, symbol, quantity, price, strategy)
+        return jsonify(body_out), code
+
     # ── CANCEL ───────────────────────────────────────────────────────────────
     elif action == "CANCEL":
         log.info(f"[{symbol}] CANCEL received — cancelling orders and closing any position")
@@ -3357,6 +3463,10 @@ def sim_webhook():
                 "status": "ok", "action": "cleanup_on_cover_during_locate", "mode": "sim"
             }), 200
         body_out, code = handle_cover(SIM, symbol, price, strategy)
+        return jsonify(body_out), code
+
+    elif action == "TRIM":
+        body_out, code = handle_trim(SIM, symbol, quantity, price, strategy)
         body_out["mode"] = "sim"
         return jsonify(body_out), code
 
