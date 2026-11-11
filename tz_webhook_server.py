@@ -100,6 +100,25 @@ COVER_RETRY_BUFFER   = 0.005   # (legacy) 0.5% above live price — cancel/clean
 # through these and then repeating the last. RTH retries are market orders.
 # price = TZ's own mark (/pnl exposure / shares); Yahoo/Twelve Data if unavailable.
 COVER_RETRY_STEPS    = (0.005, 0.02, 0.05)
+# A cover outside RTH on a LOSING short (TZ mark above the entry fill): re-price every
+# COVER_URGENT_RETRY_S seconds with these bigger steps — a squeeze can run 20% in the
+# 3 minutes the normal pace waits. A buy limit above the market still fills at the
+# best offer, so a high limit is a ceiling, not the price paid.
+COVER_URGENT_RETRY_S = 30
+COVER_URGENT_STEPS   = (0.03, 0.06, 0.10, 0.15)
+# LOSS GUARD (independent of QC): every LOSS_GUARD_EVERY_S, any ACTIVE short whose TZ
+# mark is LOSS_GUARD_EXTRA past its broker-stop level (or LOSS_GUARD_NOSTOP above entry
+# if it has no broker stop) on two checks in a row is covered at once — e.g. a
+# pre-market stop-limit that the price jumped over, while QC's COVER is late or lost.
+LOSS_GUARD_ON        = True
+LOSS_GUARD_EVERY_S   = 20
+LOSS_GUARD_EXTRA     = 0.05
+LOSS_GUARD_NOSTOP    = 0.30
+# SYNC (QC sends each book's holdings every 5 min): a short QC no longer holds is
+# covered after SYNC_CONFIRM syncs in a row agree (a lost COVER). Positions filled less
+# than SYNC_MIN_AGE_S ago are skipped (QC may not have seen its own fill yet).
+SYNC_CONFIRM         = 2
+SYNC_MIN_AGE_S       = 180
 # Day_Plus orders live 04:00-20:00 ET. After this time an unfilled cover is handed
 # back to QC (state ACTIVE, carried=True) and QC's 04:00 COVER restarts it.
 COVER_LAST_RETRY_ET  = (19, 58)
@@ -120,6 +139,13 @@ STOP_REARM_ET        = (16, 1)     # re-arm expired RTH stops as GTC_Plus StopLi
 # QC strategies send an `sl_pct` field in the SHORT webhook (VOL/EMA 0.12, BGS 0.20).
 # The bridge falls back to DEFAULT_SL_PCT only when a payload has no sl_pct.
 DEFAULT_SL_PCT  = 0.22    # 22% adverse move on short positions (price up) — fallback only
+
+
+def _sl_pct_of(state):
+    """Stop % for a position. Missing → DEFAULT_SL_PCT; an explicit 0 from QC means
+    'no broker stop' (the old `or DEFAULT` turned 0 into 22%)."""
+    v = state.get("sl_pct")
+    return DEFAULT_SL_PCT if v is None else float(v)
 SL_LIMIT_SLACK  = 0.02    # 2% slack on StopLimit ETH orders so they actually fill
 # Stop type by session: RTH uses Stop (market on trigger), ETH uses StopLimit
 # because TZ doesn't accept market orders outside RTH.
@@ -171,6 +197,81 @@ logging.basicConfig(
 )
 log = logging.getLogger("tz_server")
 log.info("=== tz_webhook_server module loading ===")
+
+# ── PHONE MESSAGES: Telegram (trades, daily summary, alerts) + optional ntfy (alerts) ──
+# Telegram: create a bot with @BotFather → TELEGRAM_BOT_TOKEN; message your bot once,
+# then put your chat id in TELEGRAM_CHAT_ID (see /telegram/test). Render env vars:
+#   TG_TRADES=0          no entry/exit messages (alerts + daily summary only)
+#   TG_DAILY=0           no 20:05 New York daily summary
+#   ALERTS_INCLUDE_SIM=0 nothing from the sim account
+# ntfy (optional, alerts only): NTFY_TOPIC = a long random topic name.
+# Alerts = every ERROR log line (same message at most once per 5 min, max 30/hour).
+TG_TOKEN           = (os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
+TG_CHAT            = (os.getenv("TELEGRAM_CHAT_ID") or "").strip()
+TG_TRADES          = (os.getenv("TG_TRADES") or "1").strip() != "0"
+TG_DAILY           = (os.getenv("TG_DAILY") or "1").strip() != "0"
+ALERTS_INCLUDE_SIM = (os.getenv("ALERTS_INCLUDE_SIM") or "1").strip() != "0"
+NTFY_TOPIC         = (os.getenv("NTFY_TOPIC") or "").strip()
+DAILY_SUMMARY_ET   = (20, 5)
+
+
+def _tg_post(text):
+    try:
+        r = requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
+                          json={"chat_id": TG_CHAT, "text": text[:4000],
+                                "disable_web_page_preview": True}, timeout=8)
+        if not r.ok:
+            print(f"telegram send failed {r.status_code}: {r.text[:200]}", flush=True)
+        return r.ok
+    except Exception as e:
+        print(f"telegram send error: {e}", flush=True)
+        return False
+
+
+def _ntfy_post(msg):
+    try:
+        requests.post(f"https://ntfy.sh/{NTFY_TOPIC}", data=msg[:400].encode("utf-8"),
+                      headers={"Title": "TZ bridge", "Priority": "high"}, timeout=5)
+    except Exception:
+        pass
+
+
+def notify(text, sim=False, alert=False):
+    """Phone message in a background thread. Trades/summaries → Telegram; alerts →
+    Telegram and ntfy. Never raises, never blocks trading."""
+    if sim and not ALERTS_INCLUDE_SIM:
+        return
+    text = ("[SIM] " if sim and not text.startswith("[SIM") else "") + text
+    if TG_TOKEN and TG_CHAT:
+        threading.Thread(target=_tg_post, args=(("🚨 " if alert else "") + text,), daemon=True).start()
+    if alert and NTFY_TOPIC:
+        threading.Thread(target=_ntfy_post, args=(text,), daemon=True).start()
+
+
+class _AlertHandler(logging.Handler):
+    def __init__(self):
+        super().__init__(logging.ERROR)
+        self._last, self._sent = {}, []
+
+    def emit(self, record):
+        try:
+            msg = record.getMessage().strip()
+            now, key = time.time(), msg[:60]
+            self._sent = [t for t in self._sent if now - t < 3600]
+            if now - self._last.get(key, 0) < 300 or len(self._sent) >= 30:
+                return
+            self._last[key] = now
+            self._sent.append(now)
+            notify(msg, sim="[SIM" in msg, alert=True)
+        except Exception:
+            pass
+
+
+if (TG_TOKEN and TG_CHAT) or NTFY_TOPIC:
+    log.addHandler(_AlertHandler())
+    log.info(f"Phone messages ON | telegram={'on' if TG_TOKEN and TG_CHAT else 'off'} "
+             f"(trades={TG_TRADES}, daily={TG_DAILY}) | ntfy={'on' if NTFY_TOPIC else 'off'} "
+             f"| sim={'on' if ALERTS_INCLUDE_SIM else 'off'}")
 
 # Suppress gunicorn access log spam from Render's health check pings.
 class _HealthCheckFilter(logging.Filter):
@@ -2180,8 +2281,10 @@ def _arm_real_stop_after_fill(symbol, filled_qty, entry_fill, source="full fill"
         log.warning(f"[{symbol}] _arm_real_stop_after_fill: invalid inputs "
                     f"(qty={filled_qty} fill=${entry_fill}) — skipping SL")
         return
-    set_state(symbol, entry_fill_price=entry_fill, quantity=filled_qty)
+    set_state(symbol, entry_fill_price=entry_fill, quantity=filled_qty, filled_at=time.time())
     log.info(f"[{symbol}] SHORT MONITOR: {source} — {filled_qty}sh @ ${entry_fill:.4f}")
+    _notify_entry(REAL, symbol, filled_qty, entry_fill,
+                  _sl_pct_of(get_state(symbol)) if STOP_LOSS_ENABLED else 0, source)
 
     # ── BROKER SL TOGGLE ──────────────────────────────────────────────────
     # Entry fill state is recorded above (needed for cover-side PnL) BEFORE this
@@ -2192,7 +2295,7 @@ def _arm_real_stop_after_fill(symbol, filled_qty, entry_fill, source="full fill"
         return
 
     s = get_state(symbol)
-    sl_pct = float(s.get("sl_pct") or DEFAULT_SL_PCT)
+    sl_pct = _sl_pct_of(s)
     if sl_pct <= 0:
         log.info(f"[{symbol}] sl_pct={sl_pct} — skipping broker SL")
         return
@@ -2402,8 +2505,10 @@ def _arm_sim_stop_after_fill(symbol, filled_qty, entry_fill, source="full fill")
         log.warning(f"[SIM:{symbol}] _arm_sim_stop_after_fill: invalid inputs "
                     f"(qty={filled_qty} fill=${entry_fill}) — skipping SL")
         return
-    sim_set_state(symbol, entry_fill_price=entry_fill, quantity=filled_qty)
+    sim_set_state(symbol, entry_fill_price=entry_fill, quantity=filled_qty, filled_at=time.time())
     log.info(f"[SIM:{symbol}] MONITOR: {source} — {filled_qty}sh @ ${entry_fill:.4f}")
+    _notify_entry(SIM, symbol, filled_qty, entry_fill,
+                  _sl_pct_of(sim_get_state(symbol)) if STOP_LOSS_ENABLED else 0, source)
 
     # ── BROKER SL TOGGLE ──────────────────────────────────────────────────
     # Entry fill state recorded above (for cover-side PnL) BEFORE this check.
@@ -2413,7 +2518,7 @@ def _arm_sim_stop_after_fill(symbol, filled_qty, entry_fill, source="full fill")
         return
 
     s = sim_get_state(symbol)
-    sl_pct = float(s.get("sl_pct") or DEFAULT_SL_PCT)
+    sl_pct = _sl_pct_of(s)
     if sl_pct <= 0:
         log.info(f"[SIM:{symbol}] sl_pct={sl_pct} — skipping broker SL")
         return
@@ -2673,13 +2778,109 @@ def _list_positions(A):
     return p if isinstance(p, list) else p.get("positions", [])
 
 
-def _log_cover_fill(A, symbol, order_ids):
+_DAY = {"REAL": [], "SIM": []}     # closed trades today, for the daily summary
+
+
+def _notify_entry(A, symbol, qty, fill, sl_pct, source):
+    if not TG_TRADES:
+        return
+    try:
+        owner = (A.get_state(symbol).get("owner") or "?").upper()
+        stop = f"stop {sl_pct:.0%} (${fill * (1 + sl_pct):.2f})" if sl_pct > 0 else "no broker stop"
+        part = "" if source == "full fill" else f" ({source})"
+        notify(f"🔻 SHORT {owner} {symbol} — {qty:,} @ ${fill:.4f} = ${qty * fill:,.0f}{part} | {stop}",
+               sim=A.is_sim)
+    except Exception:
+        pass
+
+
+def _notify_exit(A, symbol, s, qty, entry, cover, fee, locate, label):
+    try:
+        if not (entry > 0 and cover > 0 and qty > 0):
+            return
+        owner = (s.get("owner") or "?").upper()
+        net = (entry - cover) * qty - fee - locate
+        pct = net / (entry * qty) * 100
+        _DAY["SIM" if A.is_sim else "REAL"].append((owner, symbol, net, pct))
+        if not TG_TRADES:
+            return
+        held = ""
+        fa = float(s.get("filled_at") or 0)
+        if fa:
+            m = int((time.time() - fa) / 60)
+            held = f" | held {m // 60}h{m % 60:02d}m" if m >= 60 else f" | held {m}m"
+        kind = "STOP" if label.startswith("STOP") else "COVER"
+        icon = "✅" if net > 0 else "❌"
+        notify(f"{icon} {kind} {owner} {symbol} — {qty:,} @ ${cover:.4f} (in ${entry:.4f}) | "
+               f"{pct:+.1f}% ({'+' if net >= 0 else '-'}${abs(net):,.0f}){held}", sim=A.is_sim)
+    except Exception:
+        pass
+
+
+def _find_equity(d):
+    """'equity' from TZ's account response, wherever it sits."""
+    if isinstance(d, dict):
+        for k in ("equity", "accountValue", "netLiquidation"):
+            if k in d:
+                try:
+                    return float(d[k])
+                except Exception:
+                    pass
+        for v in d.values():
+            e = _find_equity(v)
+            if e is not None:
+                return e
+    if isinstance(d, list):
+        for v in d:
+            e = _find_equity(v)
+            if e is not None:
+                return e
+    return None
+
+
+def _daily_summary(A):
+    """20:05 New York: one message per account with today's closed trades by strategy."""
+    trades = _DAY["SIM" if A.is_sim else "REAL"]
+    rows = list(trades)
+    trades.clear()
+    if not TG_DAILY or (A.is_sim and not ALERTS_INCLUDE_SIM):
+        return
+    eq = None
+    try:
+        eq = _find_equity(sim_get_account_details() if A.is_sim else get_account_details())
+    except Exception:
+        pass
+    lines = [f"📊 {_now_et().strftime('%a %d %b')} — {'SIM' if A.is_sim else 'REAL'} account"]
+    if not rows:
+        lines.append("No closed trades today.")
+    for strat in sorted({r[0] for r in rows}):
+        rs = [r for r in rows if r[0] == strat]
+        w = sum(1 for r in rs if r[2] > 0)
+        lines.append(f"{strat}: {len(rs)} trades, {w}W/{len(rs) - w}L, "
+                     f"{'+' if sum(r[2] for r in rs) >= 0 else '-'}${abs(sum(r[2] for r in rs)):,.0f} | "
+                     + ", ".join(f"{r[1]} {r[3]:+.0f}%" for r in rs))
+    if rows:
+        tot = sum(r[2] for r in rows)
+        lines.append(f"TOTAL: {len(rows)} trades, {'+' if tot >= 0 else '-'}${abs(tot):,.0f}")
+    if eq is not None:
+        lines.append(f"Equity: ${eq:,.2f}")
+    open_now = [k for k, v in A.states().items() if v.get("state") in ("ACTIVE", "COVERING")]
+    if open_now:
+        lines.append(f"Still open: {', '.join(open_now)}")
+    lines.append("(trades the bridge closed today; a restart clears this list)")
+    _tg_post("\n".join(lines)) if (TG_TOKEN and TG_CHAT) else None
+
+
+def _log_cover_fill(A, symbol, order_ids, label="COVER DONE — flat"):
     """Cover complete: log the realised P&L (same sheet fields as before)."""
     try:
         orders = [o for o in _list_orders(A) if o.get("clientOrderId") in set(order_ids)]
         filled = [(int(o.get("executed", 0) or 0), float(o.get("priceAvg") or o.get("lastPrice") or 0),
                    float(o.get("orderFee") or 0)) for o in orders]
         filled = [f for f in filled if f[0] > 0 and f[1] > 0]
+        if not filled and label.startswith("STOP"):
+            log.info(f"{A.tag(symbol)} flat, but no filled stop order found to log")
+            return
         ex = sum(f[0] for f in filled)
         cover_fill = sum(f[0] * f[1] for f in filled) / ex if ex else 0.0
         fee = sum(f[2] for f in filled)
@@ -2700,7 +2901,8 @@ def _log_cover_fill(A, symbol, order_ids):
                    realized_pnl_pct=pnl_pct,
                    notes=f"{A.name} | entry_fill=${entry_fill:.4f} cover_fill=${cover_fill:.4f} "
                          f"fee=${fee:.2f} locate=${locate_cost:.2f} orders={len(filled)}")
-        log.info(f"{A.tag(symbol)} COVER DONE — flat @ avg ${cover_fill:.4f}"
+        _notify_exit(A, symbol, s, qty, entry_fill, cover_fill, fee, locate_cost, label)
+        log.info(f"{A.tag(symbol)} {label} @ avg ${cover_fill:.4f}"
                  + (f" | pnl={pnl_pct:.2f}%" if pnl_pct is not None else ""))
     except Exception as e:
         log.warning(f"{A.tag(symbol)} cover fill logging failed: {e}")
@@ -2713,7 +2915,7 @@ def _arm_carried_stop(A, symbol, qty):
         return
     s = A.get_state(symbol)
     entry = float(s.get("entry_fill_price") or s.get("entry_price") or 0)
-    sl_pct = float(s.get("sl_pct") or DEFAULT_SL_PCT)
+    sl_pct = _sl_pct_of(s)
     if entry <= 0 or sl_pct <= 0:
         return
     trigger, limit = _compute_sl_prices(entry, sl_pct)
@@ -2794,6 +2996,9 @@ def _trim_worker(A, symbol, qty, qc_price, strategy):
                     f"(short {now_q}, target {keep}) — cancelling the rest")
         _cancel_and_wait(A, symbol)
     log.info(f"{A.tag(symbol)} TRIM DONE — short now {now_q}sh")
+    if TG_TRADES:
+        notify(f"✂️ TRIM {(A.get_state(symbol).get('owner') or '?').upper()} {symbol} — "
+               f"covered {qty:,}, still short {now_q:,} (16:00 margin)", sim=A.is_sim)
     _rearm_after_trim(A, symbol)
 
 
@@ -2810,7 +3015,7 @@ def _rearm_after_trim(A, symbol):
     if q <= 0:
         return
     entry = float(s.get("entry_fill_price") or s.get("entry_price") or 0)
-    sl_pct = float(s.get("sl_pct") or DEFAULT_SL_PCT)
+    sl_pct = _sl_pct_of(s)
     if entry <= 0 or sl_pct <= 0:
         return
     stop_id = A.place_stop(symbol, q, entry, sl_pct)
@@ -2823,6 +3028,7 @@ def handle_cover(A, symbol, qc_price, strategy):
     Returns (json_dict, http_code)."""
     s = A.get_state(symbol)
     current = s.get("state", "FLAT")
+    stop_sid = s.get("sl_client_order_id")   # to log the stop's fill if it got there first
 
     if current == "COVERING":
         log.info(f"{A.tag(symbol)} COVER ignored — cover already working")
@@ -2910,7 +3116,10 @@ def handle_cover(A, symbol, qc_price, strategy):
                          daemon=True).start()
         return {"status": "ok", "note": "waiting for open orders to cancel"}, 200
     if qty <= 0:
-        log.warning(f"{A.tag(symbol)} COVER: no TZ short (entry cancelled/unfilled) — marking FLAT")
+        if expect_short and stop_sid:
+            _log_cover_fill(A, symbol, [stop_sid], label="STOP FILLED before QC's COVER —")
+        log.warning(f"{A.tag(symbol)} COVER: no TZ short (stop filled, or entry cancelled/unfilled) "
+                    f"— marking FLAT")
         A.set_state(symbol, state="FLAT", reason="cover: no short found", owner=None, carried=False)
         return {"status": "ok", "note": "no short position"}, 200
 
@@ -2954,6 +3163,110 @@ def handle_cover(A, symbol, qc_price, strategy):
         return {"status": "ok", "note": "cover order failed — cover loop retrying"}, 200
 
 
+def handle_sync(A, strategy, holdings):
+    """QC's 5-minute holdings for one book. For each ACTIVE short this book owns: if QC
+    no longer holds it on SYNC_CONFIRM syncs in a row (a COVER that never arrived) →
+    cover it. If TZ is short 100+ more than QC holds → alert only (no automatic trim)."""
+    def _key(t):        # cheap: aliases + renames already cached (no Polygon call per sync)
+        t = str(t).upper().split()[0]
+        t = TICKER_ALIASES.get(t, t)
+        with _polygon_cache_lock:
+            return _polygon_rename_cache.get(t, t)
+    held = {_key(k): int(v or 0) for k, v in (holdings or {}).items()}
+    acted, checked = [], 0
+    for sym, st in list(A.states().items()):
+        if st.get("owner") != strategy or st.get("state") != "ACTIVE":
+            continue
+        if not st.get("entry_fill_price") or time.time() - float(st.get("filled_at") or 0) < SYNC_MIN_AGE_S:
+            continue
+        try:
+            tz = _short_qty(A.position(sym))
+        except Exception as e:
+            log.warning(f"{A.tag(sym)} SYNC: position read failed ({e}) — next sync")
+            continue
+        checked += 1
+        qc = held.get(sym, 0)
+        if tz <= 0 or qc >= tz or (qc > 0 and tz - qc < 100):
+            if st.get("sync_flat") or st.get("sync_excess"):
+                A.set_state(sym, sync_flat=0, sync_excess=0)
+            continue
+        if qc <= 0:
+            n = int(st.get("sync_flat") or 0) + 1
+            A.set_state(sym, sync_flat=n)
+            if n < SYNC_CONFIRM:
+                log.warning(f"{A.tag(sym)} SYNC: QC '{strategy}' holds 0 but TZ is {tz}sh short "
+                            f"({n}/{SYNC_CONFIRM}) — checking again next sync")
+                continue
+            log.error(f"{A.tag(sym)} SYNC: QC '{strategy}' no longer holds it but TZ is still "
+                      f"{tz}sh short — lost COVER? Covering now")
+            A.set_state(sym, sync_flat=0)
+            threading.Thread(target=handle_cover, args=(A, sym, 0, strategy), daemon=True).start()
+            acted.append(sym)
+        else:
+            n = int(st.get("sync_excess") or 0) + 1
+            A.set_state(sym, sync_excess=n)
+            if n == SYNC_CONFIRM:
+                log.error(f"{A.tag(sym)} SYNC: TZ is {tz}sh short but QC '{strategy}' holds {qc} "
+                          f"— check (a failed TRIM?). Not changed automatically.")
+    if acted or checked:
+        log.info(f"[{A.name}] SYNC {strategy}: QC holds {held} | checked {checked} | covered {acted}")
+    return {"status": "ok", "checked": checked, "covered": acted}, 200
+
+
+def _marks(A):
+    """symbol -> TZ mark price (exposure / shares) for every open position, one call each."""
+    rows = _list_positions(A) or []
+    shares = {str(p.get("symbol", "")).upper(): abs(float(p.get("shares") or 0)) for p in rows}
+    r = A.get_fn(f"/v1/api/accounts/{A.acct_id()}/pnl", "PNL")
+    if not r.ok:
+        return {}
+    out = {}
+    for x in r.json().get("pnl", []) or []:
+        sym = str(x.get("symbol", "")).upper()
+        q, exp = shares.get(sym, 0), abs(float(x.get("exposure") or 0))
+        if q > 0 and exp > 0:
+            out[sym] = exp / q
+    return out
+
+
+def loss_guard_thread():
+    hits = {}
+    log.info(f"LOSS GUARD started | every {LOSS_GUARD_EVERY_S}s | broker stop +{LOSS_GUARD_EXTRA:.0%} "
+             f"(no stop: +{LOSS_GUARD_NOSTOP:.0%})")
+    while True:
+        time.sleep(LOSS_GUARD_EVERY_S)
+        if not LOSS_GUARD_ON:
+            continue
+        try:
+            if not (_dtime(4, 0) <= _now_et().time() <= _dtime(19, 58)):
+                continue
+            for A in (REAL, SIM):
+                if not A.acct_id():
+                    continue
+                active = {k: v for k, v in list(A.states().items())
+                          if v.get("state") == "ACTIVE" and float(v.get("entry_fill_price") or 0) > 0}
+                if not active:
+                    continue
+                marks = _marks(A)
+                for sym, st in active.items():
+                    px, key = marks.get(sym.upper()), (A.name, sym)
+                    entry, sl = float(st["entry_fill_price"]), _sl_pct_of(st)
+                    lim = entry * (1 + (sl + LOSS_GUARD_EXTRA if sl > 0 else LOSS_GUARD_NOSTOP))
+                    if not px or px < lim:
+                        hits.pop(key, None)
+                        continue
+                    hits[key] = hits.get(key, 0) + 1
+                    if hits[key] < 2:
+                        continue
+                    hits.pop(key, None)
+                    log.error(f"{A.tag(sym)} LOSS GUARD: TZ mark ${px:.4f} >= ${lim:.4f} "
+                              f"({(px / entry - 1) * 100:.0f}% above entry ${entry:.4f}) — covering now")
+                    threading.Thread(target=handle_cover, args=(A, sym, 0, st.get("owner")),
+                                     daemon=True).start()
+        except Exception as e:
+            log.warning(f"LOSS GUARD error: {e}")
+
+
 def cover_until_flat(A, symbol, order_ids, qc_price, placed_in_rth, placed=True):
     """Keep covering until TZ shows no short.
       * every 15 s: flat? → log fill, state FLAT, done.
@@ -2967,6 +3280,7 @@ def cover_until_flat(A, symbol, order_ids, qc_price, placed_in_rth, placed=True)
     step = 0
     last_place = time.time() if placed else 0.0
     last_rth = placed_in_rth
+    urgent = False      # sticky: once losing, keep the fast pace and big steps
     log.info(f"{tag} COVER LOOP started | orders={order_ids} | qc_price=${qc_price}")
     while True:
         time.sleep(15)
@@ -3019,7 +3333,17 @@ def cover_until_flat(A, symbol, order_ids, qc_price, placed_in_rth, placed=True)
                 _arm_carried_stop(A, symbol, qty)
             return
 
-        due = (time.time() - last_place >= COVER_FILL_TIMEOUT * 60) or (rth and not last_rth)
+        since = time.time() - last_place
+        if not rth and not urgent and COVER_URGENT_RETRY_S <= since < COVER_FILL_TIMEOUT * 60:
+            mpx, _src = _tz_mark_price(A, symbol, pos)
+            entry = float(A.get_state(symbol).get("entry_fill_price") or 0)
+            if mpx and entry and mpx > entry:
+                urgent = True
+                step = 0
+                log.warning(f"{tag} COVER LOOP: losing (mark ${mpx:.4f} > entry ${entry:.4f}) — "
+                            f"re-pricing every {COVER_URGENT_RETRY_S}s with bigger steps")
+        pace = COVER_URGENT_RETRY_S if urgent else COVER_FILL_TIMEOUT * 60
+        due = (since >= pace) or (rth and not last_rth)
         if not due:
             continue
 
@@ -3035,7 +3359,8 @@ def cover_until_flat(A, symbol, order_ids, qc_price, placed_in_rth, placed=True)
                 res, how = _place_cover(A, symbol, qty, 0, "COVER_RETRY")
             else:
                 px, src = _cover_ref_price(A, symbol, pos)
-                stepv = COVER_RETRY_STEPS[min(step, len(COVER_RETRY_STEPS) - 1)]
+                steps = COVER_URGENT_STEPS if urgent else COVER_RETRY_STEPS
+                stepv = steps[min(step, len(steps) - 1)]
                 target = max((px or 0) * (1 + stepv), float(qc_price or 0))
                 if target <= 0:
                     log.error(f"{tag} COVER LOOP: no price source — MANUAL ACTION REQUIRED (will retry)")
@@ -3129,7 +3454,7 @@ def _rearm_stops(A):
             log.info(f"[{A.pfx}{sym}] STOP RE-ARM: StopLimit {sid} already working — kept")
             continue
         entry = float(st.get("entry_fill_price") or 0)
-        sl_pct = float(st.get("sl_pct") or DEFAULT_SL_PCT)
+        sl_pct = _sl_pct_of(st)
         if entry <= 0 or sl_pct <= 0:
             log.warning(f"[{A.pfx}{sym}] STOP RE-ARM: no entry fill/sl_pct on record — skipped")
             continue
@@ -3167,6 +3492,7 @@ def ny_scheduler_thread():
         ("check",   CARRY_CHECK_ET, True,  _carry_check),
         ("rearm",   STOP_REARM_ET,  True,  _rearm_stops),
         ("rearm2",  (STOP_REARM_ET[0], STOP_REARM_ET[1] + 5), True, _rearm_stops),   # backstop
+        ("summary", DAILY_SUMMARY_ET, True, _daily_summary),
     ]
     now = _now_et()
     # On startup, treat jobs whose time already passed today as done (no surprise reset).
@@ -3234,6 +3560,26 @@ def _refresh_tz_cache():
                 _tz_cache["detail"] = f"error: {e}"
 
 # (started per serving process — see _start_background)
+
+
+@app.route("/telegram/test", methods=["GET"])
+def telegram_test():
+    """Open in a browser after setting TELEGRAM_BOT_TOKEN (and messaging your bot once):
+    shows the chat ids the bot has seen, and sends a test message if TELEGRAM_CHAT_ID is set."""
+    if not TG_TOKEN:
+        return jsonify({"error": "TELEGRAM_BOT_TOKEN not set"}), 400
+    chats = {}
+    try:
+        r = requests.get(f"https://api.telegram.org/bot{TG_TOKEN}/getUpdates", timeout=8)
+        for u in r.json().get("result", []):
+            c = (u.get("message") or {}).get("chat") or {}
+            if c.get("id"):
+                chats[str(c["id"])] = c.get("username") or c.get("first_name") or ""
+    except Exception as e:
+        chats = {"error": str(e)}
+    sent = _tg_post("✅ TZ bridge test message — Telegram is working.") if TG_CHAT else False
+    return jsonify({"chat_ids_seen": chats, "TELEGRAM_CHAT_ID": TG_CHAT or "not set",
+                    "test_message_sent": sent}), 200
 
 
 @app.route("/health", methods=["GET", "HEAD"])
@@ -3353,6 +3699,9 @@ def webhook():
     if ALLOWED_STRATEGIES and strategy not in ALLOWED_STRATEGIES:
         log.info(f"[{qc_symbol}] {action} ignored — strategy '{strategy}' not in ALLOWED_STRATEGIES")
         return jsonify({"status": "ignored", "reason": "strategy not allowed", "strategy": strategy}), 200
+    if action == "SYNC":
+        body_out, code = handle_sync(REAL, strategy, body.get("holdings"))
+        return jsonify(body_out), code
 
     if not qc_symbol:
         return jsonify({"error": "missing symbol"}), 400
@@ -3473,6 +3822,9 @@ def sim_webhook():
         log.info(f"[SIM:{qc_symbol}] {action} ignored — strategy '{strategy}' not in ALLOWED_STRATEGIES")
         return jsonify({"status": "ignored", "reason": "strategy not allowed",
                         "strategy": strategy, "mode": "sim"}), 200
+    if action == "SYNC":
+        body_out, code = handle_sync(SIM, strategy, body.get("holdings"))
+        return jsonify(body_out), code
 
     if not qc_symbol:
         return jsonify({"error": "missing symbol"}), 400
@@ -3587,8 +3939,8 @@ def _start_background():
             return
         _bg_pid = os.getpid()
     log.info(f"BACKGROUND THREADS starting in pid {os.getpid()} "
-             f"(watchdog, NY scheduler, TZ status cache)")
-    for fn in (self_watchdog_thread, ny_scheduler_thread, _refresh_tz_cache):
+             f"(watchdog, NY scheduler, TZ status cache, loss guard)")
+    for fn in (self_watchdog_thread, ny_scheduler_thread, _refresh_tz_cache, loss_guard_thread):
         threading.Thread(target=fn, daemon=True).start()
 
 
