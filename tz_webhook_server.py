@@ -304,10 +304,28 @@ def set_state(symbol, **kwargs):
              + (f" ({kwargs.get('reason', '')})" if kwargs.get("reason") else ""))
 
 
+def _notify_skip(symbol, prev, reason, sim=False):
+    """(a) Phone message when an ENTRY is abandoned: the ticker was locating, or its
+    entry order was placed but never filled (price check, locate, buying power, no fill)."""
+    try:
+        if not TG_TRADES:
+            return
+        entering = prev.get("state") == "LOCATING" or (
+            prev.get("state") == "ACTIVE" and not prev.get("entry_fill_price"))
+        if not entering:
+            return
+        owner = (prev.get("owner") or "?").upper()
+        notify(f"⛔ SKIPPED {owner} {symbol} — {reason[:300]}", sim=sim)
+    except Exception:
+        pass
+
+
 def block(symbol, reason):
-    last_cycle = symbol_state.get(symbol, {}).get("cycle", 0)
+    prev = symbol_state.get(symbol, {}).copy()
+    last_cycle = prev.get("cycle", 0)
     set_state(symbol, state="BLOCKED", reason=reason, cycle=last_cycle)
     log.warning(f"[{symbol}] BLOCKED: {reason}")
+    _notify_skip(symbol, prev, reason)
 
 
 def try_begin_cover(symbol):
@@ -355,9 +373,11 @@ def sim_set_state(symbol, **kwargs):
 
 
 def sim_block(symbol, reason):
-    last_cycle = sim_symbol_state.get(symbol, {}).get("cycle", 0)
+    prev = sim_symbol_state.get(symbol, {}).copy()
+    last_cycle = prev.get("cycle", 0)
     sim_set_state(symbol, state="BLOCKED", reason=reason, cycle=last_cycle)
     log.warning(f"[SIM:{symbol}] BLOCKED: {reason}")
+    _notify_skip(symbol, prev, reason, sim=True)
 
 
 def sim_try_begin_cover(symbol):
@@ -581,6 +601,15 @@ def _order_is_open(o):
     return True
 
 
+# DoneForDay is NOT finished for a GTC_Plus stop: TZ parks it for the rest of the session
+# and it comes back at the next 04:00. 12 Nov: VTSI's GTC_Plus stop (placed 16:27 ET) went
+# DoneForDay at once; the 19:00 cover and the 03:50 sweep both skipped it as "closed",
+# leaving a live buy stop on a flat ticker (it would open a LONG if triggered).
+# Such orders are treated as cancellable (but not waited on as "open").
+def _order_is_cancellable(o):
+    return _order_is_open(o) or str(o.get("orderStatus", "") or "") == "DoneForDay"
+
+
 def cancel_all_open_orders(symbol):
     r = tz_get(f"/v1/api/accounts/{ACCOUNT_ID}/orders", "ORDERS")
     if r.status_code != 200:
@@ -592,7 +621,7 @@ def cancel_all_open_orders(symbol):
     open_orders = [
         o for o in orders
         if o.get("symbol", "").upper() == symbol.upper()
-        and _order_is_open(o)
+        and _order_is_cancellable(o)
     ]
     log.info(f"  Found {len(open_orders)} open order(s) for {symbol}")
     cancelled = 0
@@ -669,7 +698,7 @@ def sim_cancel_all_open_orders(symbol):
     open_orders = [
         o for o in orders
         if o.get("symbol", "").upper() == symbol.upper()
-        and _order_is_open(o)
+        and _order_is_cancellable(o)
     ]
     log.info(f"  [SIM] Found {len(open_orders)} open order(s) for {symbol}")
     cancelled = 0
@@ -1020,6 +1049,23 @@ def verify_stop_alive(account_id, headers_fn, symbol, stop_client_order_id,
                 set_state(symbol, sl_client_order_id=None)
         elif status in ("PendingNew", "New", "Submitted"):
             log.info(f"{prefix} STOP VERIFY: stop is live and armed ✓")
+        elif status == "DoneForDay" and str(order.get("timeInForce", "GTC_Plus")) != "Day_Plus":
+            # A GTC_Plus stop placed after hours is parked by TZ until the next session,
+            # so the position would be unprotected until 04:00. Replace it with a Day_Plus
+            # StopLimit (works until 20:00); the 19:58 carry step arms the overnight one.
+            log.warning(f"{prefix} STOP VERIFY: stop {stop_client_order_id} is DoneForDay (parked "
+                        f"until next session) — replacing with a Day_Plus StopLimit")
+            cancel_stop_order(account_id, headers_fn, symbol, stop_client_order_id, "STOP_DFD_CANCEL")
+            qty = int(float(order.get("orderQuantity") or 0))
+            res = None
+            if qty > 0 and stop_px and limit_px:
+                res = place_stop_order(account_id, headers_fn, symbol, qty, float(stop_px),
+                                       limit_price=float(limit_px), label="STOP_DAYPLUS", tif="Day_Plus")
+            new_id = res.get("clientOrderId") if res else None
+            (sim_set_state if is_sim else set_state)(symbol, sl_client_order_id=new_id)
+            if not new_id:
+                log.error(f"{prefix} STOP VERIFY: Day_Plus replacement FAILED — position is "
+                          f"UNPROTECTED until next session (QC-side SL only)")
         else:
             log.warning(f"{prefix} STOP VERIFY: unexpected status={status} — leaving state as-is")
     except Exception as e:
@@ -1396,33 +1442,246 @@ def get_yahoo_price(symbol):
     return get_live_price(symbol)
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# (b) MULTI-SOURCE PRICE CHECK  (Nov 2026)
+# ══════════════════════════════════════════════════════════════════════════════
+# Before a SHORT, QC's price is compared with several independent quotes. Each source
+# reports a price AND the time of that price; only quotes younger than PRICE_FRESH_S
+# count. New rule:
+#   * any fresh source within PRICE_SANITY_PCT of QC          → allow
+#   * no fresh source at all                                   → allow + warn
+#   * every fresh source off by more than PRICE_SANITY_PCT,
+#     and the fresh sources agree with each other              → BLOCK (QC price looks wrong)
+#   * fresh sources off from QC but disagree with each other   → allow + warn
+# The rule above is LOGGED ONLY (all sources, for review). What can decide is the simpler
+# CNBC-fallback rule in fallback_decision(). PRICE_CHECK_MODE (Render env var):
+#   shadow (default) — the existing check still decides; the fallback rule and all sources
+#                      are logged (PRICECHK line + Telegram note when the decision would differ).
+#   fallback         — the fallback rule decides.
+# Sources (each optional; a missing key just drops that source):
+#   yahoo   — v8 chart 1-minute bars incl. pre/post (time = bar start)
+#   cnbc    — quote.cnbc.com restQuote with exthrs=1 (ExtendedMktQuote in pre/post);
+#             plain request, honest User-Agent. Unofficial endpoint: may change.
+#   alpaca  — /v2/stocks/{sym}/trades/latest?feed=iex (ALPACA_KEY_ID + ALPACA_SECRET_KEY)
+#   finnhub — /api/v1/quote (FINNHUB_API_KEY); free tier = regular-hours prices only,
+#             so it is naturally stale (not fresh) outside 09:30-16:00.
+PRICE_CHECK_MODE = (os.getenv("PRICE_CHECK_MODE") or "shadow").strip().lower()
+PRICE_FRESH_S    = int(os.getenv("PRICE_FRESH_S", "300"))
+PRICE_SRC_TIMEOUT = 5
+ALPACA_KEY_ID     = (os.getenv("ALPACA_KEY_ID") or "").strip()
+ALPACA_SECRET_KEY = (os.getenv("ALPACA_SECRET_KEY") or "").strip()
+FINNHUB_API_KEY   = (os.getenv("FINNHUB_API_KEY") or "").strip()
+BRIDGE_UA         = "tz-bridge/1.0"
+
+
+def _px_yahoo(symbol):
+    import datetime as _dt
+    r = requests.get(f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}",
+                     params={"interval": "1m", "range": "1d", "includePrePost": "true"},
+                     headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"},
+                     timeout=PRICE_SRC_TIMEOUT)
+    res = r.json()["chart"]["result"][0]
+    closes = res["indicators"]["quote"][0].get("close", []) or []
+    ts = res.get("timestamp", []) or []
+    for i in range(min(len(closes), len(ts)) - 1, -1, -1):
+        if closes[i] is not None:
+            return float(closes[i]), float(ts[i]) + 60.0       # bar start → bar end
+    return None, None
+
+
+def _px_cnbc(symbol):
+    import datetime as _dt
+    r = requests.get("https://quote.cnbc.com/quote-html-webservice/restQuote/symbolType/symbol",
+                     params={"symbols": symbol, "requestMethod": "itv", "noform": "1",
+                             "partnerId": "2", "fund": "1", "exthrs": "1", "output": "json"},
+                     headers={"User-Agent": BRIDGE_UA}, timeout=PRICE_SRC_TIMEOUT)
+    q = r.json()["FormattedQuoteResult"]["FormattedQuote"]
+    q = q[0] if isinstance(q, list) else q
+    ext = q.get("ExtendedMktQuote") or {}
+    use = ext if (ext.get("last") and str(q.get("curmktstatus", "")).upper() != "REG_MKT") else q
+    px = float(str(use.get("last", "")).replace(",", ""))
+    t = str(use.get("last_time") or "")
+    for fmt in ("%Y-%m-%dT%H:%M:%S.%f%z", "%Y-%m-%dT%H:%M:%S%z"):
+        try:
+            return px, _dt.datetime.strptime(t, fmt).timestamp()
+        except ValueError:
+            pass
+    return px, None
+
+
+def _px_alpaca(symbol):
+    import datetime as _dt
+    if not (ALPACA_KEY_ID and ALPACA_SECRET_KEY):
+        return None, None
+    r = requests.get(f"https://data.alpaca.markets/v2/stocks/{symbol}/trades/latest",
+                     params={"feed": "iex"}, timeout=PRICE_SRC_TIMEOUT,
+                     headers={"APCA-API-KEY-ID": ALPACA_KEY_ID, "APCA-API-SECRET-KEY": ALPACA_SECRET_KEY})
+    tr = r.json().get("trade") or {}
+    if not tr.get("p"):
+        return None, None
+    t = str(tr.get("t", ""))[:26].rstrip("Z")              # 2026-11-12T22:51:46.066123
+    try:
+        ts = _dt.datetime.fromisoformat(t).replace(tzinfo=_dt.timezone.utc).timestamp()
+    except ValueError:
+        ts = None
+    return float(tr["p"]), ts
+
+
+def _px_finnhub(symbol):
+    if not FINNHUB_API_KEY:
+        return None, None
+    r = requests.get("https://finnhub.io/api/v1/quote", params={"symbol": symbol, "token": FINNHUB_API_KEY},
+                     timeout=PRICE_SRC_TIMEOUT)
+    d = r.json()
+    if not d.get("c"):
+        return None, None
+    return float(d["c"]), float(d.get("t") or 0) or None
+
+
+_PRICE_SOURCES = (("yahoo", _px_yahoo), ("cnbc", _px_cnbc), ("alpaca", _px_alpaca),
+                  ("finnhub", _px_finnhub))
+
+
+def multi_source_prices(symbol):
+    """[(name, price, age_s or None, error or None)] from every source, in parallel."""
+    from concurrent.futures import ThreadPoolExecutor, wait
+    now = time.time()
+    out = []
+    with ThreadPoolExecutor(max_workers=len(_PRICE_SOURCES)) as ex:
+        futs = {ex.submit(fn, symbol): name for name, fn in _PRICE_SOURCES}
+        done, _ = wait(futs, timeout=PRICE_SRC_TIMEOUT + 1)
+        for f, name in futs.items():
+            if f not in done:
+                out.append((name, None, None, "timeout"))
+                continue
+            try:
+                px, ts = f.result()
+                out.append((name, px, (now - ts) if (px and ts) else None, None if px else "no price"))
+            except Exception as e:
+                out.append((name, None, None, f"{type(e).__name__}"))
+    return out
+
+
+def multi_source_decision(symbol, qc_price):
+    """('allow' | 'block' | 'warn', text). See the rule above."""
+    rows = multi_source_prices(symbol)
+    parts = []
+    for name, px, age, err in rows:
+        parts.append(f"{name}=" + (f"${px:.4f}({int(age)}s)" if px and age is not None
+                                   else f"${px:.4f}(age?)" if px else err))
+    fresh = [(n, px) for n, px, age, _e in rows if px and age is not None and age <= PRICE_FRESH_S]
+    text = " | ".join(parts)
+    if not fresh:
+        return "warn", f"no fresh source (<= {PRICE_FRESH_S}s) | {text}"
+    dev = {n: abs(qc_price - px) / px for n, px in fresh}
+    if min(dev.values()) <= PRICE_SANITY_PCT:
+        ok = min(dev, key=dev.get)
+        return "allow", f"{ok} within {dev[ok]*100:.1f}% | {text}"
+    pxs = sorted(px for _n, px in fresh)
+    med = pxs[len(pxs) // 2]
+    if all(abs(px - med) / med <= PRICE_SANITY_PCT for px in pxs):
+        return "block", (f"all {len(fresh)} fresh source(s) {min(dev.values())*100:.0f}%+ from QC "
+                         f"(median ${med:.4f}) | {text}")
+    return "warn", f"fresh sources off from QC and disagree with each other | {text}"
+
+
+def _cnbc_check(symbol, qc_price):
+    """CNBC second opinion: ('agree' | 'disagree' | 'none', text)."""
+    try:
+        px, ts = _px_cnbc(symbol)
+    except Exception as e:
+        return "none", f"cnbc error {type(e).__name__}"
+    if not px:
+        return "none", "cnbc no price"
+    age = time.time() - ts if ts else None
+    if age is None or age > PRICE_FRESH_S:
+        return "none", f"cnbc=${px:.4f} stale ({'?' if age is None else int(age)}s)"
+    dev = abs(qc_price - px) / px
+    return ("agree" if dev <= PRICE_SANITY_PCT else "disagree"), f"cnbc=${px:.4f} ({int(age)}s, {dev*100:.1f}% off)"
+
+
+def fallback_decision(primary, qc_price, symbol):
+    """Dennis's rule (13 Nov). primary = 'ok' | 'fail' | 'stale' from the existing check
+    (Twelve Data in RTH, Yahoo outside).
+      ok    → allow (CNBC not asked)
+      fail  → ask CNBC: agrees → allow (primary assumed stale); disagrees → block;
+              CNBC unavailable/stale → block (as today)
+      stale → (no usable primary price) ask CNBC: agrees → allow; disagrees → block;
+              unavailable → allow, as today."""
+    if primary == "ok":
+        return "allow", "primary OK"
+    c, text = _cnbc_check(symbol, qc_price)
+    if c == "agree":
+        return "allow", f"primary {primary}, {text} → allow"
+    if c == "disagree":
+        return "block", f"primary {primary}, {text} → block"
+    return ("block" if primary == "fail" else "allow"), f"primary {primary}, {text}"
+
+
+def price_gate(symbol, entry_price, sim=False):
+    """Step 0 of an entry. Returns (block_reason or None, log_note for the sheet).
+    The existing check runs first (unchanged). PRICE_CHECK_MODE:
+      shadow   (default) existing check decides; CNBC fallback + all sources logged only
+      fallback the fallback rule decides (see fallback_decision)."""
+    pfx = f"[SIM:{symbol}]" if sim else f"[{symbol}]"
+    old_reason, note, primary = None, None, "stale"
+    live_price, live_session = get_live_price(symbol)
+    if live_price is not None:
+        deviation = abs(entry_price - live_price) / live_price
+        log.info(f"{pfx} Price check: {live_session}=${live_price:.4f} | QC=${entry_price:.4f} | "
+                 f"deviation={deviation*100:.2f}% (limit={PRICE_SANITY_PCT*100:.0f}%)")
+        if live_session == "yahoo_v8(lastClose)":
+            log.info(f"{pfx} Price sanity SKIPPED — {live_session} is yesterday's close")
+        elif deviation > PRICE_SANITY_PCT:
+            primary = "fail"
+            old_reason = (f"price sanity FAILED: QC=${entry_price} vs {live_session}=${live_price:.4f} "
+                          f"({deviation*100:.1f}% > {PRICE_SANITY_PCT*100:.0f}% limit)")
+            note = f"QC=${entry_price} vs {live_session}=${live_price:.4f} ({deviation*100:.1f}%)"
+        else:
+            primary = "ok"
+    else:
+        log.warning(f"{pfx} All price sources exhausted — proceeding unvalidated")
+    old = "block" if old_reason else "allow"
+
+    if PRICE_CHECK_MODE == "fallback":
+        new, text = fallback_decision(primary, entry_price, symbol)
+        log.info(f"{pfx} PRICECHK mode=fallback QC=${entry_price:.4f} | old={old} new={new} | {text}")
+        if new == "block":
+            return (old_reason or f"price check FAILED: {text}"), f"QC=${entry_price} | {text}"[:300]
+        if old == "block":
+            notify(f"✅ PRICE CHECK {symbol}: {live_session} disagreed but {text} (entry allowed)", sim=sim)
+        return None, None
+
+    def _shadow():                     # logging only: never delays the entry
+        try:
+            new, text = fallback_decision(primary, entry_price, symbol)
+            _all, all_text = multi_source_decision(symbol, entry_price)
+        except Exception as e:
+            new, text, all_text = "allow", f"error {e}", ""
+        log.info(f"{pfx} PRICECHK mode=shadow QC=${entry_price:.4f} | old={old} fallback={new} | {text} "
+                 f"|| all: {all_text}")
+        if new != old:
+            notify(f"🔍 PRICECHK {symbol} (shadow): now {old}, fallback rule would {new} | "
+                   f"QC ${entry_price:.4f} | {text[:250]}", sim=sim)
+    threading.Thread(target=_shadow, daemon=True).start()
+    return old_reason, note
+
+
 def locate_and_short(symbol, qc_quantity, entry_price):
     log.info(f"[{symbol}] ── LOCATE THREAD STARTED ──────────────────────")
     log.info(f"[{symbol}] QC requested: qty={qc_quantity} entry_price=${entry_price}")
 
-    # ── Step 0: Price sanity check ─────────────────────────────────────────
+    # ── Step 0: Price sanity check (old rule + multi-source, see price_gate) ──
     log.info(f"[{symbol}] Step 0: Price sanity check (QC=${entry_price:.4f})")
-    live_price, live_session = get_live_price(symbol)
-    if live_price is not None:
-        deviation = abs(entry_price - live_price) / live_price
-        log.info(f"[{symbol}] Price check: {live_session}=${live_price:.4f} | QC=${entry_price:.4f} | "
-                 f"deviation={deviation*100:.2f}% (limit={PRICE_SANITY_PCT*100:.0f}%)")
-
-        if live_session == "yahoo_v8(lastClose)":
-            log.info(f"[{symbol}] Price sanity SKIPPED — {live_session} is yesterday's close")
-        elif deviation > PRICE_SANITY_PCT:
-            log_locate(symbol=symbol, entry_price=entry_price,
-                       outcome='REJECTED_BY_PRICE_SANITY',
-                       trade_outcome='BLOCKED_NO_TRADE',
-                       notes=f"REAL | QC=${entry_price} vs {live_session}=${live_price:.4f} "
-                             f"({deviation*100:.1f}%)")
-            block(symbol, f"price sanity FAILED: QC=${entry_price} vs {live_session}=${live_price:.4f} "
-                          f"({deviation*100:.1f}% > {PRICE_SANITY_PCT*100:.0f}% limit)")
-            return
-        else:
-            log.info(f"[{symbol}] Price sanity OK ✓")
-    else:
-        log.warning(f"[{symbol}] All price sources exhausted — proceeding unvalidated")
+    reason, note = price_gate(symbol, entry_price)
+    if reason:
+        log_locate(symbol=symbol, entry_price=entry_price,
+                   outcome='REJECTED_BY_PRICE_SANITY',
+                   trade_outcome='BLOCKED_NO_TRADE',
+                   notes=f"REAL | {note}")
+        block(symbol, reason)
+        return
+    log.info(f"[{symbol}] Price sanity OK ✓")
 
     # ── Step 1: Check buying power ─────────────────────────────────────────
     log.info(f"[{symbol}] Step 1: Checking buying power and margin")
@@ -1798,28 +2057,17 @@ def locate_and_short_sim(symbol, qc_quantity, entry_price):
     log.info(f"[SIM:{symbol}] ── SIM LOCATE THREAD STARTED ─────────────────")
     log.info(f"[SIM:{symbol}] QC requested: qty={qc_quantity} entry_price=${entry_price}")
 
-    # ── Step 0: Price sanity check ─────────────────────────────────────────
+    # ── Step 0: Price sanity check (old rule + multi-source, see price_gate) ──
     log.info(f"[SIM:{symbol}] Step 0: Price sanity check (QC=${entry_price:.4f})")
-    live_price, live_session = get_live_price(symbol)
-    if live_price is not None:
-        deviation = abs(entry_price - live_price) / live_price
-        log.info(f"[SIM:{symbol}] Price check: {live_session}=${live_price:.4f} | "
-                 f"QC=${entry_price:.4f} | deviation={deviation*100:.2f}%")
-        if live_session == "yahoo_v8(lastClose)":
-            log.info(f"[SIM:{symbol}] Price sanity SKIPPED — lastClose is stale reference")
-        elif deviation > PRICE_SANITY_PCT:
-            log_locate(symbol=symbol, entry_price=entry_price,
-                       outcome='REJECTED_BY_PRICE_SANITY',
-                       trade_outcome='BLOCKED_NO_TRADE',
-                       notes=f"SIM | QC=${entry_price} vs {live_session}=${live_price:.4f} "
-                             f"({deviation*100:.1f}%)")
-            sim_block(symbol, f"price sanity FAILED: QC=${entry_price} vs "
-                              f"{live_session}=${live_price:.4f} ({deviation*100:.1f}%)")
-            return
-        else:
-            log.info(f"[SIM:{symbol}] Price sanity OK ✓")
-    else:
-        log.warning(f"[SIM:{symbol}] All price sources exhausted — proceeding unvalidated")
+    reason, note = price_gate(symbol, entry_price, sim=True)
+    if reason:
+        log_locate(symbol=symbol, entry_price=entry_price,
+                   outcome='REJECTED_BY_PRICE_SANITY',
+                   trade_outcome='BLOCKED_NO_TRADE',
+                   notes=f"SIM | {note}")
+        sim_block(symbol, reason)
+        return
+    log.info(f"[SIM:{symbol}] Price sanity OK ✓")
 
     # ── Step 1: Buying power check against SIM account ─────────────────────
     log.info(f"[SIM:{symbol}] Step 1: Checking SIM account buying power")
@@ -3145,6 +3393,9 @@ def handle_cover(A, symbol, qc_price, strategy):
         A.set_state(symbol, state="COVERING", carried=False, reason="cover working",
                     cover_started=time.time())
         log.info(f"{A.tag(symbol)} COVER PLACED | qty={qty} | {how} | qc_price=${qc_price} | clientOrderId={cid}")
+        if qc_price > 0:
+            threading.Thread(target=_check_cover_gap, args=(A, symbol, qc_price, pos, strategy),
+                             daemon=True).start()
         threading.Thread(target=cover_until_flat,
                          args=(A, symbol, [cid] if cid else [], qc_price, _is_rth_now(), bool(cid)),
                          daemon=True).start()
@@ -3161,6 +3412,27 @@ def handle_cover(A, symbol, qc_price, strategy):
                          args=(A, symbol, [], qc_price, _is_rth_now(), False),
                          daemon=True).start()
         return {"status": "ok", "note": "cover order failed — cover loop retrying"}, 200
+
+
+COVER_GAP_ALERT = float(os.getenv("COVER_GAP_ALERT", "0.10"))
+
+
+def _check_cover_gap(A, symbol, qc_price, pos, strategy):
+    """(d) QC's COVER price far from TZ's own mark → QC's data (or its P&L) is off.
+    Seen 12 Nov: VWAV COVER at $2.11 (QC target) while TZ marked $2.37-2.65."""
+    try:
+        mark, _src = _tz_mark_price(A, symbol, pos)
+        if not mark:
+            return
+        gap = (qc_price - mark) / mark
+        if abs(gap) > COVER_GAP_ALERT:
+            msg = (f"{A.tag(symbol)} COVER PRICE GAP: QC ${qc_price:.4f} vs TZ mark ${mark:.4f} "
+                   f"({gap*100:+.0f}%) — QC's exit price/P&L for this trade is not what TZ will get")
+            log.warning(msg)
+            notify(f"⚠️ {(strategy or '?').upper()} {symbol}: QC cover ${qc_price:.4f} vs TZ mark "
+                   f"${mark:.4f} ({gap*100:+.0f}%) — cover will be re-priced from TZ", sim=A.is_sim)
+    except Exception as e:
+        log.warning(f"{A.tag(symbol)} cover gap check failed: {e}")
 
 
 def handle_sync(A, strategy, holdings):
@@ -3229,8 +3501,48 @@ def _marks(A):
     return out
 
 
+STOP_FILL_MIN_AGE_S = 60
+
+
+def _detect_stop_fills(A, active, gone):
+    """(e) An ACTIVE short (entry filled) that TZ no longer shows on two checks in a row
+    was closed outside the bridge — normally the broker stop. Log it, message at once,
+    mark FLAT. (Before: noticed only when QC's own COVER came, e.g. POAS 1.5 h late.)"""
+    rows = _list_positions(A)
+    if rows is None:
+        return
+    for sym, st in active.items():
+        key = (A.name, sym)
+        if time.time() - float(st.get("filled_at") or 0) < STOP_FILL_MIN_AGE_S:
+            gone.pop(key, None)
+            continue
+        if _short_qty(_pick_position(rows, sym)) > 0:
+            gone.pop(key, None)
+            continue
+        gone[key] = gone.get(key, 0) + 1
+        if gone[key] < 2:
+            continue
+        gone.pop(key, None)
+        if A.get_state(sym).get("state") != "ACTIVE":
+            continue                          # a cover/trim took over meanwhile
+        sid = st.get("sl_client_order_id")
+        log.warning(f"{A.tag(sym)} STOP-FILL CHECK: TZ shows no short for an ACTIVE position "
+                    f"(broker stop {sid or 'none'}) — marking FLAT")
+        if not _cancel_and_wait(A, sym):
+            log.warning(f"{A.tag(sym)} STOP-FILL CHECK: orders still open — leaving ACTIVE, next check")
+            continue
+        so = _find_order(A.acct_id(), A.headers, sid) if sid else None
+        if so is not None and int(float(so.get("executed") or 0)) > 0:
+            _log_cover_fill(A, sym, [sid], label="STOP FILLED (bridge check) —")
+        else:
+            notify(f"❓ {(st.get('owner') or '?').upper()} {sym} — TZ shows no short any more and "
+                   f"the broker stop did not fill (closed manually?). Marked flat.", sim=A.is_sim)
+        A.set_state(sym, state="FLAT", reason="stop filled (bridge check)", owner=None,
+                    carried=False, sl_client_order_id=None)
+
+
 def loss_guard_thread():
-    hits = {}
+    hits, gone = {}, {}
     log.info(f"LOSS GUARD started | every {LOSS_GUARD_EVERY_S}s | broker stop +{LOSS_GUARD_EXTRA:.0%} "
              f"(no stop: +{LOSS_GUARD_NOSTOP:.0%})")
     while True:
@@ -3245,6 +3557,10 @@ def loss_guard_thread():
                     continue
                 active = {k: v for k, v in list(A.states().items())
                           if v.get("state") == "ACTIVE" and float(v.get("entry_fill_price") or 0) > 0}
+                if not active:
+                    continue
+                _detect_stop_fills(A, active, gone)
+                active = {k: v for k, v in active.items() if A.get_state(k).get("state") == "ACTIVE"}
                 if not active:
                     continue
                 marks = _marks(A)
@@ -3398,7 +3714,7 @@ def _daily_reset(A):
         shorts = {str(p.get("symbol", "")).upper() for p in positions if _short_qty(p) > 0}
         for o in _list_orders(A):
             cid = str(o.get("clientOrderId", ""))
-            if (cid.startswith("SL_") and _order_is_open(o)
+            if (cid.startswith("SL_") and _order_is_cancellable(o)
                     and str(o.get("symbol", "")).upper() not in shorts):
                 sym = str(o.get("symbol", "")).upper()
                 cancel_stop_order(A.acct_id(), A.headers, sym, cid, f"{A.name}_ORPHAN_STOP_CANCEL")
@@ -3449,7 +3765,7 @@ def _rearm_stops(A):
         # A regular-hours Stop (Day) is replaced even if TZ still lists it as open: on
         # 3 Nov the expired Day stops were still listed at 16:01, so BWEN was skipped and
         # left with no broker stop overnight.
-        if (cur is not None and _order_is_open(cur)
+        if (cur is not None and _order_is_cancellable(cur)
                 and str(cur.get("orderType", "")).lower() == "stoplimit"):
             log.info(f"[{A.pfx}{sym}] STOP RE-ARM: StopLimit {sid} already working — kept")
             continue
@@ -3458,7 +3774,7 @@ def _rearm_stops(A):
         if entry <= 0 or sl_pct <= 0:
             log.warning(f"[{A.pfx}{sym}] STOP RE-ARM: no entry fill/sl_pct on record — skipped")
             continue
-        if cur is not None and _order_is_open(cur):
+        if cur is not None and _order_is_cancellable(cur):
             cancel_stop_order(A.acct_id(), A.headers, sym, sid, f"{A.name}_DAYSTOP_CANCEL")
         qty, err = None, None
         for _ in range(3):
@@ -3485,6 +3801,36 @@ def _rearm_stops(A):
             log.warning(f"[{A.pfx}{sym}] STOP RE-ARM FAILED — position relies on QC-side SL")
 
 
+def _rearm_overnight(A):
+    """19:57 ET — a Day_Plus stop (after-hours replacement, see verify_stop_alive) ends at
+    20:00. Swap it for a GTC_Plus StopLimit at the same levels so the short stays protected
+    from the next 04:00."""
+    if not STOP_LOSS_ENABLED:
+        return
+    try:
+        orders = {str(o.get("clientOrderId")): o for o in _list_orders(A)}
+    except Exception as e:
+        log.warning(f"[{A.name}] OVERNIGHT RE-ARM: orders unavailable: {e}")
+        return
+    with A.lock:
+        active = {k: dict(v) for k, v in A.states().items() if v.get("state") == "ACTIVE"}
+    for sym, st in active.items():
+        sid = str(st.get("sl_client_order_id") or "")
+        cur = orders.get(sid) if sid else None
+        if cur is None or str(cur.get("timeInForce", "")) != "Day_Plus" or not _order_is_open(cur):
+            continue
+        qty = int(float(cur.get("orderQuantity") or 0))
+        stop_px, lim_px = cur.get("priceStop"), cur.get("limitPrice")
+        if qty <= 0 or not stop_px or not lim_px:
+            continue
+        cancel_stop_order(A.acct_id(), A.headers, sym, sid, f"{A.name}_DAYPLUS_CANCEL")
+        res = place_stop_order(A.acct_id(), A.headers, sym, qty, float(stop_px), limit_price=float(lim_px),
+                               label=f"{A.name}_STOP_OVERNIGHT", tif="GTC_Plus")
+        A.set_state(sym, sl_client_order_id=res.get("clientOrderId") if res else None)
+        log.info(f"[{A.pfx}{sym}] OVERNIGHT RE-ARM: Day_Plus {sid} → GTC_Plus "
+                 f"{res.get('clientOrderId') if res else 'FAILED'}")
+
+
 def ny_scheduler_thread():
     """Runs the New York-time jobs once per day each (replaces the midnight-UTC reset)."""
     jobs = [  # (name, (h, m), weekdays_only, fn)
@@ -3493,6 +3839,7 @@ def ny_scheduler_thread():
         ("rearm",   STOP_REARM_ET,  True,  _rearm_stops),
         ("rearm2",  (STOP_REARM_ET[0], STOP_REARM_ET[1] + 5), True, _rearm_stops),   # backstop
         ("summary", DAILY_SUMMARY_ET, True, _daily_summary),
+        ("overnight", (19, 57), True, _rearm_overnight),
     ]
     now = _now_et()
     # On startup, treat jobs whose time already passed today as done (no surprise reset).
@@ -3612,6 +3959,11 @@ def health():
             "max_locate_cost_pct": MAX_LOCATE_COST_PCT,
             "sim_max_locate_cost_pct": SIM_MAX_LOCATE_COST_PCT,
             "allowed_strategies":  sorted(ALLOWED_STRATEGIES) or "all",
+            "price_check_mode":    PRICE_CHECK_MODE,   # shadow | fallback
+            "price_sources":       [n for n, _f in _PRICE_SOURCES
+                                    if not ((n == "alpaca" and not ALPACA_KEY_ID) or
+                                            (n == "finnhub" and not FINNHUB_API_KEY))],
+            "cover_gap_alert":     COVER_GAP_ALERT,
             "min_locate_quantity": MIN_LOCATE_QUANTITY,
             "locate_poll_timeout": LOCATE_POLL_TIMEOUT,
             "locate_bp_usage":     LOCATE_BP_USAGE,
