@@ -104,14 +104,16 @@ COVER_RETRY_STEPS    = (0.005, 0.02, 0.05)
 # COVER_URGENT_RETRY_S seconds with these bigger steps — a squeeze can run 20% in the
 # 3 minutes the normal pace waits. A buy limit above the market still fills at the
 # best offer, so a high limit is a ceiling, not the price paid.
-COVER_URGENT_RETRY_S = 30
-COVER_URGENT_STEPS   = (0.03, 0.06, 0.10, 0.15)
+COVER_URGENT_RETRY_S = 10      # was 30 (PLYX 17 Feb 2026 ran $4 -> $76 -> $5 inside 40 s)
+COVER_URGENT_STEPS   = (0.10, 0.15, 0.25, 0.40)   # was 3/6/10/15%: a limit this far above the
+                                                  # mark is a ceiling — it fills at the best offer
 # LOSS GUARD (independent of QC): every LOSS_GUARD_EVERY_S, any ACTIVE short whose TZ
 # mark is LOSS_GUARD_EXTRA past its broker-stop level (or LOSS_GUARD_NOSTOP above entry
 # if it has no broker stop) on two checks in a row is covered at once — e.g. a
 # pre-market stop-limit that the price jumped over, while QC's COVER is late or lost.
 LOSS_GUARD_ON        = True
-LOSS_GUARD_EVERY_S   = 20
+LOSS_GUARD_EVERY_S   = 5       # was 20: two checks in a row now take 5-10 s, not 20-40 s
+LOSS_GUARD_COVER_PCT = 0.10    # loss-guard cover: first limit = TZ mark x 1.10 (marketable)
 LOSS_GUARD_EXTRA     = 0.05
 LOSS_GUARD_NOSTOP    = 0.30
 # SYNC (QC sends each book's holdings every 5 min): a short QC no longer holds is
@@ -146,7 +148,12 @@ def _sl_pct_of(state):
     'no broker stop' (the old `or DEFAULT` turned 0 into 22%)."""
     v = state.get("sl_pct")
     return DEFAULT_SL_PCT if v is None else float(v)
-SL_LIMIT_SLACK  = 0.02    # 2% slack on StopLimit ETH orders so they actually fill
+SL_LIMIT_SLACK  = 0.50    # ETH StopLimit limit = trigger x 1.50. A buy limit fills at the best
+                          # offer, so this is a ceiling, not the price paid. 2% failed on PLYX
+                          # 17 Feb 2026 (06:35 ET: $3.96 -> $10.85 in one second; ~40K shares traded
+                          # between the $4.08 trigger and +50%, none came back under +2% for 18 min).
+                          # Env var SL_LIMIT_SLACK overrides (e.g. 0.30) without a code edit.
+SL_LIMIT_SLACK  = float(os.getenv("SL_LIMIT_SLACK", SL_LIMIT_SLACK))
 # Stop type by session: RTH uses Stop (market on trigger), ETH uses StopLimit
 # because TZ doesn't accept market orders outside RTH.
 
@@ -3119,15 +3126,53 @@ def _daily_summary(A):
     _tg_post("\n".join(lines)) if (TG_TOKEN and TG_CHAT) else None
 
 
+def _buy_orders_since(orders, symbol, since_epoch):
+    """Filled buy-side orders on `symbol` placed after `since_epoch` (entry fill time).
+    Orders without a readable startTime are kept only when no since_epoch is known."""
+    from datetime import datetime as _dtm, timezone as _tz
+    out = []
+    for o in orders or []:
+        if str(o.get("symbol", "")).upper() != symbol.upper():
+            continue
+        if not str(o.get("side", "")).lower().startswith("buy"):
+            continue
+        if since_epoch:
+            try:
+                st = str(o.get("startTime") or "").replace("Z", "")[:19]   # 2026-11-13T09:03:02
+                t = _dtm.strptime(st, "%Y-%m-%dT%H:%M:%S").replace(tzinfo=_tz.utc).timestamp()
+            except Exception:
+                continue
+            if t < float(since_epoch) - 5:
+                continue
+        out.append(o)
+    return out
+
+
 def _log_cover_fill(A, symbol, order_ids, label="COVER DONE — flat"):
     """Cover complete: log the realised P&L (same sheet fields as before)."""
     try:
-        orders = [o for o in _list_orders(A) if o.get("clientOrderId") in set(order_ids)]
-        filled = [(int(o.get("executed", 0) or 0), float(o.get("priceAvg") or o.get("lastPrice") or 0),
-                   float(o.get("orderFee") or 0)) for o in orders]
-        filled = [f for f in filled if f[0] > 0 and f[1] > 0]
-        if not filled and label.startswith("STOP"):
-            log.info(f"{A.tag(symbol)} flat, but no filled stop order found to log")
+        all_orders = _list_orders(A)
+        def _fills(os_):
+            out = [(int(o.get("executed", 0) or 0), float(o.get("priceAvg") or o.get("lastPrice") or 0),
+                    float(o.get("orderFee") or 0)) for o in os_]
+            return [f for f in out if f[0] > 0 and f[1] > 0]
+        filled = _fills([o for o in all_orders if o.get("clientOrderId") in set(order_ids or [])])
+        if not filled:
+            # (14 Nov) the order id we tracked may not be the one that filled (stop re-armed /
+            # replaced / swapped overnight, cover re-priced). Fall back to EVERY filled buy on
+            # this symbol since the entry filled, so no closed trade is missing from the sheet.
+            filled = _fills(_buy_orders_since(all_orders, symbol, A.get_state(symbol).get("filled_at")))
+        if not filled:
+            s0 = A.get_state(symbol)
+            e0 = float(s0.get("entry_fill_price") or 0)
+            if e0 > 0:
+                log_locate(symbol=symbol, entry_price=e0, shares_offered=int(s0.get("quantity") or 0),
+                           route='COVER', outcome='COVER_UNKNOWN', trade_outcome='UNKNOWN_PENDING',
+                           notes=f"{A.name} | {label} flat but no filled buy order found | "
+                                 f"entry_fill=${e0:.4f} owner={s0.get('owner')}")
+                notify(f"❓ {(s0.get('owner') or '?').upper()} {symbol} — flat, but the cover fill "
+                       f"could not be found (logged as COVER_UNKNOWN)", sim=A.is_sim)
+            log.info(f"{A.tag(symbol)} flat, but no filled buy order found to log ({label})")
             return
         ex = sum(f[0] for f in filled)
         cover_fill = sum(f[0] * f[1] for f in filled) / ex if ex else 0.0
@@ -3364,8 +3409,9 @@ def handle_cover(A, symbol, qc_price, strategy):
                          daemon=True).start()
         return {"status": "ok", "note": "waiting for open orders to cancel"}, 200
     if qty <= 0:
-        if expect_short and stop_sid:
-            _log_cover_fill(A, symbol, [stop_sid], label="STOP FILLED before QC's COVER —")
+        if expect_short:     # (14 Nov) log even without a tracked stop id: fallback finds the fill
+            _log_cover_fill(A, symbol, [stop_sid] if stop_sid else [],
+                            label="STOP FILLED before QC's COVER —")
         log.warning(f"{A.tag(symbol)} COVER: no TZ short (stop filled, or entry cancelled/unfilled) "
                     f"— marking FLAT")
         A.set_state(symbol, state="FLAT", reason="cover: no short found", owner=None, carried=False)
@@ -3532,8 +3578,10 @@ def _detect_stop_fills(A, active, gone):
             log.warning(f"{A.tag(sym)} STOP-FILL CHECK: orders still open — leaving ACTIVE, next check")
             continue
         so = _find_order(A.acct_id(), A.headers, sid) if sid else None
-        if so is not None and int(float(so.get("executed") or 0)) > 0:
-            _log_cover_fill(A, sym, [sid], label="STOP FILLED (bridge check) —")
+        bought = [o for o in _buy_orders_since(_list_orders(A), sym, st.get("filled_at"))
+                  if int(float(o.get("executed") or 0)) > 0]
+        if (so is not None and int(float(so.get("executed") or 0)) > 0) or bought:
+            _log_cover_fill(A, sym, [sid] if sid else [], label="STOP FILLED (bridge check) —")
         else:
             notify(f"❓ {(st.get('owner') or '?').upper()} {sym} — TZ shows no short any more and "
                    f"the broker stop did not fill (closed manually?). Marked flat.", sim=A.is_sim)
@@ -3576,8 +3624,11 @@ def loss_guard_thread():
                         continue
                     hits.pop(key, None)
                     log.error(f"{A.tag(sym)} LOSS GUARD: TZ mark ${px:.4f} >= ${lim:.4f} "
-                              f"({(px / entry - 1) * 100:.0f}% above entry ${entry:.4f}) — covering now")
-                    threading.Thread(target=handle_cover, args=(A, sym, 0, st.get("owner")),
+                              f"({(px / entry - 1) * 100:.0f}% above entry ${entry:.4f}) — covering now "
+                              f"(limit ${px * (1 + LOSS_GUARD_COVER_PCT):.4f}, fast re-price)")
+                    A.set_state(sym, loss_guard=True)   # cover loop starts in urgent mode
+                    threading.Thread(target=handle_cover,
+                                     args=(A, sym, px * (1 + LOSS_GUARD_COVER_PCT), st.get("owner")),
                                      daemon=True).start()
         except Exception as e:
             log.warning(f"LOSS GUARD error: {e}")
@@ -3597,9 +3648,13 @@ def cover_until_flat(A, symbol, order_ids, qc_price, placed_in_rth, placed=True)
     last_place = time.time() if placed else 0.0
     last_rth = placed_in_rth
     urgent = False      # sticky: once losing, keep the fast pace and big steps
-    log.info(f"{tag} COVER LOOP started | orders={order_ids} | qc_price=${qc_price}")
+    if A.get_state(symbol).get("loss_guard"):
+        urgent = True   # loss-guard cover: fast pace and big steps from the start
+        A.set_state(symbol, loss_guard=False)
+    log.info(f"{tag} COVER LOOP started | orders={order_ids} | qc_price=${qc_price}"
+             + (" | URGENT (loss guard)" if urgent else ""))
     while True:
-        time.sleep(15)
+        time.sleep(3 if urgent else 15)
         st = A.get_state(symbol).get("state")
         if st != "COVERING":
             log.info(f"{tag} COVER LOOP: state={st} — stopping")
@@ -3970,6 +4025,7 @@ def health():
             "locate_stepdown":     f"<1000sh: -100/step | >=1000sh: x{LOCATE_STEPDOWN_FACTOR} (max {LOCATE_MAX_ATTEMPTS})",
             "stop_loss_enabled":   STOP_LOSS_ENABLED,
             "default_sl_pct":      DEFAULT_SL_PCT,
+            "sl_limit_slack":      SL_LIMIT_SLACK,
             "price_handling":      "QC pre-buffered — server uses received price directly",
         },
     }
