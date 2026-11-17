@@ -4155,7 +4155,11 @@ def webhook():
         if quantity <= 0 or price <= 0:
             return jsonify({"error": "quantity and price required for SHORT"}), 400
 
-        set_state(symbol, state="LOCATING", entry_price=price, quantity=quantity, cycle=cycle, sl_pct=sl_pct, owner=strategy)
+        # New cycle: clear the previous cycle's fill/stop fields. Left in place they made
+        # the LOSS GUARD's stop-fill check treat a still-unfilled entry as filled and
+        # cancel it (AIMD / CLRO re-entries, 16 Nov 2026).
+        set_state(symbol, state="LOCATING", entry_price=price, quantity=quantity, cycle=cycle, sl_pct=sl_pct, owner=strategy,
+                  entry_fill_price=0, filled_at=None, sl_client_order_id=None, loss_guard=False, carried=False)
         threading.Thread(target=locate_and_short, args=(symbol, quantity, price), daemon=True).start()
         log.info(f"[{symbol}] Locate thread launched — returning 200 immediately")
         return jsonify({"status": "ok", "action": "SHORT", "symbol": symbol, "state": "LOCATING"}), 200
@@ -4281,7 +4285,8 @@ def sim_webhook():
         if quantity <= 0 or price <= 0:
             return jsonify({"error": "quantity and price required for SHORT"}), 400
 
-        sim_set_state(symbol, state="LOCATING", entry_price=price, quantity=quantity, cycle=cycle, sl_pct=sl_pct, owner=strategy)
+        sim_set_state(symbol, state="LOCATING", entry_price=price, quantity=quantity, cycle=cycle, sl_pct=sl_pct, owner=strategy,
+                      entry_fill_price=0, filled_at=None, sl_client_order_id=None, loss_guard=False, carried=False)
         threading.Thread(
             target=locate_and_short_sim, args=(symbol, quantity, price), daemon=True
         ).start()
